@@ -1,0 +1,16 @@
+[Unit]
+Description=frp client for RipperMoonStash
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/rippermoonstash/hosting.env
+ExecStart=/usr/local/bin/frpc -c /etc/frp/frpc.toml
+Restart=always
+RestartSec=5
+User=ripper-moon
+Group=ripper-moon
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+node_modules/
+data/
+!data/.gitkeep
+servers/*
+!servers/README.md
+*.log
+.DS_Store
+.codex

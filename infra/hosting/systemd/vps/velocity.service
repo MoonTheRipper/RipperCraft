@@ -1,0 +1,16 @@
+[Unit]
+Description=Velocity proxy for RipperMoonStash Minecraft host routing
+After=network-online.target frps.service
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/velocity
+ExecStart=/usr/bin/java -Xms256M -Xmx512M -jar /opt/velocity/velocity.jar
+Restart=always
+RestartSec=5
+User=velocity
+Group=velocity
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

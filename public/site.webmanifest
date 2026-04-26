@@ -1,0 +1,17 @@
+{
+  "name": "RipperMoonStash",
+  "short_name": "RipperMoonStash",
+  "description": "A minimal Minecraft server dashboard for managing servers, worlds, mods, logs, and admin access.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f1317",
+  "theme_color": "#0f1317",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

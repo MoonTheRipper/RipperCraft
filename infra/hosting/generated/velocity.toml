@@ -1,0 +1,18 @@
+config-version = "2.7"
+bind = "0.0.0.0:25565"
+motd = "<dark_purple>RipperMoonStash</dark_purple>"
+show-max-players = 100
+online-mode = true
+force-key-authentication = true
+player-info-forwarding-mode = "none"
+forwarding-secret-file = "forwarding.secret"
+ping-passthrough = "ALL"
+
+[servers]
+cultoftheripper = "127.0.0.1:26001"
+absolutechads = "127.0.0.1:26002"
+try = ["cultoftheripper"]
+
+[forced-hosts]
+"cultoftheripper.rippermoonstash.com" = ["cultoftheripper"]
+"absolutechads.rippermoonstash.com" = ["absolutechads"]

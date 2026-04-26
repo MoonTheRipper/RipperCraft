@@ -1,0 +1,9 @@
+tunnel: rippermoonstash
+credentials-file: /home/ripper-moon/.cloudflared/rippermoonstash.json
+
+ingress:
+  - hostname: rippermoonstash.com
+    service: http://localhost:4300
+  - hostname: www.rippermoonstash.com
+    service: http://localhost:4300
+  - service: http_status:404

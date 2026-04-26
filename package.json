@@ -1,0 +1,14 @@
+{
+  "name": "rippermoonstash",
+  "version": "0.1.0",
+  "description": "Browser-based Minecraft server manager for RipperMoonStash",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "license": "UNLICENSED"
+}

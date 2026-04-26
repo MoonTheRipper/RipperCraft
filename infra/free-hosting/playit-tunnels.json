@@ -1,0 +1,17 @@
+{
+  "domain": "rippermoonstash.com",
+  "servers": {
+    "CultOfTheRipper": {
+      "publicHost": "european-copyrighted.gl.at.ply.gg",
+      "publicPort": 8650,
+      "priority": 1,
+      "weight": 1
+    },
+    "AbsoluteChads": {
+      "publicHost": "german-indirect.gl.at.ply.gg",
+      "publicPort": 8659,
+      "priority": 1,
+      "weight": 1
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "domain": "rippermoonstash.com",
+  "servers": {
+    "CultOfTheRipper": {
+      "publicHost": "replace-with-playit-host.example.playit.gg",
+      "publicPort": 12345,
+      "priority": 1,
+      "weight": 1
+    },
+    "AbsoluteChads": {
+      "publicHost": "replace-with-playit-host.example.playit.gg",
+      "publicPort": 23456,
+      "priority": 1,
+      "weight": 1
+    }
+  }
+}
