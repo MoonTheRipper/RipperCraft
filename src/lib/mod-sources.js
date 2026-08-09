@@ -1,7 +1,12 @@
-const { safeFilename } = require("./utils");
+const crypto = require("node:crypto");
+const fsp = require("node:fs/promises");
+const os = require("node:os");
+const path = require("node:path");
+const { ensureDir, nowIso, runCommand, safeFilename } = require("./utils");
 
 const MODRINTH_API = "https://api.modrinth.com/v2";
 const CURSEFORGE_API = "https://api.curseforge.com/v1";
+const CURSEFORGE_MINECRAFT_GAME_ID = "432";
 const MODDED_LOADERS = new Set(["fabric", "forge", "neoforge", "quilt"]);
 const PLUGIN_LOADERS = new Set(["paper", "purpur", "folia", "spigot", "bukkit"]);
 const RELEASE_PRIORITY = {
@@ -11,10 +16,30 @@ const RELEASE_PRIORITY = {
 };
 const REMOTE_USER_AGENT = process.env.RIPPERMOONSTASH_USER_AGENT || "RipperMoonStash/0.1 (https://localhost)";
 
-function createModManager(serverManager) {
-  function providerAvailability() {
+function createModManager(serverManager, options = {}) {
+  // Owner-managed keys live in data/app.json; an environment variable always
+  // wins so ops can override whatever is stored without editing the UI.
+  const readIntegrations = options.readIntegrations || (async () => ({}));
+
+  function curseforgeGameId() {
+    return String(process.env.CURSEFORGE_GAME_ID || CURSEFORGE_MINECRAFT_GAME_ID);
+  }
+
+  async function resolveCurseforgeKey() {
+    const fromEnv = String(process.env.CURSEFORGE_API_KEY || "").trim();
+    if (fromEnv) {
+      return { key: fromEnv, source: "environment" };
+    }
+    const integrations = (await readIntegrations()) || {};
+    const stored = String(integrations.curseforgeApiKey || "").trim();
+    return stored ? { key: stored, source: "stored" } : { key: "", source: "none" };
+  }
+
+  async function providerAvailability() {
+    const curseforge = await resolveCurseforgeKey();
     return {
-      curseforge: Boolean(process.env.CURSEFORGE_API_KEY && process.env.CURSEFORGE_GAME_ID),
+      curseforge: Boolean(curseforge.key),
+      curseforgeSource: curseforge.source,
       direct: true,
       modrinth: true,
       upload: true
@@ -88,7 +113,9 @@ function createModManager(serverManager) {
       }
     });
     if (!response.ok) {
-      throw new Error(`Request failed with status ${response.status}.`);
+      const error = new Error(`Request failed with status ${response.status}.`);
+      error.status = response.status;
+      throw error;
     }
     return await response.json();
   }
@@ -137,11 +164,48 @@ function createModManager(serverManager) {
     }));
   }
 
-  function curseforgeHeaders() {
+  async function curseforgeHeaders() {
+    const { key } = await resolveCurseforgeKey();
+    if (!key) {
+      throw new Error("CurseForge is not configured. Add an API key in Owner settings.");
+    }
     return {
       Accept: "application/json",
-      "x-api-key": process.env.CURSEFORGE_API_KEY
+      "x-api-key": key
     };
+  }
+
+  // Verifies a key against CurseForge without storing or echoing it. When no
+  // candidate is passed the currently resolved key is tested instead.
+  async function testCurseforgeKey(candidateKey) {
+    const key = String(candidateKey || "").trim() || (await resolveCurseforgeKey()).key;
+    if (!key) {
+      return { ok: false, reason: "No CurseForge API key is configured." };
+    }
+
+    let response;
+    try {
+      response = await fetch(`${CURSEFORGE_API}/games/${curseforgeGameId()}`, {
+        headers: {
+          Accept: "application/json",
+          "User-Agent": REMOTE_USER_AGENT,
+          "x-api-key": key
+        }
+      });
+    } catch (error) {
+      return { ok: false, reason: `Could not reach CurseForge: ${error.message}` };
+    }
+
+    if (response.status === 403 || response.status === 401) {
+      return { ok: false, reason: "CurseForge rejected the key (403). Check for typos or surrounding quotes." };
+    }
+    if (!response.ok) {
+      return { ok: false, reason: `CurseForge returned HTTP ${response.status}.` };
+    }
+
+    const payload = await response.json().catch(() => null);
+    const gameName = payload && payload.data && payload.data.name;
+    return { gameName: gameName || "", ok: true, reason: `Verified against ${gameName || "CurseForge"}.` };
   }
 
   function loaderToCurseforgeType(loader) {
@@ -160,8 +224,8 @@ function createModManager(serverManager) {
   }
 
   async function searchCurseforge(server, query) {
-    if (!providerAvailability().curseforge) {
-      throw new Error("CurseForge is not configured. Set CURSEFORGE_API_KEY and CURSEFORGE_GAME_ID.");
+    if (!(await providerAvailability()).curseforge) {
+      throw new Error("CurseForge is not configured. Add an API key in Owner settings.");
     }
 
     const profile = assertManagedInstallServer(server);
@@ -171,7 +235,7 @@ function createModManager(serverManager) {
 
     const loaderType = loaderToCurseforgeType(server.loader);
     const url = new URL(`${CURSEFORGE_API}/mods/search`, "https://api.curseforge.com");
-    url.searchParams.set("gameId", process.env.CURSEFORGE_GAME_ID);
+    url.searchParams.set("gameId", curseforgeGameId());
     url.searchParams.set("searchFilter", query);
     url.searchParams.set("classId", "6");
     url.searchParams.set("pageSize", "12");
@@ -183,7 +247,7 @@ function createModManager(serverManager) {
     }
 
     const payload = await fetchJson(url.toString(), {
-      headers: curseforgeHeaders()
+      headers: await curseforgeHeaders()
     });
 
     return payload.data.map((result) => ({
@@ -193,6 +257,11 @@ function createModManager(serverManager) {
       downloads: result.downloadCount,
       iconUrl: result.logo && result.logo.thumbnailUrl,
       id: String(result.id),
+      // Authors can disable third-party downloads; flag it here so the UI can
+      // point at CurseForge instead of offering an install that cannot succeed.
+      manualDownloadOnly: result.allowModDistribution === false,
+      pageUrl:
+        result.links && /^https?:\/\//i.test(result.links.websiteUrl || "") ? result.links.websiteUrl : "",
       provider: "curseforge",
       slug: result.slug,
       title: result.name
@@ -249,13 +318,66 @@ function createModManager(serverManager) {
     return releaseMap[file.releaseType] ?? 99;
   }
 
+  async function resolveCurseforgeModPage(modId) {
+    try {
+      const payload = await fetchJson(`${CURSEFORGE_API}/mods/${modId}`, {
+        headers: await curseforgeHeaders()
+      });
+      const data = payload.data || {};
+      const websiteUrl = (data.links && data.links.websiteUrl) || "";
+      return {
+        modName: data.name || "",
+        // Only ever hand an http(s) link back; this value ends up in an href.
+        websiteUrl: /^https?:\/\//i.test(websiteUrl) ? websiteUrl : ""
+      };
+    } catch {
+      return { modName: "", websiteUrl: "" };
+    }
+  }
+
+  async function manualDownloadRequiredError(modId, file) {
+    const { modName, websiteUrl } = await resolveCurseforgeModPage(modId);
+    const pageUrl = websiteUrl ? `${websiteUrl}/files/${file.id}` : "";
+    const label = modName || file.fileName || `CurseForge project ${modId}`;
+    const error = new Error(
+      `${label} cannot be installed automatically because its author disabled third-party downloads on CurseForge. ` +
+        (pageUrl
+          ? `Download it from ${pageUrl}, then add it here with "upload file".`
+          : `Download it from CurseForge, then add it here with "upload file".`)
+    );
+    error.statusCode = 409;
+    error.code = "CURSEFORGE_MANUAL_DOWNLOAD_REQUIRED";
+    error.manualDownload = {
+      fileId: String(file.id),
+      fileName: file.fileName || "",
+      modId: String(modId),
+      modName: label,
+      pageUrl,
+      provider: "curseforge"
+    };
+    return error;
+  }
+
   async function resolveCurseforgeDownloadUrl(modId, file) {
     if (file.downloadUrl) {
       return file.downloadUrl;
     }
-    const payload = await fetchJson(`${CURSEFORGE_API}/mods/${modId}/files/${file.id}/download-url`, {
-      headers: curseforgeHeaders()
-    });
+
+    let payload;
+    try {
+      payload = await fetchJson(`${CURSEFORGE_API}/mods/${modId}/files/${file.id}/download-url`, {
+        headers: await curseforgeHeaders()
+      });
+    } catch (error) {
+      if (error.status === 403 || error.status === 404) {
+        throw await manualDownloadRequiredError(modId, file);
+      }
+      throw error;
+    }
+
+    if (!payload || !payload.data) {
+      throw await manualDownloadRequiredError(modId, file);
+    }
     return payload.data;
   }
 
@@ -276,7 +398,7 @@ function createModManager(serverManager) {
     url.searchParams.set("pageSize", "50");
 
     const payload = await fetchJson(url.toString(), {
-      headers: curseforgeHeaders()
+      headers: await curseforgeHeaders()
     });
     const files = (payload.data || []).sort((left, right) => {
       const releaseDiff = curseforgeFileScore(left) - curseforgeFileScore(right);
@@ -362,6 +484,9 @@ function createModManager(serverManager) {
     seenMods.add(modId);
 
     const file = await resolveCurseforgeFile(modId, server);
+    // Resolve the download URL before installing dependencies so an author opt-out
+    // fails before anything is written to mods/ and leaves untracked files behind.
+    const downloadUrl = await resolveCurseforgeDownloadUrl(modId, file);
     const installedFiles = [];
 
     for (const dependency of file.dependencies || []) {
@@ -378,7 +503,6 @@ function createModManager(serverManager) {
       installedFiles.push(...nested);
     }
 
-    const downloadUrl = await resolveCurseforgeDownloadUrl(modId, file);
     const installed = await serverManager.downloadAndInstallFile(serverId, downloadUrl, file.fileName);
     installedFiles.push({
       dependencyOf,
@@ -551,6 +675,457 @@ function createModManager(serverManager) {
     return planEntries;
   }
 
+  // Resolves the newest provider file for an already-installed add-on, using the
+  // server's CURRENT loader and Minecraft version. Unlike the combined update
+  // this never changes the game version - it just finds a newer build.
+  async function resolveLatestForEntry(server, entry) {
+    if (entry.provider === "modrinth") {
+      const version = await resolveModrinthVersion(entry.sourceId, server);
+      const file = chooseModrinthFile(version);
+      // Modrinth spells it "filename"; CurseForge uses "fileName".
+      return { fileName: file.filename, url: file.url, versionLabel: version.version_number || "" };
+    }
+
+    if (entry.provider === "curseforge") {
+      const file = await resolveCurseforgeFile(entry.sourceId, server);
+      return {
+        curseforgeFile: file,
+        fileName: file.fileName,
+        url: null,
+        versionLabel: file.displayName || ""
+      };
+    }
+
+    return null;
+  }
+
+  // Per-add-on update check. One add-on failing must not hide the rest, so each
+  // result carries its own status instead of blocking the whole report.
+  async function planAddonUpdates(serverId) {
+    const server = await serverManager.getServer(serverId);
+    if (!server) {
+      throw new Error("Server not found.");
+    }
+
+    const profile = getCompatibilityProfile(server);
+    const manifest = await serverManager.readAddonManifest(serverId);
+    const installed = (await serverManager.listInstalledFiles(serverId)).map((entry) =>
+      typeof entry === "string" ? { enabled: true, fileName: entry } : entry
+    );
+    const trackedNames = new Set(manifest.map((entry) => entry.fileName));
+
+    const entries = [];
+
+    for (const entry of manifest) {
+      const base = {
+        dependencyOf: entry.dependencyOf || null,
+        fileName: entry.fileName,
+        provider: entry.provider,
+        sourceId: entry.sourceId
+      };
+
+      if (entry.manual === true || entry.provider === "direct" || entry.provider === "upload") {
+        entries.push({
+          ...base,
+          reason: "Installed by hand, so there is no provider to check for updates.",
+          status: "unsupported"
+        });
+        continue;
+      }
+
+      if (!profile.supportsManagedInstalls) {
+        entries.push({
+          ...base,
+          reason: "Set a supported loader and Minecraft version before checking for updates.",
+          status: "unsupported"
+        });
+        continue;
+      }
+
+      try {
+        const latest = await resolveLatestForEntry(server, entry);
+        if (!latest) {
+          entries.push({ ...base, reason: `Provider ${entry.provider} cannot be checked.`, status: "unsupported" });
+          continue;
+        }
+        const changed = safeFilename(latest.fileName) !== entry.fileName;
+        entries.push({
+          ...base,
+          latestFileName: safeFilename(latest.fileName),
+          latestVersion: latest.versionLabel || "",
+          status: changed ? "update-available" : "up-to-date"
+        });
+      } catch (error) {
+        entries.push({
+          ...base,
+          reason: error.manualDownload ? error.message : `Could not check: ${error.message}`,
+          status: "error"
+        });
+      }
+    }
+
+    for (const file of installed) {
+      if (!trackedNames.has(file.fileName)) {
+        entries.push({
+          fileName: file.fileName,
+          provider: "untracked",
+          reason: "This file is not tracked by the dashboard. Reinstall it through a provider to enable updates.",
+          sourceId: "",
+          status: "untracked"
+        });
+      }
+    }
+
+    entries.sort((left, right) => left.fileName.localeCompare(right.fileName));
+    return {
+      entries,
+      gameVersion: profile.gameVersion,
+      loader: profile.loader,
+      updatable: entries.filter((entry) => entry.status === "update-available").length
+    };
+  }
+
+  // Replaces one add-on's jar with the newest build. The server must be stopped:
+  // swapping jars underneath a running JVM corrupts the mod state.
+  async function applyAddonUpdate(serverId, fileName) {
+    const server = await serverManager.getServer(serverId);
+    if (!server) {
+      throw new Error("Server not found.");
+    }
+
+    const target = safeFilename(fileName);
+    const manifest = await serverManager.readAddonManifest(serverId);
+    const entry = manifest.find((item) => item.fileName === target);
+    if (!entry) {
+      const error = new Error(`No tracked add-on named ${fileName} was found.`);
+      error.statusCode = 404;
+      throw error;
+    }
+    if (entry.manual === true || entry.provider === "direct" || entry.provider === "upload") {
+      const error = new Error(`${target} was installed by hand and cannot be updated automatically.`);
+      error.statusCode = 409;
+      throw error;
+    }
+
+    await serverManager.ensureServerStopped(serverId);
+
+    const latest = await resolveLatestForEntry(server, entry);
+    if (!latest) {
+      const error = new Error(`Provider ${entry.provider} cannot be updated automatically.`);
+      error.statusCode = 409;
+      throw error;
+    }
+
+    const nextName = safeFilename(latest.fileName);
+    if (nextName === entry.fileName) {
+      return { changed: false, fileName: entry.fileName, mods: await serverManager.listInstalledFiles(serverId) };
+    }
+
+    const downloadUrl =
+      entry.provider === "curseforge"
+        ? await resolveCurseforgeDownloadUrl(entry.sourceId, latest.curseforgeFile)
+        : latest.url;
+    const installed = await serverManager.downloadAndInstallFile(serverId, downloadUrl, nextName);
+
+    // Only drop the old jar once the replacement is safely on disk.
+    if (installed.fileName !== entry.fileName) {
+      await serverManager.removeAddonFiles(serverId, [entry.fileName]);
+    }
+
+    await serverManager.recordAddonInstalls(serverId, [
+      normalizeTrackedEntry(server, {
+        dependencyOf: entry.dependencyOf || null,
+        direct: entry.direct !== false,
+        fileName: installed.fileName,
+        provider: entry.provider,
+        sourceId: entry.sourceId
+      })
+    ]);
+
+    return {
+      changed: true,
+      fileName: installed.fileName,
+      fromFileName: entry.fileName,
+      mods: await serverManager.listInstalledFiles(serverId)
+    };
+  }
+
+  // Gathers everything needed to tell a player what to install. Modrinth
+  // publishes client_side/server_side per project, so client requirements are
+  // read rather than guessed. CurseForge has no equivalent field.
+  async function buildClientManifest(serverId) {
+    const server = await serverManager.getServer(serverId);
+    if (!server) {
+      throw new Error("Server not found.");
+    }
+
+    const profile = getCompatibilityProfile(server);
+    const manifest = await serverManager.readAddonManifest(serverId);
+    const installed = (await serverManager.listInstalledFiles(serverId)).map((entry) =>
+      typeof entry === "string" ? { enabled: true, fileName: entry } : entry
+    );
+    // Disabled add-ons are not loaded by the server, so players must not be
+    // told to install them - a mismatched mod list is rejected at login.
+    const enabledNames = new Set(installed.filter((entry) => entry.enabled !== false).map((entry) => entry.fileName));
+    const trackedNames = new Set(manifest.map((entry) => entry.fileName));
+    const skipped = [];
+    const items = [];
+
+    for (const entry of manifest) {
+      if (!enabledNames.has(entry.fileName)) {
+        skipped.push(entry.fileName);
+        continue;
+      }
+      const item = {
+        clientSide: "unknown",
+        fileName: entry.fileName,
+        provider: entry.provider,
+        serverSide: "unknown",
+        sourceId: entry.sourceId,
+        title: entry.fileName,
+        url: ""
+      };
+
+      try {
+        if (entry.provider === "modrinth") {
+          const project = await fetchJson(`${MODRINTH_API}/project/${entry.sourceId}`);
+          item.clientSide = project.client_side || "unknown";
+          item.serverSide = project.server_side || "unknown";
+          item.title = project.title || entry.fileName;
+          item.url = `https://modrinth.com/mod/${project.slug || entry.sourceId}`;
+        } else if (entry.provider === "curseforge") {
+          const payload = await fetchJson(`${CURSEFORGE_API}/mods/${entry.sourceId}`, {
+            headers: await curseforgeHeaders()
+          });
+          const data = payload.data || {};
+          item.title = data.name || entry.fileName;
+          const website = (data.links && data.links.websiteUrl) || "";
+          item.url = /^https?:\/\//i.test(website) ? website : "";
+          // CurseForge exposes no client/server split, so assume the player
+          // needs it rather than risk telling them to skip a required mod.
+          item.clientSide = "assumed-required";
+          item.serverSide = "unknown";
+        } else {
+          item.clientSide = "assumed-required";
+          item.title = entry.fileName;
+        }
+      } catch (error) {
+        item.lookupError = error.message;
+        item.clientSide = "assumed-required";
+      }
+
+      items.push(item);
+    }
+
+    for (const fileName of enabledNames) {
+      if (!trackedNames.has(fileName)) {
+        items.push({
+          clientSide: "assumed-required",
+          fileName,
+          provider: "untracked",
+          serverSide: "unknown",
+          sourceId: "",
+          title: fileName,
+          untracked: true,
+          url: ""
+        });
+      }
+    }
+
+    items.sort((left, right) => left.title.localeCompare(right.title));
+    return {
+      gameVersion: profile.gameVersion,
+      items,
+      loader: profile.loader,
+      loaderVersion: (server.managedRuntime && server.managedRuntime.loaderVersion) || "",
+      serverName: server.name,
+      skippedDisabled: skipped.sort()
+    };
+  }
+
+  function needsClient(item) {
+    return item.clientSide !== "unsupported";
+  }
+
+  function renderClientListText(manifest) {
+    const needed = manifest.items.filter(needsClient);
+    const serverOnly = manifest.items.filter((item) => !needsClient(item));
+    const lines = [];
+
+    lines.push(`${manifest.serverName} - client mod list`);
+    lines.push("=".repeat(`${manifest.serverName} - client mod list`.length));
+    lines.push("");
+    lines.push(`Minecraft : ${manifest.gameVersion || "unknown"}`);
+    lines.push(`Loader    : ${manifest.loader}${manifest.loaderVersion ? ` ${manifest.loaderVersion}` : ""}`);
+    lines.push(`Mods      : ${needed.length} required on the client`);
+    lines.push("");
+    lines.push(`Install ${manifest.loader} ${manifest.loaderVersion || ""} for Minecraft ${manifest.gameVersion || ""},`);
+    lines.push("then put every jar below into your .minecraft/mods folder.");
+    lines.push("Versions must match exactly or you will be rejected at login.");
+    lines.push("");
+
+    const groups = [
+      ["MODRINTH", needed.filter((item) => item.provider === "modrinth")],
+      ["CURSEFORGE", needed.filter((item) => item.provider === "curseforge")],
+      ["OTHER / MANUAL", needed.filter((item) => item.provider !== "modrinth" && item.provider !== "curseforge")]
+    ];
+
+    for (const [label, list] of groups) {
+      if (!list.length) {
+        continue;
+      }
+      lines.push(`-- ${label} (${list.length}) ${"-".repeat(Math.max(0, 50 - label.length))}`);
+      for (const item of list) {
+        lines.push(`  ${item.title}`);
+        lines.push(`      file : ${item.fileName}`);
+        if (item.url) {
+          lines.push(`      link : ${item.url}`);
+        }
+        if (item.clientSide === "assumed-required") {
+          lines.push("      note : provider does not publish client/server split; assumed required");
+        }
+        if (item.untracked) {
+          lines.push("      note : not tracked by the dashboard; source unknown");
+        }
+        if (item.lookupError) {
+          lines.push(`      note : lookup failed (${item.lookupError})`);
+        }
+      }
+      lines.push("");
+    }
+
+    if (serverOnly.length) {
+      lines.push(`-- SERVER ONLY - do NOT install these (${serverOnly.length}) ${"-".repeat(18)}`);
+      for (const item of serverOnly) {
+        lines.push(`  ${item.title}  [${item.fileName}]`);
+      }
+      lines.push("");
+    }
+
+    if (manifest.skippedDisabled && manifest.skippedDisabled.length) {
+      lines.push(`-- DISABLED ON THE SERVER - excluded (${manifest.skippedDisabled.length}) ${"-".repeat(12)}`);
+      for (const fileName of manifest.skippedDisabled) {
+        lines.push(`  ${fileName}`);
+      }
+      lines.push("");
+    }
+
+    lines.push("Generated by RipperMoonStash.");
+    return `${lines.join("\n")}\n`;
+  }
+
+  // Builds a Modrinth-format modpack (.mrpack) of the client mods.
+  //
+  // Only Modrinth files can be referenced by URL: the .mrpack spec restricts
+  // download hosts to a trusted allowlist that excludes CurseForge's CDN. And
+  // embedding other people's jars in a pack is redistribution, which is not
+  // ours to do - so CurseForge and manual mods are listed for manual install
+  // instead of being bundled.
+  async function buildModpackArchive(serverId) {
+    const manifest = await buildClientManifest(serverId);
+    const server = await serverManager.getServer(serverId);
+    const paths = serverManager.resolveRecordPaths(server);
+    const clientItems = manifest.items.filter(needsClient);
+
+    const files = [];
+    const manual = [];
+
+    for (const item of clientItems) {
+      if (item.provider !== "modrinth") {
+        manual.push(item);
+        continue;
+      }
+
+      try {
+        const entryManifest = { provider: "modrinth", sourceId: item.sourceId };
+        const latest = await resolveLatestForEntry(server, entryManifest);
+        const jarPath = path.join(paths.modsDir, item.fileName);
+        const buffer = await fsp.readFile(jarPath);
+        files.push({
+          downloads: [latest.url],
+          env: {
+            client: item.clientSide === "optional" ? "optional" : "required",
+            server: item.serverSide === "unsupported" ? "unsupported" : "required"
+          },
+          fileSize: buffer.length,
+          hashes: {
+            sha1: crypto.createHash("sha1").update(buffer).digest("hex"),
+            sha512: crypto.createHash("sha512").update(buffer).digest("hex")
+          },
+          path: `mods/${item.fileName}`
+        });
+      } catch (error) {
+        manual.push({ ...item, lookupError: error.message });
+      }
+    }
+
+    const dependencies = { minecraft: manifest.gameVersion || "" };
+    if (manifest.loader === "forge" && manifest.loaderVersion) {
+      dependencies.forge = manifest.loaderVersion;
+    } else if (manifest.loader === "neoforge" && manifest.loaderVersion) {
+      dependencies["neoforge"] = manifest.loaderVersion;
+    } else if (manifest.loader === "fabric" && manifest.loaderVersion) {
+      dependencies["fabric-loader"] = manifest.loaderVersion;
+    }
+
+    const index = {
+      dependencies,
+      files,
+      formatVersion: 1,
+      game: "minecraft",
+      name: manifest.serverName,
+      summary: `Client pack for ${manifest.serverName}`,
+      versionId: nowIso().slice(0, 10)
+    };
+
+    const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "rms-mrpack-"));
+    try {
+      await fsp.writeFile(path.join(tmpDir, "modrinth.index.json"), `${JSON.stringify(index, null, 2)}\n`, "utf8");
+      await ensureDir(path.join(tmpDir, "overrides"));
+
+      const notes = [
+        `${manifest.serverName} - mods this pack could not include`,
+        "",
+        "The .mrpack format can only reference downloads from a trusted host list,",
+        "which does not include CurseForge. These jars are not bundled here because",
+        "redistributing them is the author's call, not ours. Add them by hand:",
+        ""
+      ];
+      for (const item of manual) {
+        notes.push(`- ${item.title}`);
+        notes.push(`    file : ${item.fileName}`);
+        if (item.url) {
+          notes.push(`    link : ${item.url}`);
+        }
+        if (item.lookupError) {
+          notes.push(`    note : ${item.lookupError}`);
+        }
+      }
+      if (!manual.length) {
+        notes.push("(none - every client mod is included in this pack)");
+      }
+      notes.push("");
+      await fsp.writeFile(path.join(tmpDir, "overrides", "MANUAL-MODS.txt"), `${notes.join("\n")}\n`, "utf8");
+
+      const outputPath = path.join(
+        tmpDir,
+        `${String(manifest.serverName || "modpack").replace(/[^A-Za-z0-9._-]+/g, "-")}.mrpack`
+      );
+      // .mrpack is a zip; build it from the staged directory.
+      await runCommand("zip", ["-rq", outputPath, "modrinth.index.json", "overrides"], { cwd: tmpDir });
+
+      return {
+        bundled: files.length,
+        filePath: outputPath,
+        manual: manual.length,
+        tmpDir
+      };
+    } catch (error) {
+      await fsp.rm(tmpDir, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
   async function planCombinedAddonUpdate(serverId, targetVersion) {
     const server = await serverManager.getServer(serverId);
     if (!server) {
@@ -562,7 +1137,9 @@ function createModManager(serverManager) {
       minecraftVersion: String(targetVersion || server.minecraftVersion || "").trim()
     };
     const manifest = await serverManager.readAddonManifest(serverId);
-    const installedFiles = await serverManager.listInstalledFiles(serverId);
+    const installedFiles = (await serverManager.listInstalledFiles(serverId))
+      .filter((entry) => typeof entry === "string" || entry.enabled !== false)
+      .map((entry) => typeof entry === "string" ? entry : entry.fileName);
     const trackedFileNames = new Set(manifest.map((entry) => entry.fileName));
     const untrackedFiles = installedFiles.filter((fileName) => !trackedFileNames.has(fileName));
     const manualEntries = manifest.filter(
@@ -690,13 +1267,19 @@ function createModManager(serverManager) {
   }
 
   return {
+    applyAddonUpdate,
     applyCombinedAddonUpdate,
+    buildClientManifest,
+    buildModpackArchive,
     getCompatibilityProfile,
+    planAddonUpdates,
+    renderClientListText,
     install,
     installUpload,
     planCombinedAddonUpdate,
     providerAvailability,
-    search
+    search,
+    testCurseforgeKey
   };
 }
 

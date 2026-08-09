@@ -4,6 +4,14 @@ const os = require("node:os");
 const { ensureDir, nowIso, runCommand, safeFilename, withinParent } = require("./utils");
 
 function createWorldManager(serverManager) {
+  // Bad input from the browser should surface as a 4xx, not a 500 that logs as
+  // a server fault.
+  function worldError(message, statusCode = 409) {
+    const error = new Error(message);
+    error.statusCode = statusCode;
+    return error;
+  }
+
   function parseServerPropertiesText(contents) {
     const properties = {};
     for (const line of String(contents || "").split(/\r?\n/)) {
@@ -100,6 +108,43 @@ function createWorldManager(serverManager) {
     }
   }
 
+  // Deletes an archived world zip. The live world is never touched here - it is
+  // not an archive, and removing it is what "create new world" is for.
+  async function deleteWorldArchive(serverId, archiveName) {
+    const requested = String(archiveName || "").trim();
+    if (!requested) {
+      throw worldError("An archive name is required.", 400);
+    }
+
+    const server = await serverManager.getServer(serverId);
+    if (!server) {
+      throw worldError("Server not found.", 404);
+    }
+
+    const paths = serverManager.resolveRecordPaths(server);
+    const archivePath = await serverManager.readWorldArchivePath(serverId, requested);
+    if (!withinParent(paths.worldLibraryDir, archivePath)) {
+      throw worldError("Invalid archive path.", 400);
+    }
+
+    const entries = await serverManager.listWorldEntries(serverId);
+    const match = entries.find((entry) => entry.kind === "archive" && entry.name === path.basename(archivePath));
+    if (!match) {
+      // Either it never existed or it is the active world, which has no archive
+      // entry. Refuse rather than guess.
+      throw worldError(
+        `No archived world named ${requested} was found. The active world cannot be deleted here.`,
+        404
+      );
+    }
+
+    await fsp.rm(archivePath, { force: true });
+    return {
+      deleted: match.name,
+      worlds: await listWorlds(serverId)
+    };
+  }
+
   async function activateWorldArchive(serverId, archiveName) {
     const server = await serverManager.getServer(serverId);
     const paths = serverManager.resolveRecordPaths(server);
@@ -186,6 +231,7 @@ function createWorldManager(serverManager) {
     captureActiveWorld,
     createNewWorld,
     createExportArchive,
+    deleteWorldArchive,
     importWorldArchive,
     listWorlds,
     updateWorldRules

@@ -7,6 +7,7 @@ const { json, noContent, parseFormData, parseJsonBody, sendFile, sendStream } = 
 const { createServerManager } = require("./lib/servers");
 const { createWorldManager } = require("./lib/worlds");
 const { createModManager } = require("./lib/mod-sources");
+const { createJobRegistry } = require("./lib/jobs");
 const { exists, withinParent } = require("./lib/utils");
 
 function sanitizeUser(user) {
@@ -68,7 +69,10 @@ async function createApp(rootDir = process.cwd(), options = {}) {
   const sessionManager = createSessionManager(() => store.getAppConfig());
   const serverManager = createServerManager(store);
   const worldManager = createWorldManager(serverManager);
-  const modManager = createModManager(serverManager);
+  const modManager = createModManager(serverManager, {
+    readIntegrations: () => store.getIntegrations()
+  });
+  const jobs = createJobRegistry();
   const publicRoot = path.join(rootDir, "public");
 
   async function getContext(req) {
@@ -138,11 +142,39 @@ async function createApp(rootDir = process.cwd(), options = {}) {
     const appConfig = await store.getAppConfig();
     json(res, 200, {
       appName: appConfig.appName,
+      installableLoaders: serverManager.getInstallableLoaders(),
       loggedIn: Boolean(context.user),
       needsSetup: !(await store.hasUsers()),
-      providers: modManager.providerAvailability(),
+      providers: await modManager.providerAvailability(),
       user: sanitizeUser(context.user)
     });
+  }
+
+  // Describes integration credentials without ever returning the secret. Only
+  // a last-four hint is exposed, and only for keys stored by the owner.
+  async function describeIntegrations() {
+    const providers = await modManager.providerAvailability();
+    const integrations = await store.getIntegrations();
+    const storedKey = String(integrations.curseforgeApiKey || "");
+    return {
+      curseforge: {
+        configured: providers.curseforge,
+        // An environment variable outranks the stored value. The key can still
+        // be saved here, but it stays dormant until the variable is removed -
+        // so tell the owner exactly where to go and what to change.
+        envOverride:
+          providers.curseforgeSource === "environment"
+            ? {
+                envFile: process.env.RIPPERMOONSTASH_ENV_FILE || "/etc/rippermoonstash.env",
+                service: "rippermoonstash",
+                variable: "CURSEFORGE_API_KEY"
+              }
+            : null,
+        hint: storedKey.length >= 4 ? `…${storedKey.slice(-4)}` : "",
+        stored: Boolean(storedKey),
+        source: providers.curseforgeSource
+      }
+    };
   }
 
   async function buildCombinedUpdatePlan(serverId, targetVersion) {
@@ -315,7 +347,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
       if (req.method === "GET" && url.pathname === "/api/servers") {
         const servers = await serverManager.listServersForUser(context.user);
         json(res, 200, {
-          providers: modManager.providerAvailability(),
+          providers: await modManager.providerAvailability(),
           servers
         });
         return;
@@ -329,14 +361,60 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         return;
       }
 
+      if (req.method === "GET" && url.pathname === "/api/java-runtimes") {
+        if (!ensureOwner(res, context)) {
+          return;
+        }
+        json(res, 200, {
+          runtimes: await serverManager.listJavaRuntimes({ refresh: url.searchParams.get("refresh") === "1" })
+        });
+        return;
+      }
+
       if (req.method === "POST" && url.pathname === "/api/servers") {
         if (!ensureOwner(res, context)) {
           return;
         }
 
         const body = await parseJsonBody(req);
-        const server = await serverManager.createServer(body, context.user);
-        json(res, 201, { server: serverManager.serializeServer(server) });
+        // Provisioning Forge or NeoForge runs a real installer and can take a
+        // minute, so this runs as a background job the browser polls.
+        const job = jobs.create("create-server", {
+          label: "starting",
+          totalSteps: body.mode === "existing" ? 2 : 6
+        });
+
+        (async () => {
+          try {
+            const server = await serverManager.createServer(body, context.user, {
+              onProgress: (step) => jobs.progress(job.id, step)
+            });
+            jobs.succeed(job.id, { server: serverManager.serializeServer(server) });
+            logger.info("Server created", { actor: context.user.username, serverId: server.id });
+          } catch (error) {
+            jobs.fail(job.id, error);
+            logger.error("Server creation failed", {
+              actor: context.user.username,
+              error: error.message,
+              stack: error.stack
+            });
+          }
+        })();
+
+        json(res, 202, { job: jobs.get(job.id) });
+        return;
+      }
+
+      if (req.method === "GET" && segments[1] === "jobs" && segments[2]) {
+        if (!ensureOwner(res, context)) {
+          return;
+        }
+        const job = jobs.get(segments[2]);
+        if (!job) {
+          json(res, 404, { error: "That job is no longer available." });
+          return;
+        }
+        json(res, 200, { job });
         return;
       }
 
@@ -464,6 +542,12 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               metadataPatch.passphrase = body.passphrase.trim();
             }
 
+            // Only patch javaBin when the form actually sent it, otherwise an
+            // unrelated settings save would silently clear a configured path.
+            if (typeof body.javaBin === "string") {
+              metadataPatch.javaBin = body.javaBin;
+            }
+
             await serverManager.setServerMetadata(serverId, metadataPatch);
             if (typeof body.propertiesText === "string") {
               await serverManager.writeServerProperties(serverId, body.propertiesText);
@@ -490,6 +574,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               typeof body.maxMemory === "string" ||
               typeof body.minMemory === "string" ||
               typeof body.startCommand === "string" ||
+              typeof body.javaBin === "string" ||
               typeof body.name === "string" ||
               typeof body.description === "string"
             ) {
@@ -517,6 +602,30 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           snapshot.addonCompatibility = modManager.getCompatibilityProfile(snapshot.server);
           json(res, 200, snapshot);
           return;
+        }
+
+        if (segments[3] === "operators") {
+          if (!ensureOwner(res, context)) {
+            return;
+          }
+
+          if (req.method === "POST" && segments.length === 4) {
+            const body = await parseJsonBody(req);
+            const operators = await serverManager.addServerOperator(serverId, {
+              bypassesPlayerLimit: body.bypassesPlayerLimit === true,
+              level: body.level,
+              name: body.name,
+              uuid: body.uuid
+            });
+            json(res, 200, { operators });
+            return;
+          }
+
+          if (req.method === "DELETE" && segments[4]) {
+            const operators = await serverManager.removeServerOperator(serverId, decodeURIComponent(segments[4]));
+            json(res, 200, { operators });
+            return;
+          }
         }
 
         if (segments[3] === "worlds") {
@@ -573,6 +682,28 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               generateStructures: body.generateStructures !== false,
               levelType: body.levelType
             }));
+            return;
+          }
+
+          if (req.method === "POST" && segments[4] === "delete") {
+            if (!canMutateServer(context, server)) {
+              json(res, 403, { error: "Unlock the server before deleting a world archive." });
+              return;
+            }
+            // Deleting a backup is destructive and unrecoverable, so hold it to
+            // the same bar as creating worlds rather than plain unlock.
+            if (!serverManager.userCanCreateWorld(context.user, serverId)) {
+              json(res, 403, { error: "You do not have permission to delete world archives for this server." });
+              return;
+            }
+            const body = await parseJsonBody(req);
+            const result = await worldManager.deleteWorldArchive(serverId, body.archiveName);
+            logger.info("World archive deleted", {
+              actor: context.user.username,
+              archive: result.deleted,
+              serverId
+            });
+            json(res, 200, result);
             return;
           }
 
@@ -674,6 +805,93 @@ async function createApp(rootDir = process.cwd(), options = {}) {
             return;
           }
 
+          if (req.method === "GET" && segments[4] === "client-list") {
+            if (!ensureServerUnlocked(res, context, server, "Unlock the server before exporting the client mod list.")) {
+              return;
+            }
+            const clientManifest = await modManager.buildClientManifest(serverId);
+            const body = modManager.renderClientListText(clientManifest);
+            const fileName = `${String(server.name || serverId).replace(/[^A-Za-z0-9._-]+/g, "-")}-client-mods.txt`;
+            res.writeHead(200, {
+              "Cache-Control": "no-store, max-age=0",
+              "Content-Disposition": `attachment; filename="${fileName}"`,
+              "Content-Type": "text/plain; charset=utf-8"
+            });
+            res.end(body);
+            return;
+          }
+
+          if (req.method === "GET" && segments[4] === "modpack") {
+            if (!ensureServerUnlocked(res, context, server, "Unlock the server before exporting a modpack.")) {
+              return;
+            }
+            const pack = await modManager.buildModpackArchive(serverId);
+            const stream = require("node:fs").createReadStream(pack.filePath);
+            // Drop the staging directory once the response has drained.
+            const cleanup = () => {
+              fs.rm(pack.tmpDir, { force: true, recursive: true }).catch(() => {});
+            };
+            stream.on("close", cleanup);
+            stream.on("error", cleanup);
+            sendStream(res, 200, stream, {
+              "Cache-Control": "no-store, max-age=0",
+              "Content-Disposition": `attachment; filename="${path.basename(pack.filePath)}"`,
+              "Content-Type": "application/zip",
+              "X-Modpack-Bundled": String(pack.bundled),
+              "X-Modpack-Manual": String(pack.manual)
+            });
+            return;
+          }
+
+          if (req.method === "GET" && segments[4] === "updates") {
+            if (!ensureServerUnlocked(res, context, server, "Unlock the server before checking add-on updates.")) {
+              return;
+            }
+            json(res, 200, await modManager.planAddonUpdates(serverId));
+            return;
+          }
+
+          if (req.method === "POST" && segments[4] === "update") {
+            if (!canMutateServer(context, server)) {
+              json(res, 403, { error: "Unlock the server before updating add-ons." });
+              return;
+            }
+            if (!serverManager.userCanManageAddons(context.user, server)) {
+              json(res, 403, { error: "You do not have permission to update add-ons on this server." });
+              return;
+            }
+            const body = await parseJsonBody(req);
+            const names = Array.isArray(body.fileNames)
+              ? body.fileNames
+              : body.fileName
+                ? [body.fileName]
+                : [];
+            if (!names.length) {
+              json(res, 400, { error: "At least one add-on file name is required." });
+              return;
+            }
+
+            // Update each independently so one failure does not abandon the rest.
+            const results = [];
+            for (const name of names) {
+              try {
+                const result = await modManager.applyAddonUpdate(serverId, name);
+                results.push({ fileName: name, ...result, mods: undefined, ok: true });
+              } catch (error) {
+                results.push({ error: error.message, fileName: name, ok: false });
+              }
+            }
+
+            logger.info("Add-on update applied", {
+              actor: context.user.username,
+              failed: results.filter((entry) => !entry.ok).length,
+              serverId,
+              updated: results.filter((entry) => entry.ok && entry.changed).length
+            });
+            json(res, 200, { mods: await serverManager.listInstalledFiles(serverId), results });
+            return;
+          }
+
           if (req.method === "POST" && segments[4] === "remove") {
             if (!canMutateServer(context, server)) {
               json(res, 403, { error: "Unlock the server before removing add-ons." });
@@ -686,6 +904,21 @@ async function createApp(rootDir = process.cwd(), options = {}) {
             const body = await parseJsonBody(req);
             const removed = await serverManager.removeAddonFiles(serverId, [body.fileName]);
             json(res, 200, { mods: await serverManager.listInstalledFiles(serverId), removed });
+            return;
+          }
+
+          if (req.method === "POST" && segments[4] === "toggle") {
+            if (!canMutateServer(context, server)) {
+              json(res, 403, { error: "Unlock the server before toggling add-ons." });
+              return;
+            }
+            if (!serverManager.userCanManageAddons(context.user, server)) {
+              json(res, 403, { error: "You do not have permission to toggle add-ons on this server." });
+              return;
+            }
+            const body = await parseJsonBody(req);
+            const mods = await serverManager.setAddonEnabled(serverId, body.fileName, body.enabled === true);
+            json(res, 200, { mods });
             return;
           }
 
@@ -755,6 +988,54 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           });
           return;
         }
+      }
+
+      if (url.pathname === "/api/settings/integrations") {
+        if (!ensureOwner(res, context)) {
+          return;
+        }
+
+        if (req.method === "GET") {
+          json(res, 200, { integrations: await describeIntegrations() });
+          return;
+        }
+
+        if (req.method === "PUT") {
+          const body = await parseJsonBody(req);
+          if (!Object.prototype.hasOwnProperty.call(body, "curseforgeApiKey")) {
+            json(res, 400, { error: "No integration values were supplied." });
+            return;
+          }
+
+          const nextKey = String(body.curseforgeApiKey || "").trim();
+          // Refuse to store a key that CurseForge rejects, unless explicitly
+          // overridden - a silently bad key looks identical to a working one.
+          if (nextKey && body.skipVerify !== true) {
+            const check = await modManager.testCurseforgeKey(nextKey);
+            if (!check.ok) {
+              json(res, 400, { error: check.reason, verified: false });
+              return;
+            }
+          }
+
+          await store.saveIntegrations({ curseforgeApiKey: nextKey });
+          logger.info("Integration credentials updated", {
+            actor: context.user.username,
+            cleared: !nextKey,
+            integration: "curseforge"
+          });
+          json(res, 200, { integrations: await describeIntegrations() });
+          return;
+        }
+      }
+
+      if (req.method === "POST" && url.pathname === "/api/settings/integrations/test") {
+        if (!ensureOwner(res, context)) {
+          return;
+        }
+        const result = await modManager.testCurseforgeKey();
+        json(res, 200, { result });
+        return;
       }
 
       if (req.method === "GET" && url.pathname === "/api/users") {
@@ -886,7 +1167,9 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         stack: error.stack
       });
       json(res, typeof error.statusCode === "number" ? error.statusCode : 500, {
-        error: error.message || "Unexpected server error."
+        error: error.message || "Unexpected server error.",
+        ...(error.code ? { code: error.code } : {}),
+        ...(error.manualDownload ? { manualDownload: error.manualDownload } : {})
       });
     }
   });

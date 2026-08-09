@@ -8,6 +8,7 @@ const { createSessionManager, hashSecret, verifySecret } = require("../src/lib/a
 const { createServerManager } = require("../src/lib/servers");
 const { createWorldManager } = require("../src/lib/worlds");
 const { createModManager } = require("../src/lib/mod-sources");
+const { createJobRegistry } = require("../src/lib/jobs");
 
 async function createFixtureRoot() {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rippermoonstash-test-"));
@@ -202,7 +203,15 @@ test("server admins can manage add-on loader settings and remove add-ons after u
     }
   ]);
 
-  assert.deepEqual(await serverManager.listInstalledFiles("DemoServer"), ["example-mod.jar"]);
+  assert.deepEqual(await serverManager.listInstalledFiles("DemoServer"), [
+    { enabled: true, fileName: "example-mod.jar" }
+  ]);
+  assert.deepEqual(await serverManager.setAddonEnabled("DemoServer", "example-mod.jar", false), [
+    { enabled: false, fileName: "example-mod.jar" }
+  ]);
+  assert.deepEqual(await serverManager.setAddonEnabled("DemoServer", "example-mod.jar", true), [
+    { enabled: true, fileName: "example-mod.jar" }
+  ]);
   assert.deepEqual(await serverManager.removeAddonFiles("DemoServer", ["example-mod.jar"]), ["example-mod.jar"]);
   assert.deepEqual(await serverManager.listInstalledFiles("DemoServer"), []);
   assert.deepEqual(await serverManager.readAddonManifest("DemoServer"), []);
@@ -239,6 +248,500 @@ test("compatibility profiles distinguish modded, plugin, and unsupported servers
     supportsCurseforge: false,
     supportsManagedInstalls: false
   });
+});
+
+test("curseforge availability only needs an api key and defaults to the minecraft game id", async (t) => {
+  const previousKey = process.env.CURSEFORGE_API_KEY;
+  const previousGameId = process.env.CURSEFORGE_GAME_ID;
+  t.after(() => {
+    process.env.CURSEFORGE_API_KEY = previousKey;
+    process.env.CURSEFORGE_GAME_ID = previousGameId;
+    if (previousKey === undefined) {
+      delete process.env.CURSEFORGE_API_KEY;
+    }
+    if (previousGameId === undefined) {
+      delete process.env.CURSEFORGE_GAME_ID;
+    }
+  });
+
+  let stored = {};
+  const modManager = createModManager(
+    { getServer: async () => null },
+    { readIntegrations: async () => stored }
+  );
+
+  delete process.env.CURSEFORGE_API_KEY;
+  delete process.env.CURSEFORGE_GAME_ID;
+  assert.equal((await modManager.providerAvailability()).curseforge, false);
+
+  // An owner-saved key is enough on its own.
+  stored = { curseforgeApiKey: "stored-key" };
+  const fromStore = await modManager.providerAvailability();
+  assert.equal(fromStore.curseforge, true);
+  assert.equal(fromStore.curseforgeSource, "stored");
+
+  // The environment always outranks whatever the owner saved.
+  process.env.CURSEFORGE_API_KEY = "env-key";
+  const fromEnv = await modManager.providerAvailability();
+  assert.equal(fromEnv.curseforge, true);
+  assert.equal(fromEnv.curseforgeSource, "environment");
+});
+
+test("integration keys are stored, hardened on disk, and cleared by a blank value", async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rippermoonstash-integrations-"));
+  const store = createStore(root);
+  t.after(async () => {
+    await fsp.rm(root, { recursive: true, force: true });
+  });
+
+  await store.ensureInitialized();
+  assert.deepEqual(await store.getIntegrations(), {});
+
+  await store.saveIntegrations({ curseforgeApiKey: "  spaced-key  " });
+  assert.equal((await store.getIntegrations()).curseforgeApiKey, "spaced-key");
+
+  // app.json holds the cookie secret and now an API key; it must not be world readable.
+  const mode = (await fsp.stat(path.join(root, "data", "app.json"))).mode & 0o777;
+  assert.equal(mode, 0o600);
+
+  await store.saveIntegrations({ curseforgeApiKey: "" });
+  assert.equal(Object.prototype.hasOwnProperty.call(await store.getIntegrations(), "curseforgeApiKey"), false);
+
+  // Unrelated config must survive an integration write.
+  assert.ok((await store.getAppConfig()).cookieSecret);
+});
+
+test("a per-server java binary is validated and reaches the launched process", async (t) => {
+  const root = await createFixtureRoot();
+  const store = createStore(root);
+  const serverManager = createServerManager(store);
+
+  t.after(async () => {
+    await fsp.rm(root, { recursive: true, force: true });
+  });
+
+  await store.ensureInitialized();
+  const owner = await store.createUser({
+    username: "owner",
+    passwordHash: hashSecret("moon-pass"),
+    role: "owner",
+    servers: []
+  });
+  await serverManager.syncDiscoveredServers();
+  await serverManager.setServerMetadata("DemoServer", { passphrase: "demo-pass" });
+  await fsp.writeFile(path.join(root, "servers", "DemoServer", "eula.txt"), "eula=true\n", "utf8");
+
+  // A relative path is rejected outright.
+  await assert.rejects(
+    () => serverManager.setServerMetadata("DemoServer", { javaBin: "java" }),
+    /absolute path/
+  );
+
+  // A path that is not executable is rejected.
+  const notExecutable = path.join(root, "not-java");
+  await fsp.writeFile(notExecutable, "", { mode: 0o644 });
+  await assert.rejects(
+    () => serverManager.setServerMetadata("DemoServer", { javaBin: notExecutable }),
+    /not found or not executable/
+  );
+
+  // A real executable is accepted and handed to the launch script via the
+  // environment variable the script already prefers.
+  const fakeJava = path.join(root, "fake-java");
+  await fsp.writeFile(fakeJava, "#!/usr/bin/env bash\nexit 0\n", { mode: 0o755 });
+  const saved = await serverManager.setServerMetadata("DemoServer", { javaBin: fakeJava });
+  assert.equal(saved.javaBin, fakeJava);
+
+  const probe = path.join(root, "servers", "DemoServer", "launch-server.sh");
+  const capture = path.join(root, "captured-env.txt");
+  await fsp.writeFile(
+    probe,
+    `#!/usr/bin/env bash\nprintf '%s' "\${RIPPERMOONSTASH_JAVA_BIN:-unset}" > ${capture}\nsleep 5\n`
+  );
+  // writeFile only honours mode when it creates the file, and the fixture
+  // already made this one.
+  await fsp.chmod(probe, 0o755);
+
+  await serverManager.startServer("DemoServer", owner);
+  t.after(async () => {
+    await serverManager.stopServer("DemoServer").catch(() => {});
+  });
+
+  let captured = "";
+  for (let attempt = 0; attempt < 40 && captured !== fakeJava; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    captured = await fsp.readFile(capture, "utf8").catch(() => "");
+  }
+  assert.equal(captured, fakeJava);
+
+  // Clearing it puts the server back on the dashboard-wide default.
+  await serverManager.stopServer("DemoServer");
+  const cleared = await serverManager.setServerMetadata("DemoServer", { javaBin: "" });
+  assert.equal(cleared.javaBin, "");
+});
+
+test("addon update check reports per-mod status and swaps only outdated jars", async (t) => {
+  const root = await createFixtureRoot();
+  const store = createStore(root);
+  const serverManager = createServerManager(store);
+  const modManager = createModManager(serverManager);
+  const previousFetch = globalThis.fetch;
+
+  t.after(async () => {
+    globalThis.fetch = previousFetch;
+    await fsp.rm(root, { recursive: true, force: true });
+  });
+
+  await store.ensureInitialized();
+  await serverManager.syncDiscoveredServers();
+  await serverManager.setServerMetadata("DemoServer", { loader: "fabric", minecraftVersion: "1.21.11" });
+
+  // One outdated, one current, one hand-installed, one untracked on disk.
+  await serverManager.installManagedFile("DemoServer", "old-mod-1.0.0.jar", Buffer.from("old"));
+  await serverManager.installManagedFile("DemoServer", "fresh-mod-2.0.0.jar", Buffer.from("fresh"));
+  await serverManager.installManagedFile("DemoServer", "hand-made.jar", Buffer.from("manual"));
+  await serverManager.installManagedFile("DemoServer", "mystery.jar", Buffer.from("mystery"));
+  await serverManager.writeAddonManifest("DemoServer", [
+    { fileName: "old-mod-1.0.0.jar", provider: "modrinth", sourceId: "OLD" },
+    { fileName: "fresh-mod-2.0.0.jar", provider: "modrinth", sourceId: "FRESH" },
+    { fileName: "hand-made.jar", manual: true, provider: "upload", sourceId: "hand-made.jar" }
+  ]);
+
+  const versionPayload = (projectId) =>
+    JSON.stringify([
+      {
+        date_published: "2026-01-01T00:00:00Z",
+        dependencies: [],
+        files: [
+          {
+            filename: projectId === "OLD" ? "old-mod-1.1.0.jar" : "fresh-mod-2.0.0.jar",
+            primary: true,
+            url: `https://example.invalid/${projectId}.jar`
+          }
+        ],
+        version_number: projectId === "OLD" ? "1.1.0" : "2.0.0",
+        version_type: "release"
+      }
+    ]);
+
+  globalThis.fetch = async (url) => {
+    const href = String(url);
+    const match = href.match(/\/project\/([A-Z]+)\/version/);
+    if (match) {
+      return new Response(versionPayload(match[1]), {
+        headers: { "content-type": "application/json" },
+        status: 200
+      });
+    }
+    if (href.endsWith("/OLD.jar")) {
+      return new Response(Buffer.from("new bytes"), { status: 200 });
+    }
+    throw new Error(`Unexpected request: ${href}`);
+  };
+
+  const plan = await modManager.planAddonUpdates("DemoServer");
+  const statusOf = (name) => plan.entries.find((entry) => entry.fileName === name).status;
+  assert.equal(statusOf("old-mod-1.0.0.jar"), "update-available");
+  assert.equal(statusOf("fresh-mod-2.0.0.jar"), "up-to-date");
+  assert.equal(statusOf("hand-made.jar"), "unsupported");
+  assert.equal(statusOf("mystery.jar"), "untracked");
+  assert.equal(plan.updatable, 1);
+  assert.equal(plan.gameVersion, "1.21.11");
+
+  // A hand-installed add-on must refuse rather than silently do nothing.
+  await assert.rejects(() => modManager.applyAddonUpdate("DemoServer", "hand-made.jar"), /installed by hand/);
+  await assert.rejects(() => modManager.applyAddonUpdate("DemoServer", "mystery.jar"), /No tracked add-on/);
+
+  // Updating the current one is a no-op, not a redundant download.
+  const unchanged = await modManager.applyAddonUpdate("DemoServer", "fresh-mod-2.0.0.jar");
+  assert.equal(unchanged.changed, false);
+
+  const updated = await modManager.applyAddonUpdate("DemoServer", "old-mod-1.0.0.jar");
+  assert.equal(updated.changed, true);
+  assert.equal(updated.fileName, "old-mod-1.1.0.jar");
+
+  const files = (await serverManager.listInstalledFiles("DemoServer")).map((entry) => entry.fileName);
+  assert.equal(files.includes("old-mod-1.1.0.jar"), true);
+  assert.equal(files.includes("old-mod-1.0.0.jar"), false, "the superseded jar must be removed");
+
+  // The manifest must follow the rename, keeping the add-on tracked.
+  const manifest = await serverManager.readAddonManifest("DemoServer");
+  const tracked = manifest.find((entry) => entry.sourceId === "OLD");
+  assert.equal(tracked.fileName, "old-mod-1.1.0.jar");
+  assert.equal(manifest.some((entry) => entry.fileName === "old-mod-1.0.0.jar"), false);
+});
+
+test("world archives can be deleted without touching the active world", async (t) => {
+  const root = await createFixtureRoot();
+  const store = createStore(root);
+  const serverManager = createServerManager(store);
+  const worldManager = createWorldManager(serverManager);
+
+  t.after(async () => {
+    await fsp.rm(root, { recursive: true, force: true });
+  });
+
+  await store.ensureInitialized();
+  await serverManager.syncDiscoveredServers();
+
+  const capturedA = await worldManager.captureActiveWorld("DemoServer", "keep-me");
+  const capturedB = await worldManager.captureActiveWorld("DemoServer", "delete-me");
+
+  const before = await worldManager.listWorlds("DemoServer");
+  assert.equal(before.filter((world) => world.kind === "archive").length, 2);
+
+  const result = await worldManager.deleteWorldArchive("DemoServer", capturedB.archiveName);
+  assert.equal(result.deleted, capturedB.archiveName);
+
+  const after = result.worlds;
+  const archiveNames = after.filter((world) => world.kind === "archive").map((world) => world.name);
+  assert.deepEqual(archiveNames, [capturedA.archiveName]);
+
+  // The live world must survive an archive deletion.
+  const active = after.find((world) => world.active);
+  assert.ok(active);
+  await fsp.access(path.join(root, "servers", "DemoServer", "world", "level.dat"));
+
+  // Deleting the same archive twice is an error, not a silent no-op.
+  await assert.rejects(
+    () => worldManager.deleteWorldArchive("DemoServer", capturedB.archiveName),
+    /No archived world named/
+  );
+
+  // The active world is not an archive and must not be deletable this way.
+  await assert.rejects(() => worldManager.deleteWorldArchive("DemoServer", "world"), /No archived world named/);
+
+  // Path traversal must not escape the world library.
+  await assert.rejects(
+    () => worldManager.deleteWorldArchive("DemoServer", "../../../../etc/passwd"),
+    /No archived world named|Invalid archive path/
+  );
+  await assert.rejects(() => worldManager.deleteWorldArchive("DemoServer", ""), /archive name is required/);
+
+  // The traversal attempt must not have removed the surviving archive.
+  const final = await worldManager.listWorlds("DemoServer");
+  assert.equal(final.filter((world) => world.kind === "archive").length, 1);
+});
+
+test("job registry tracks progress, completion and failure", async () => {
+  const jobs = createJobRegistry();
+
+  const job = jobs.create("create-server", { label: "starting", totalSteps: 4 });
+  assert.equal(jobs.get(job.id).status, "running");
+  assert.equal(jobs.get(job.id).progress, 0);
+
+  jobs.progress(job.id, "creating server folders");
+  jobs.progress(job.id, "resolving forge build");
+  const midway = jobs.get(job.id);
+  assert.equal(midway.step, "resolving forge build");
+  assert.equal(midway.stepIndex, 2);
+  assert.equal(midway.progress, 0.5);
+
+  // Progress must never exceed the declared total, even if more steps report.
+  jobs.progress(job.id, "a");
+  jobs.progress(job.id, "b");
+  jobs.progress(job.id, "c");
+  assert.equal(jobs.get(job.id).progress, 1);
+
+  jobs.succeed(job.id, { server: { id: "demo" } });
+  const done = jobs.get(job.id);
+  assert.equal(done.status, "succeeded");
+  assert.equal(done.result.server.id, "demo");
+
+  // A finished job ignores further progress reports.
+  jobs.progress(job.id, "late");
+  assert.equal(jobs.get(job.id).step, "done");
+
+  const failing = jobs.create("create-server", { totalSteps: 2 });
+  jobs.fail(failing.id, new Error("installer exploded"));
+  assert.equal(jobs.get(failing.id).status, "failed");
+  assert.equal(jobs.get(failing.id).error, "installer exploded");
+
+  assert.equal(jobs.get("job_missing"), null);
+});
+
+test("java runtime discovery collapses symlinked duplicates and reports versions", async (t) => {
+  const root = await createFixtureRoot();
+  const store = createStore(root);
+  const serverManager = createServerManager(store);
+
+  t.after(async () => {
+    await fsp.rm(root, { recursive: true, force: true });
+  });
+
+  const runtimes = await serverManager.listJavaRuntimes({ refresh: true });
+
+  // The suite needs a JDK to run Forge installers anyway; if the host has none
+  // there is nothing meaningful to assert.
+  if (!runtimes.length) {
+    t.skip("no java installations detected on this host");
+    return;
+  }
+
+  const paths = runtimes.map((runtime) => runtime.path);
+  assert.equal(new Set(paths).size, paths.length, "paths must be unique");
+
+  // Distributions ship both java-17-... and java-1.17.0-... pointing at one
+  // JDK. Resolving each entry must not surface the same binary twice.
+  const realPaths = await Promise.all(paths.map((javaPath) => fsp.realpath(javaPath)));
+  assert.equal(new Set(realPaths).size, realPaths.length, "symlinked duplicates must be collapsed");
+
+  for (const runtime of runtimes) {
+    assert.match(runtime.version, /^\d/);
+    assert.equal(typeof runtime.major, "number");
+    assert.match(runtime.label, /^Java \d+ \(/);
+    assert.equal(path.isAbsolute(runtime.path), true);
+  }
+
+  // Sorted ascending by major version so the dropdown reads predictably.
+  const majors = runtimes.map((runtime) => runtime.major);
+  assert.deepEqual(majors, [...majors].sort((left, right) => left - right));
+});
+
+test("curseforge search flags mods whose author disabled third-party downloads", async (t) => {
+  const modManager = createModManager({ getServer: async () => null });
+  const previousKey = process.env.CURSEFORGE_API_KEY;
+  const previousFetch = globalThis.fetch;
+  process.env.CURSEFORGE_API_KEY = "test-key";
+
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+    process.env.CURSEFORGE_API_KEY = previousKey;
+    if (previousKey === undefined) {
+      delete process.env.CURSEFORGE_API_KEY;
+    }
+  });
+
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        data: [
+          {
+            allowModDistribution: false,
+            authors: [{ name: "Someone" }],
+            id: 448233,
+            links: { websiteUrl: "https://www.curseforge.com/minecraft/mc-mods/entityculling" },
+            name: "Entity Culling",
+            summary: "skips rendering hidden entities"
+          },
+          {
+            allowModDistribution: true,
+            authors: [{ name: "Someone Else" }],
+            id: 12345,
+            links: { websiteUrl: "javascript:alert(1)" },
+            name: "Open Mod",
+            summary: "installable"
+          }
+        ]
+      }),
+      { headers: { "content-type": "application/json" }, status: 200 }
+    );
+
+  const results = await modManager.search(
+    { loader: "fabric", minecraftVersion: "1.21.11" },
+    "curseforge",
+    "culling"
+  );
+
+  assert.equal(results[0].manualDownloadOnly, true);
+  assert.equal(results[0].pageUrl, "https://www.curseforge.com/minecraft/mc-mods/entityculling");
+  assert.equal(results[1].manualDownloadOnly, false);
+  // A non-http link must never reach the UI, where it would become an href.
+  assert.equal(results[1].pageUrl, "");
+});
+
+test("curseforge installs hand off to a manual download when the author opts out", async (t) => {
+  const root = await createFixtureRoot();
+  const store = createStore(root);
+  const serverManager = createServerManager(store);
+  const modManager = createModManager(serverManager);
+
+  const previousKey = process.env.CURSEFORGE_API_KEY;
+  const previousFetch = globalThis.fetch;
+  process.env.CURSEFORGE_API_KEY = "test-key";
+
+  t.after(async () => {
+    globalThis.fetch = previousFetch;
+    process.env.CURSEFORGE_API_KEY = previousKey;
+    if (previousKey === undefined) {
+      delete process.env.CURSEFORGE_API_KEY;
+    }
+    await fsp.rm(root, { recursive: true, force: true });
+  });
+
+  await store.ensureInitialized();
+  await serverManager.syncDiscoveredServers();
+  await serverManager.setServerMetadata("DemoServer", {
+    loader: "fabric",
+    minecraftVersion: "1.21.11"
+  });
+
+  const requested = [];
+  globalThis.fetch = async (url) => {
+    const href = String(url);
+    requested.push(href);
+
+    if (href.includes("/files/55501/download-url")) {
+      return new Response(JSON.stringify({ data: null }), {
+        headers: { "content-type": "application/json" },
+        status: 200
+      });
+    }
+
+    if (href.includes("/mods/9001/files")) {
+      return new Response(
+        JSON.stringify({
+          data: [
+            {
+              dependencies: [{ modId: 4242, relationType: 3 }],
+              downloadUrl: null,
+              fileDate: "2026-01-01T00:00:00Z",
+              fileName: "guarded-mod-1.0.0.jar",
+              id: 55501,
+              releaseType: 1
+            }
+          ]
+        }),
+        { headers: { "content-type": "application/json" }, status: 200 }
+      );
+    }
+
+    if (href.endsWith("/mods/9001")) {
+      return new Response(
+        JSON.stringify({
+          data: {
+            links: { websiteUrl: "https://www.curseforge.com/minecraft/mc-mods/guarded-mod" },
+            name: "Guarded Mod"
+          }
+        }),
+        { headers: { "content-type": "application/json" }, status: 200 }
+      );
+    }
+
+    throw new Error(`Unexpected request in test: ${href}`);
+  };
+
+  await assert.rejects(
+    () => modManager.install("DemoServer", { modId: "9001", provider: "curseforge" }),
+    (error) => {
+      assert.equal(error.code, "CURSEFORGE_MANUAL_DOWNLOAD_REQUIRED");
+      assert.equal(error.statusCode, 409);
+      assert.equal(error.manualDownload.fileName, "guarded-mod-1.0.0.jar");
+      assert.equal(error.manualDownload.modName, "Guarded Mod");
+      assert.equal(
+        error.manualDownload.pageUrl,
+        "https://www.curseforge.com/minecraft/mc-mods/guarded-mod/files/55501"
+      );
+      return true;
+    }
+  );
+
+  // The opt-out must be detected before any dependency is written to disk.
+  assert.equal(
+    requested.some((href) => href.includes("/mods/4242")),
+    false
+  );
+  assert.deepEqual(await serverManager.listInstalledFiles("DemoServer"), []);
 });
 
 test("world manager can prepare a new generated world and update generation properties", async (t) => {
@@ -380,19 +883,79 @@ test("managed server creation rejects loaders without a safe installer path", as
 
   await store.ensureInitialized();
 
+  // Quilt has no provisioning path, and the rejection happens before any
+  // network call so this stays offline.
   await assert.rejects(
     serverManager.createServer(
       {
-        directoryName: "fabric-lab",
-        loader: "fabric",
+        directoryName: "quilt-lab",
+        loader: "quilt",
         minecraftVersion: "1.21.11",
         mode: "managed",
-        name: "Fabric Lab"
+        name: "Quilt Lab"
       },
       { username: "owner" }
     ),
-    /Managed server creation currently supports vanilla, Paper, and Purpur only/
+    (error) => {
+      assert.match(error.message, /does not support the quilt loader/);
+      // The message must name every loader that can be provisioned.
+      for (const loader of ["vanilla", "paper", "purpur", "fabric", "forge", "neoforge"]) {
+        assert.match(error.message, new RegExp(loader));
+      }
+      return true;
+    }
   );
+});
+
+test("argfile loaders get a launch script that uses their installer argfile", async (t) => {
+  const root = await createFixtureRoot();
+  const store = createStore(root);
+  const serverManager = createServerManager(store);
+
+  t.after(async () => {
+    await fsp.rm(root, { recursive: true, force: true });
+  });
+
+  await store.ensureInitialized();
+  await serverManager.syncDiscoveredServers();
+
+  const argFile = "libraries/net/minecraftforge/forge/1.20.1-47.4.10/unix_args.txt";
+  await serverManager.setServerMetadata("DemoServer", {
+    loader: "forge",
+    managedRuntime: {
+      kind: "forge",
+      launch: { argFile, kind: "argfile" },
+      loaderVersion: "47.4.10",
+      source: "forge 47.4.10"
+    },
+    maxMemory: "10G",
+    minMemory: "2G",
+    minecraftVersion: "1.20.1"
+  });
+
+  await serverManager.ensureManagedServerArtifacts("DemoServer");
+  const script = await fsp.readFile(
+    path.join(root, "servers", "DemoServer", ".rippermoon", "launch-server.sh"),
+    "utf8"
+  );
+
+  // Forge has no server.jar, so the script must not try to run one.
+  assert.equal(script.includes("-jar server.jar"), false);
+  assert.match(script, new RegExp(`@${argFile.replace(/[/.]/g, "\\$&")}`));
+  assert.match(script, /user_jvm_args\.txt/);
+  assert.match(script, /MIN_MEMORY="2G"/);
+  assert.match(script, /MAX_MEMORY="10G"/);
+
+  // A jar-based runtime keeps the original shape.
+  await serverManager.setServerMetadata("DemoServer", {
+    managedRuntime: { kind: "fabric", launch: { kind: "jar" }, source: "fabric" }
+  });
+  await serverManager.ensureManagedServerArtifacts("DemoServer");
+  const jarScript = await fsp.readFile(
+    path.join(root, "servers", "DemoServer", ".rippermoon", "launch-server.sh"),
+    "utf8"
+  );
+  assert.match(jarScript, /-jar server\.jar nogui/);
 });
 
 test("managed server creation defaults the server id to the directory name", async (t) => {

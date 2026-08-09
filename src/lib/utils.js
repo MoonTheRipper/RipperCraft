@@ -19,9 +19,13 @@ async function readJson(filePath, fallbackValue) {
   }
 }
 
-async function writeJson(filePath, value) {
+async function writeJson(filePath, value, options = {}) {
   await ensureDir(path.dirname(filePath));
   await fs.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  if (options.mode !== undefined) {
+    // writeFile only honours mode when creating, so set it explicitly.
+    await fs.chmod(filePath, options.mode);
+  }
 }
 
 function randomId(prefix = "id") {
@@ -101,8 +105,22 @@ async function runCommand(command, args, options = {}) {
       stderr += chunk.toString("utf8");
     });
 
-    child.on("error", reject);
+    const timer = options.timeoutMs
+      ? setTimeout(() => {
+          child.kill("SIGKILL");
+        }, options.timeoutMs)
+      : null;
+
+    child.on("error", (error) => {
+      if (timer) {
+        clearTimeout(timer);
+      }
+      reject(error);
+    });
     child.on("close", (code) => {
+      if (timer) {
+        clearTimeout(timer);
+      }
       if (code === 0) {
         resolve({ stdout, stderr });
         return;

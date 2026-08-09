@@ -11,6 +11,9 @@ WorkingDirectory=/home/ripper-moon/minecraft-server
 Environment=NODE_ENV=production
 Environment=HOST=0.0.0.0
 Environment=PORT=4300
+# Optional secrets (CURSEFORGE_API_KEY, ...). The leading "-" keeps the service
+# starting normally when the file is absent. Never commit the key itself.
+EnvironmentFile=-/etc/rippermoonstash.env
 Environment=PATH=/home/ripper-moon/.nvm/versions/node/v24.15.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/home/ripper-moon/.nvm/versions/node/v24.15.0/bin/node /home/ripper-moon/minecraft-server/src/server.js
 Restart=on-failure

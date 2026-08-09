@@ -12,6 +12,12 @@
       "publicPort": 8659,
       "priority": 1,
       "weight": 1
+    },
+    "TheLastOfMines": {
+      "publicHost": "atoms-lister.tun.ply.gg",
+      "publicPort": 60282,
+      "priority": 1,
+      "weight": 1
     }
   }
 }

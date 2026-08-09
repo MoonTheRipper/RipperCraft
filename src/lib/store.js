@@ -1,4 +1,5 @@
 const path = require("node:path");
+const fsp = require("node:fs/promises");
 const crypto = require("node:crypto");
 const { ensureDir, nowIso, randomId, readJson, writeJson } = require("./utils");
 
@@ -7,6 +8,25 @@ function createStore(rootDir) {
   const USERS_FILE = path.join(DATA_DIR, "users.json");
   const SERVERS_FILE = path.join(DATA_DIR, "servers.json");
   const APP_FILE = path.join(DATA_DIR, "app.json");
+  // app.json holds the cookie secret and integration keys, users.json holds
+  // password hashes, servers.json holds per-server passphrase hashes. None of
+  // them should be world-readable.
+  const SECRET_FILE_MODE = 0o600;
+  let hardenedExistingFiles = false;
+
+  async function hardenSecretFiles() {
+    if (hardenedExistingFiles) {
+      return;
+    }
+    hardenedExistingFiles = true;
+    for (const file of [APP_FILE, USERS_FILE, SERVERS_FILE]) {
+      try {
+        await fsp.chmod(file, SECRET_FILE_MODE);
+      } catch {
+        // Missing file or a filesystem without permissions; nothing to harden.
+      }
+    }
+  }
 
   async function ensureInitialized() {
     await ensureDir(DATA_DIR);
@@ -14,25 +34,32 @@ function createStore(rootDir) {
     const app = await readJson(APP_FILE, null);
     if (!app) {
       const timestamp = nowIso();
-      await writeJson(APP_FILE, {
-        appName: "RipperMoonStash",
-        cookieSecret: crypto.randomBytes(32).toString("hex"),
-        sessionTtlHours: 24,
-        unlockTtlMinutes: 20,
-        createdAt: timestamp,
-        updatedAt: timestamp
-      });
+      await writeJson(
+        APP_FILE,
+        {
+          appName: "RipperMoonStash",
+          cookieSecret: crypto.randomBytes(32).toString("hex"),
+          integrations: {},
+          sessionTtlHours: 24,
+          unlockTtlMinutes: 20,
+          createdAt: timestamp,
+          updatedAt: timestamp
+        },
+        { mode: SECRET_FILE_MODE }
+      );
     }
 
     const users = await readJson(USERS_FILE, null);
     if (!users) {
-      await writeJson(USERS_FILE, { users: [] });
+      await writeJson(USERS_FILE, { users: [] }, { mode: SECRET_FILE_MODE });
     }
 
     const servers = await readJson(SERVERS_FILE, null);
     if (!servers) {
-      await writeJson(SERVERS_FILE, { servers: {} });
+      await writeJson(SERVERS_FILE, { servers: {} }, { mode: SECRET_FILE_MODE });
     }
+
+    await hardenSecretFiles();
   }
 
   async function getAppConfig() {
@@ -44,8 +71,29 @@ function createStore(rootDir) {
     await ensureInitialized();
     const current = await getAppConfig();
     const merged = { ...current, ...nextConfig, updatedAt: nowIso() };
-    await writeJson(APP_FILE, merged);
+    await writeJson(APP_FILE, merged, { mode: SECRET_FILE_MODE });
     return merged;
+  }
+
+  async function getIntegrations() {
+    const config = await getAppConfig();
+    return config.integrations && typeof config.integrations === "object" ? config.integrations : {};
+  }
+
+  // Patch keys with a blank value are removed rather than stored empty, so
+  // "configured" always means "has a usable value".
+  async function saveIntegrations(patch) {
+    const next = { ...(await getIntegrations()) };
+    for (const [key, value] of Object.entries(patch || {})) {
+      const trimmed = typeof value === "string" ? value.trim() : value;
+      if (!trimmed) {
+        delete next[key];
+      } else {
+        next[key] = trimmed;
+      }
+    }
+    await saveAppConfig({ integrations: next });
+    return next;
   }
 
   async function getUsers() {
@@ -56,7 +104,7 @@ function createStore(rootDir) {
 
   async function saveUsers(users) {
     await ensureInitialized();
-    await writeJson(USERS_FILE, { users });
+    await writeJson(USERS_FILE, { users }, { mode: SECRET_FILE_MODE });
   }
 
   async function hasUsers() {
@@ -104,7 +152,7 @@ function createStore(rootDir) {
 
   async function saveServerRecords(records) {
     await ensureInitialized();
-    await writeJson(SERVERS_FILE, { servers: records });
+    await writeJson(SERVERS_FILE, { servers: records }, { mode: SECRET_FILE_MODE });
   }
 
   async function updateServerRecord(serverId, patch) {
@@ -142,11 +190,13 @@ function createStore(rootDir) {
     deleteServerRecord,
     ensureInitialized,
     getAppConfig,
+    getIntegrations,
     getServerRecords,
     getUsers,
     hasUsers,
     rootDir,
     saveAppConfig,
+    saveIntegrations,
     saveServerRecords,
     saveUsers,
     updateServerRecord,

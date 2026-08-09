@@ -10,6 +10,15 @@ const state = {
   createServerMinecraftVersion: "latest",
   createVersionOpen: false,
   editingUserId: null,
+  createJob: null,
+  integrations: null,
+  logAutoRefresh: localStorage.getItem("rippermoonstash-log-auto") !== "off",
+  modUpdates: null,
+  logOrder: localStorage.getItem("rippermoonstash-log-order") === "newest" ? "newest" : "oldest",
+  javaRuntimes: [],
+  manualDownload: null,
+  modProvider: "modrinth",
+  modQuery: "",
   modResults: [],
   navOpen: false,
   notice: null,
@@ -31,8 +40,13 @@ const SERVER_SECTIONS = [
 
 const OWNER_SECTIONS = [
   ["servers", "server registry"],
-  ["admins", "admins"]
+  ["admins", "admins"],
+  ["integrations", "integrations"]
 ];
+
+// Every loader that can be set as a label. Which of these can actually be
+// provisioned comes from the backend - see installableLoaders().
+const ALL_LOADERS = ["vanilla", "fabric", "forge", "neoforge", "quilt", "paper", "purpur", "custom"];
 
 const ICONS = {
   admin: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.2a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5Zm-4.5 10a4.5 4.5 0 1 1 9 0v.8h-9Z" fill="currentColor"/></svg>',
@@ -126,7 +140,14 @@ async function api(path, options = {}) {
     : await response.text();
 
   if (!response.ok) {
-    throw new Error(payload.error || payload || "Request failed.");
+    const error = new Error((payload && payload.error) || payload || "Request failed.");
+    if (payload && payload.code) {
+      error.code = payload.code;
+    }
+    if (payload && payload.manualDownload) {
+      error.manualDownload = payload.manualDownload;
+    }
+    throw error;
   }
 
   return payload;
@@ -338,17 +359,85 @@ async function loadVersionCatalog() {
   state.versionCatalog = await api("/api/minecraft/versions");
 }
 
+async function loadIntegrations() {
+  if (!state.bootstrap?.user || state.bootstrap.user.role !== "owner") {
+    state.integrations = null;
+    return;
+  }
+  const payload = await api("/api/settings/integrations");
+  state.integrations = payload.integrations;
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+// Polls a provisioning job to completion, re-rendering on each step so the
+// progress panel actually moves during a long Forge install.
+async function pollCreateJob(jobId) {
+  for (;;) {
+    await wait(1000);
+
+    let payload;
+    try {
+      payload = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
+    } catch (error) {
+      state.createJob = null;
+      setNotice("error", `lost track of the creation job: ${error.message}`);
+      return;
+    }
+
+    state.createJob = payload.job;
+
+    if (payload.job.status === "succeeded") {
+      const created = payload.job.result && payload.job.result.server;
+      state.createJob = null;
+      state.createVersionOpen = false;
+      state.createServerMinecraftVersion = "latest";
+      if (created) {
+        state.selectedServerId = created.id;
+        state.view = "server";
+        state.serverSection = "overview";
+      }
+      setNotice("success", created ? `created ${created.name}` : "server created");
+      await refreshAll();
+      return;
+    }
+
+    if (payload.job.status === "failed") {
+      state.createJob = null;
+      setNotice("error", payload.job.error || "server creation failed");
+      return;
+    }
+
+    render();
+  }
+}
+
+async function loadJavaRuntimes() {
+  if (!state.bootstrap?.user || state.bootstrap.user.role !== "owner") {
+    state.javaRuntimes = [];
+    return;
+  }
+  const payload = await api("/api/java-runtimes");
+  state.javaRuntimes = payload.runtimes || [];
+}
+
 async function refreshAll() {
   await loadBootstrap();
   if (state.bootstrap.loggedIn) {
     await loadServers();
     await loadSnapshot();
     await loadUsers();
+    await loadIntegrations();
+    await loadJavaRuntimes();
     await loadVersionCatalog();
   } else {
     state.servers = [];
     state.serverSnapshot = null;
     state.users = [];
+    state.integrations = null;
+    state.javaRuntimes = [];
     state.versionCatalog = null;
     state.updatePlan = null;
   }
@@ -680,6 +769,66 @@ function renderUpdatesSection(snapshot) {
   );
 }
 
+function renderJavaBinSelect(server) {
+  const runtimes = Array.isArray(state.javaRuntimes) ? state.javaRuntimes : [];
+  const current = server.javaBin || "";
+  const known = runtimes.some((runtime) => runtime.path === current);
+
+  return `
+    <select name="javaBin">
+      <option value=""${current ? "" : " selected"}>use dashboard default</option>
+      ${runtimes
+        .map(
+          (runtime) =>
+            `<option value="${escapeHtml(runtime.path)}"${runtime.path === current ? " selected" : ""}>${escapeHtml(runtime.label)}</option>`
+        )
+        .join("")}
+      ${current && !known
+        ? `<option value="${escapeHtml(current)}" selected>${escapeHtml(current)} (not detected)</option>`
+        : ""}
+    </select>
+  `;
+}
+
+function renderJavaBinNote(server) {
+  const runtimes = Array.isArray(state.javaRuntimes) ? state.javaRuntimes : [];
+  const current = server.javaBin || "";
+  const known = runtimes.some((runtime) => runtime.path === current);
+
+  if (!runtimes.length) {
+    return `<p class="muted">no java installations were detected on this machine. the dashboard default will be used.</p>`;
+  }
+  if (current && !known) {
+    return `<p class="muted">this server points at <code>${escapeHtml(current)}</code>, which was not found on this machine. the server will fail to start until you pick a detected version.</p>`;
+  }
+  return `<p class="muted">only set this when a server needs a different jdk from the rest, for example forge 1.20.1 wants java 17 while newer versions want java 21+. detected from this machine: ${runtimes.map((runtime) => escapeHtml(String(runtime.major ?? "?"))).join(", ")}.</p>`;
+}
+
+// Catches the silent failure where the loader label says forge but the runtime
+// on disk is vanilla: the server boots fine and loads no mods at all.
+function renderLoaderMismatchWarning(server) {
+  const runtime = server.managedRuntime;
+  if (!runtime || !runtime.kind) {
+    return "";
+  }
+
+  const declared = String(server.loader || "").toLowerCase();
+  const actual = String(runtime.kind).toLowerCase();
+  if (declared === actual) {
+    return "";
+  }
+
+  return `
+    <div class="list-row list-row--notice">
+      <div class="list-row__main">
+        <strong>loader mismatch</strong>
+        <p class="muted">this server is labelled <code>${escapeHtml(declared || "unset")}</code> but the runtime installed on disk is <code>${escapeHtml(actual)}</code>${runtime.loaderVersion ? ` (${escapeHtml(runtime.loaderVersion)})` : ""}.</p>
+        <p class="muted">the label only changes which folder add-ons install into. it does not install a loader, so ${escapeHtml(declared || "that loader")} mods will not load. recreate this server with the ${escapeHtml(declared || "intended")} loader, or set the label back to <code>${escapeHtml(actual)}</code>.</p>
+      </div>
+    </div>
+  `;
+}
+
 function renderSettingsSection(snapshot) {
   const permissions = getServerPermissions(snapshot);
   if (!permissions.canAccessDangerousSettings) {
@@ -691,6 +840,7 @@ function renderSettingsSection(snapshot) {
     "settings",
     "metadata and server.properties",
     `
+      ${renderLoaderMismatchWarning(server)}
       <form data-form="save-settings" class="form-grid">
         <div class="input-grid">
           <label>
@@ -700,7 +850,7 @@ function renderSettingsSection(snapshot) {
           <label>
             <span>loader</span>
             <select name="loader">
-              ${["vanilla", "fabric", "forge", "neoforge", "quilt", "paper", "purpur", "custom"]
+              ${ALL_LOADERS
                 .map((loader) => `<option value="${loader}" ${server.loader === loader ? "selected" : ""}>${loader}</option>`)
                 .join("")}
             </select>
@@ -721,7 +871,12 @@ function renderSettingsSection(snapshot) {
             <span>start command</span>
             <input name="startCommand" value="${escapeHtml(server.startCommand || "./launch-server.sh")}" />
           </label>
+          <label>
+            <span>java version</span>
+            ${renderJavaBinSelect(server)}
+          </label>
         </div>
+        ${renderJavaBinNote(server)}
         <label>
           <span>description</span>
           <input name="description" value="${escapeHtml(server.description || "")}" />
@@ -738,8 +893,66 @@ function renderSettingsSection(snapshot) {
           <button class="button button--primary" type="submit">${labelWithIcon("settings", "save settings")}</button>
         </div>
       </form>
+      ${renderServerOperatorsPanel(snapshot)}
     `
   );
+}
+
+function renderServerOperatorsPanel(snapshot) {
+  const operators = snapshot.operators || [];
+  return `
+    <div class="subpanel">
+      <div class="section-heading">
+        <div>
+          <p class="brand-line">server admins</p>
+          <h3>in-game operators</h3>
+        </div>
+      </div>
+      <form data-form="add-server-operator" class="form-grid">
+        <div class="input-grid">
+          <label>
+            <span>player name</span>
+            <input name="name" placeholder="RipperMoon" required />
+          </label>
+          <label>
+            <span>uuid</span>
+            <input name="uuid" placeholder="leave blank for cracked/offline UUID" />
+          </label>
+          <label>
+            <span>op level</span>
+            <select name="level">
+              <option value="4">4 - owner</option>
+              <option value="3">3 - admin</option>
+              <option value="2">2 - moderator</option>
+              <option value="1">1 - helper</option>
+            </select>
+          </label>
+          <label class="checkbox-line">
+            <input type="checkbox" name="bypassesPlayerLimit" />
+            <span>bypass player limit</span>
+          </label>
+        </div>
+        <div class="submit-line">
+          <button class="button button--primary" type="submit">${labelWithIcon("admin", "add admin")}</button>
+        </div>
+      </form>
+      <div class="list-stack">
+        ${operators.length
+          ? operators
+              .map((operator) => `
+                <div class="list-row admin-row">
+                  <div>
+                    <strong>${escapeHtml(operator.name)}</strong>
+                    <p class="muted">${escapeHtml(operator.uuid)} • level ${escapeHtml(String(operator.level || 4))}${operator.bypassesPlayerLimit ? " • bypasses limit" : ""}</p>
+                  </div>
+                  <button class="button button--quiet button--compact" type="button" data-action="remove-server-operator" data-uuid="${escapeHtml(operator.uuid)}">${labelWithIcon("delete", "remove")}</button>
+                </div>
+              `)
+              .join("")
+          : `<p class="muted">no in-game operators are configured for this server.</p>`}
+      </div>
+    </div>
+  `;
 }
 
 function renderAdminSettingsSection(snapshot) {
@@ -756,7 +969,7 @@ function renderAdminSettingsSection(snapshot) {
               <label>
                 <span>add-on loader</span>
                 <select name="loader">
-                  ${["vanilla", "fabric", "forge", "neoforge", "quilt", "paper", "purpur", "custom"]
+                  ${ALL_LOADERS
                     .map((loader) => `<option value="${loader}" ${server.loader === loader ? "selected" : ""}>${loader}</option>`)
                     .join("")}
                 </select>
@@ -841,6 +1054,9 @@ function renderWorldsSection(snapshot) {
                         : `
                           <button class="button button--quiet" data-action="activate-world" data-archive-name="${escapeHtml(world.name)}">${labelWithIcon("start", "activate")}</button>
                           <a class="button button--quiet" href="/api/servers/${encodeURIComponent(server.id)}/worlds/download?name=${encodeURIComponent(world.name)}">${labelWithIcon("overview", "download")}</a>
+                          ${permissions.canCreateWorlds
+                            ? `<button class="button button--danger" data-action="delete-world" data-archive-name="${escapeHtml(world.name)}" data-size="${escapeHtml(world.size ? `${(world.size / 1024 / 1024).toFixed(2)} MB` : "unknown size")}">${labelWithIcon("stop", "delete")}</button>`
+                            : ""}
                         `}
                     </div>
                   </div>
@@ -869,11 +1085,75 @@ function renderWorldsSection(snapshot) {
   );
 }
 
+function findAddonUpdate(fileName) {
+  if (!state.modUpdates) {
+    return null;
+  }
+  return state.modUpdates.entries.find((entry) => entry.fileName === fileName) || null;
+}
+
+function renderAddonUpdateLabel(update) {
+  if (!update) {
+    return "";
+  }
+  if (update.status === "update-available") {
+    return ` • <strong>update: ${escapeHtml(update.latestFileName)}</strong>`;
+  }
+  if (update.status === "up-to-date") {
+    return " • up to date";
+  }
+  if (update.status === "untracked") {
+    return " • untracked";
+  }
+  if (update.status === "error") {
+    return ` • check failed: ${escapeHtml(update.reason || "")}`;
+  }
+  return " • no provider";
+}
+
+function renderAddonUpdatePanel() {
+  const updates = state.modUpdates;
+  if (!updates) {
+    return "";
+  }
+
+  const counts = updates.entries.reduce((totals, entry) => {
+    totals[entry.status] = (totals[entry.status] || 0) + 1;
+    return totals;
+  }, {});
+  const summary = [
+    `${counts["update-available"] || 0} with updates`,
+    `${counts["up-to-date"] || 0} up to date`,
+    `${counts.unsupported || 0} manual`,
+    `${counts.untracked || 0} untracked`,
+    `${counts.error || 0} failed`
+  ].join(" • ");
+
+  return `
+    <div class="list-row ${updates.updatable ? "list-row--notice" : ""}">
+      <div class="list-row__main">
+        <strong>add-on updates for ${escapeHtml(updates.loader)} ${escapeHtml(updates.gameVersion || "unknown")}</strong>
+        <p class="muted">${escapeHtml(summary)}</p>
+        <p class="muted">updates stay on minecraft ${escapeHtml(updates.gameVersion || "")} — the game version is never changed here. the server is stopped before any jar is swapped.</p>
+      </div>
+      <div class="row-actions">
+        ${updates.updatable
+          ? `<button class="button button--primary" data-action="update-all-mods">${labelWithIcon("refresh", `update all (${updates.updatable})`)}</button>`
+          : ""}
+        <button class="button button--quiet" data-action="dismiss-mod-updates">${labelWithIcon("stop", "hide")}</button>
+      </div>
+    </div>
+  `;
+}
+
 function renderModsSection(snapshot) {
   const { server, mods, runtime, addonCompatibility } = snapshot;
   const permissions = getServerPermissions(snapshot);
   const providers = state.bootstrap.providers;
   const canUseCurseforge = providers.curseforge && addonCompatibility.supportsCurseforge;
+  // Keep the chosen provider across the re-render that follows a search, and
+  // never leave curseforge selected on a server that cannot use it.
+  const activeProvider = state.modProvider === "curseforge" && canUseCurseforge ? "curseforge" : "modrinth";
   const results = state.modResults.length
     ? `
         <div class="list-rows">
@@ -886,16 +1166,23 @@ function renderModsSection(snapshot) {
                     <p class="muted">${escapeHtml(result.provider)} • ${escapeHtml(result.author || "unknown author")} • ${Number(result.downloads || 0).toLocaleString()} downloads</p>
                     ${result.compatibilityLabel ? `<p class="muted">${escapeHtml(result.compatibilityLabel)}</p>` : ""}
                     <p class="muted">${escapeHtml(result.description || "")}</p>
+                    ${result.manualDownloadOnly
+                      ? `<p class="muted">manual download only — this author disabled third-party downloads.</p>`
+                      : ""}
                   </div>
                   <div class="row-actions">
-                    <button
+                    ${result.manualDownloadOnly
+                      ? (result.pageUrl
+                          ? `<a class="button button--quiet" href="${escapeHtml(result.pageUrl)}" target="_blank" rel="noopener noreferrer">${labelWithIcon("mods", "open curseforge")}</a>`
+                          : "")
+                      : `<button
                       class="button button--quiet"
                       data-action="install-result"
                       data-provider="${escapeHtml(result.provider)}"
                       data-id="${escapeHtml(result.id)}"
                     >
                       ${labelWithIcon("mods", "install")}
-                    </button>
+                    </button>`}
                   </div>
                 </div>
               `
@@ -904,6 +1191,26 @@ function renderModsSection(snapshot) {
         </div>
       `
     : `<p class="muted">only compatibility-matching add-ons are listed here for ${escapeHtml(server.loader)} on ${escapeHtml(server.minecraftVersion || "unknown")}.</p>`;
+
+  const handoff = state.manualDownload;
+  const manualDownload = handoff
+    ? `
+        <div class="list-row list-row--notice">
+          <div class="list-row__main">
+            <strong>manual download required</strong>
+            <p class="muted">${escapeHtml(handoff.modName)} cannot be fetched automatically. its author disabled third-party downloads on curseforge.</p>
+            ${handoff.fileName ? `<p class="muted">file: <code>${escapeHtml(handoff.fileName)}</code></p>` : ""}
+            <p class="muted">download it, then add it below with "upload file".</p>
+          </div>
+          <div class="row-actions">
+            ${handoff.pageUrl
+              ? `<a class="button button--quiet" href="${escapeHtml(handoff.pageUrl)}" target="_blank" rel="noopener noreferrer">${labelWithIcon("mods", "open curseforge")}</a>`
+              : ""}
+            <button class="button button--quiet" data-action="dismiss-manual-download">${labelWithIcon("stop", "dismiss")}</button>
+          </div>
+        </div>
+      `
+    : "";
 
   return renderSection(
     "mods",
@@ -915,10 +1222,10 @@ function renderModsSection(snapshot) {
           ? `
             <form data-form="search-mods" class="form-inline">
               <select name="provider">
-                <option value="modrinth">modrinth</option>
-                ${canUseCurseforge ? `<option value="curseforge">curseforge</option>` : ""}
+                <option value="modrinth"${activeProvider === "modrinth" ? " selected" : ""}>modrinth</option>
+                ${canUseCurseforge ? `<option value="curseforge"${activeProvider === "curseforge" ? " selected" : ""}>curseforge</option>` : ""}
               </select>
-              <input name="query" placeholder="search mods or plugins" required />
+              <input name="query" value="${escapeHtml(state.modQuery)}" placeholder="search mods or plugins" required />
               <button class="button button--primary" type="submit">${labelWithIcon("search", "search")}</button>
             </form>
           `
@@ -941,28 +1248,47 @@ function renderModsSection(snapshot) {
             <p class="muted">direct urls and uploads stay hidden unless this account can manage add-ons and the server uses a supported add-on loader.</p>
           `}
       </div>
+      ${manualDownload}
       ${results}
+      ${renderAddonUpdatePanel()}
       <div class="list-rows">
         <div class="list-row list-row--header">
           <strong>installed</strong>
+          <div class="row-actions">
+            ${permissions.canManageAddonSettings
+              ? `<button class="button button--quiet" data-action="check-mod-updates">${labelWithIcon("refresh", state.modUpdates ? "re-check updates" : "check for updates")}</button>`
+              : ""}
+            <a class="button button--quiet" href="/api/servers/${encodeURIComponent(server.id)}/mods/client-list">${labelWithIcon("logs", "client list (.txt)")}</a>
+            <a class="button button--quiet" href="/api/servers/${encodeURIComponent(server.id)}/mods/modpack">${labelWithIcon("mods", "client modpack (.mrpack)")}</a>
+          </div>
         </div>
         ${mods.length
           ? mods
               .map(
-                (item) => `
-                  <div class="list-row">
+                (item) => {
+                  const fileName = typeof item === "string" ? item : item.fileName;
+                  const enabled = typeof item === "string" ? true : item.enabled !== false;
+                  const update = findAddonUpdate(fileName);
+                  return `
+                  <div class="list-row ${update && update.status === "update-available" ? "list-row--notice" : ""}">
                     <div class="list-row__main">
-                      <code>${escapeHtml(item)}</code>
+                      <code>${escapeHtml(fileName)}</code>
+                      <p class="muted">${enabled ? "enabled" : "disabled"}${renderAddonUpdateLabel(update)}</p>
                     </div>
                     ${permissions.canManageAddonSettings
                       ? `
                         <div class="row-actions">
-                          <button class="button button--quiet" data-action="remove-mod" data-file-name="${escapeHtml(item)}">${labelWithIcon("stop", "remove")}</button>
+                          ${update && update.status === "update-available"
+                            ? `<button class="button button--primary" data-action="update-mod" data-file-name="${escapeHtml(fileName)}">${labelWithIcon("refresh", "update")}</button>`
+                            : ""}
+                          <button class="button button--quiet" data-action="toggle-mod" data-file-name="${escapeHtml(fileName)}" data-enabled="${enabled ? "true" : "false"}">${labelWithIcon(enabled ? "stop" : "start", enabled ? "disable" : "enable")}</button>
+                          <button class="button button--quiet" data-action="remove-mod" data-file-name="${escapeHtml(fileName)}">${labelWithIcon("stop", "remove")}</button>
                         </div>
                       `
                       : ""}
                   </div>
-                `
+                `;
+                }
               )
               .join("")
           : `<p class="muted">nothing installed yet</p>`}
@@ -971,24 +1297,63 @@ function renderModsSection(snapshot) {
   );
 }
 
+const LOG_LINE_LIMIT = 500;
+
+// Keeps the tail, not the head: an 800-line log should open on the newest
+// output, and the oldest lines are the ones worth dropping.
+function prepareLogText(raw, emptyMessage) {
+  const text = String(raw || "").replace(/\s+$/, "");
+  if (!text) {
+    return { hiddenLines: 0, text: emptyMessage, totalLines: 0 };
+  }
+
+  const lines = text.split("\n");
+  const kept = lines.slice(-LOG_LINE_LIMIT);
+  if (state.logOrder === "newest") {
+    kept.reverse();
+  }
+  return {
+    hiddenLines: lines.length - kept.length,
+    text: kept.join("\n"),
+    totalLines: lines.length
+  };
+}
+
+function renderLogPane(key, label, raw, emptyMessage) {
+  const prepared = prepareLogText(raw, emptyMessage);
+  const meta = prepared.totalLines
+    ? `${prepared.totalLines} lines${prepared.hiddenLines ? ` • oldest ${prepared.hiddenLines} hidden` : ""}`
+    : "empty";
+
+  return `
+    <div class="log-pane">
+      <p class="log-label">${escapeHtml(label)} <span class="muted">${escapeHtml(meta)}</span></p>
+      <pre data-log-pane="${escapeHtml(key)}">${escapeHtml(prepared.text)}</pre>
+    </div>
+  `;
+}
+
 function renderLogsSection(snapshot) {
   const { logs } = snapshot;
+  const newestFirst = state.logOrder === "newest";
   return renderSection(
     "logs",
     "latest.log and runtime.log",
     `
       <div class="submit-line">
         <button class="button button--quiet" data-action="refresh-logs">${labelWithIcon("refresh", "refresh logs")}</button>
+        <button class="button ${state.logAutoRefresh ? "button--primary" : "button--quiet"}" data-action="toggle-log-auto">
+          ${labelWithIcon("refresh", state.logAutoRefresh ? "live: on" : "live: off")}
+        </button>
+        <button class="button button--quiet" data-action="toggle-log-order">
+          ${labelWithIcon("settings", newestFirst ? "switch to oldest first" : "switch to newest first")}
+        </button>
+        ${newestFirst ? "" : `<button class="button button--quiet" data-action="jump-to-latest">${labelWithIcon("refresh", "jump to latest")}</button>`}
       </div>
+      <p class="muted">${state.logAutoRefresh ? `refreshing every ${LOG_POLL_INTERVAL_MS / 1000}s while this tab is open. ` : ""}${newestFirst ? "reversed: the newest line is at the top." : `opens at the newest output. showing at most the last ${LOG_LINE_LIMIT} lines.`}</p>
       <div class="log-grid">
-        <div class="log-pane">
-          <p class="log-label">latest.log</p>
-          <pre>${escapeHtml(logs.latestLog || "No latest.log content yet.")}</pre>
-        </div>
-        <div class="log-pane">
-          <p class="log-label">runtime.log</p>
-          <pre>${escapeHtml(logs.runtimeLog || "No runtime log content yet.")}</pre>
-        </div>
+        ${renderLogPane("latest", "latest.log", logs.latestLog, "No latest.log content yet.")}
+        ${renderLogPane("runtime", "runtime.log", logs.runtimeLog, "No runtime log content yet.")}
       </div>
     `
   );
@@ -1081,8 +1446,53 @@ function renderServerContent() {
   `;
 }
 
+// The backend is the authority on what it can provision; fall back to the
+// conservative original set if bootstrap has not landed yet.
+function installableLoaders() {
+  const fromServer = state.bootstrap?.installableLoaders;
+  return Array.isArray(fromServer) && fromServer.length ? fromServer : ["vanilla", "paper", "purpur"];
+}
+
+function isInstallableLoader(loader) {
+  return installableLoaders().includes(String(loader || "").toLowerCase());
+}
+
+function createLoaderNote(mode, loader) {
+  if (mode === "existing") {
+    return `existing mode will register the folder as a ${loader} server. nothing is downloaded or installed.`;
+  }
+  if (isInstallableLoader(loader)) {
+    return `managed mode will provision a ${loader} server for the selected minecraft version.`;
+  }
+  return `${loader} cannot be provisioned automatically. install it yourself and switch to existing mode, otherwise you get a vanilla server labelled ${loader} that loads no mods.`;
+}
+
+function renderCreateProgress() {
+  const job = state.createJob;
+  if (!job) {
+    return "";
+  }
+
+  const percent = Math.round((job.progress || 0) * 100);
+  // The installer step can hold for ~25s; an elapsed counter keeps it from
+  // looking frozen while the bar is stationary.
+  const elapsedSeconds = Math.max(0, Math.round((Date.now() - new Date(job.createdAt).getTime()) / 1000));
+  return renderSection(
+    "creating server",
+    `step ${job.stepIndex} of ${job.totalSteps} • ${elapsedSeconds}s elapsed`,
+    `
+      <p>${escapeHtml(job.step || "working")}…</p>
+      <div class="progress-track" role="progressbar" aria-valuenow="${percent}" aria-valuemin="0" aria-valuemax="100">
+        <div class="progress-track__fill" style="width: ${percent}%"></div>
+      </div>
+      <p class="muted">${percent}% • forge and neoforge run a real installer, so that step alone takes about 25 seconds. leaving this page does not cancel it.</p>
+    `
+  );
+}
+
 function renderOwnerServers() {
   return `
+    ${renderCreateProgress()}
     ${renderSection(
       "create or register server",
       "create a managed server folder or register an existing one",
@@ -1107,10 +1517,15 @@ function renderOwnerServers() {
             <label>
               <span>loader</span>
               <select name="loader">
-                ${["vanilla", "fabric", "forge", "neoforge", "quilt", "paper", "purpur", "custom"]
-                  .map((loader) => `<option value="${loader}">${loader}</option>`)
-                  .join("")}
+                ${ALL_LOADERS.map(
+                  (loader) =>
+                    `<option value="${loader}">${loader}${isInstallableLoader(loader) ? "" : " (existing folders only)"}</option>`
+                ).join("")}
               </select>
+            </label>
+            <label>
+              <span>java version</span>
+              ${renderJavaBinSelect({ javaBin: "" })}
             </label>
             <label>
               <span>passphrase</span>
@@ -1118,7 +1533,7 @@ function renderOwnerServers() {
             </label>
           </div>
           ${renderCreateVersionPicker()}
-          <p class="muted" data-create-loader-note>managed mode supports vanilla, Paper, and Purpur. Fabric, Forge, NeoForge, Quilt, and custom loaders can be registered through existing folders.</p>
+          <p class="muted" data-create-loader-note>${escapeHtml(createLoaderNote("managed", "vanilla"))}</p>
           <label>
             <span>description</span>
             <input name="description" />
@@ -1360,17 +1775,80 @@ function renderOwnerAdmins() {
   `;
 }
 
+const OWNER_PAGE_COPY = {
+  admins: ["owner / admins", "manage who can see and control each server"],
+  integrations: ["owner / integrations", "api credentials shared by every server on this dashboard"],
+  servers: ["owner / server registry", "create new server entries and review what is registered"]
+};
+
 function renderOwnerContent() {
-  const title = state.ownerSection === "admins" ? "owner / admins" : "owner / server registry";
-  const subtitle =
+  const [title, subtitle] = OWNER_PAGE_COPY[state.ownerSection] || OWNER_PAGE_COPY.servers;
+  const body =
     state.ownerSection === "admins"
-      ? "manage who can see and control each server"
-      : "create new server entries and review what is registered";
+      ? renderOwnerAdmins()
+      : state.ownerSection === "integrations"
+        ? renderOwnerIntegrations()
+        : renderOwnerServers();
 
   return `
     ${renderPageHeader(title, "owner controls", subtitle)}
-    ${state.ownerSection === "admins" ? renderOwnerAdmins() : renderOwnerServers()}
+    ${body}
   `;
+}
+
+function renderOwnerIntegrations() {
+  const curseforge = state.integrations?.curseforge;
+  if (!curseforge) {
+    return renderSection("integrations", "loading", `<p class="muted">loading credentials…</p>`);
+  }
+
+  const override = curseforge.envOverride;
+  const statusLine = curseforge.stored
+    ? `<p class="muted">a key is saved in this dashboard${curseforge.hint ? ` • ends in <code>${escapeHtml(curseforge.hint)}</code>` : ""}</p>`
+    : `<p class="muted">no key is saved in this dashboard.</p>`;
+
+  // When an environment variable is in force, saving here still works but has
+  // no effect until it is removed - so spell out the file, line and command.
+  const overrideNotice = override
+    ? `
+      <div class="list-row list-row--notice">
+        <div class="list-row__main">
+          <strong>an environment variable is in control</strong>
+          <p class="muted">the active key comes from <code>${escapeHtml(override.variable)}</code> in this service's environment, which overrides anything saved below.</p>
+          <p class="muted">to manage the key from this page instead, remove that line and restart:</p>
+          <pre>sudo nano ${escapeHtml(override.envFile)}
+# delete the ${escapeHtml(override.variable)}=... line, save, then:
+sudo systemctl restart ${escapeHtml(override.service)}</pre>
+          <p class="muted">if the variable is set somewhere else, check <code>systemctl cat ${escapeHtml(override.service)}</code> for other <code>Environment=</code> or <code>EnvironmentFile=</code> lines.</p>
+        </div>
+      </div>
+    `
+    : "";
+
+  return renderSection(
+    "curseforge",
+    curseforge.configured ? `connected via ${curseforge.source}` : "not connected",
+    `
+      ${overrideNotice}
+      ${statusLine}
+      <form data-form="save-integration" class="form-grid">
+        <label>
+          api key
+          <input name="curseforgeApiKey" type="password" autocomplete="off" placeholder="paste a key from console.curseforge.com" />
+        </label>
+        <p class="muted">the key is verified against curseforge before it is saved, and is never sent back to this page. get one at <code>console.curseforge.com</code> → api keys.</p>
+        <div class="row-actions">
+          <button class="button button--primary" type="submit">${labelWithIcon("mods", "save key")}</button>
+          ${curseforge.configured
+            ? `<button class="button button--quiet" type="button" data-action="test-integration">${labelWithIcon("search", "test connection")}</button>`
+            : ""}
+          ${curseforge.stored
+            ? `<button class="button button--danger" type="button" data-action="clear-integration">${labelWithIcon("stop", "remove saved key")}</button>`
+            : ""}
+        </div>
+      </form>
+    `
+  );
 }
 
 function render() {
@@ -1433,6 +1911,105 @@ function render() {
     ${renderVersionDatalist("minecraft-version-list", false)}
     ${renderVersionDatalist("minecraft-version-list-create", true)}
   `;
+
+  applyLogScroll();
+  syncLogPolling();
+}
+
+const LOG_POLL_INTERVAL_MS = 3000;
+let logPollTimer = null;
+let logPollInFlight = false;
+let logPollFailures = 0;
+
+function logsTabIsOpen() {
+  return (
+    state.view === "server" &&
+    state.serverSection === "logs" &&
+    Boolean(state.selectedServerId) &&
+    Boolean(state.serverSnapshot)
+  );
+}
+
+// Only polls while the logs tab is actually on screen, so navigating away or
+// switching servers stops the background requests.
+function syncLogPolling() {
+  const shouldPoll = state.logAutoRefresh && logsTabIsOpen();
+
+  if (!shouldPoll) {
+    if (logPollTimer) {
+      clearInterval(logPollTimer);
+      logPollTimer = null;
+    }
+    return;
+  }
+
+  if (logPollTimer) {
+    return;
+  }
+
+  logPollFailures = 0;
+  logPollTimer = setInterval(pollLogsOnce, LOG_POLL_INTERVAL_MS);
+}
+
+async function pollLogsOnce() {
+  // Skip while the tab is in the background; the next tick after it is visible
+  // again picks straight back up.
+  if (logPollInFlight || document.hidden || !logsTabIsOpen()) {
+    return;
+  }
+  logPollInFlight = true;
+
+  const serverId = state.selectedServerId;
+  try {
+    const logs = await api(`/api/servers/${encodeURIComponent(serverId)}/logs`);
+    logPollFailures = 0;
+
+    // The server may have changed under us while the request was in flight.
+    if (serverId !== state.selectedServerId || !state.serverSnapshot) {
+      return;
+    }
+
+    const current = state.serverSnapshot.logs || {};
+    if (current.latestLog === logs.latestLog && current.runtimeLog === logs.runtimeLog) {
+      return; // Nothing new: skip the re-render so the view does not flicker.
+    }
+
+    state.serverSnapshot.logs = logs;
+    render();
+  } catch (error) {
+    logPollFailures += 1;
+    // Three consecutive failures means something real is wrong (server down,
+    // session expired). Stop hammering it and say so once.
+    if (logPollFailures >= 3) {
+      state.logAutoRefresh = false;
+      localStorage.setItem("rippermoonstash-log-auto", "off");
+      syncLogPolling();
+      setNotice("error", `log auto refresh stopped: ${error.message}`);
+    }
+  } finally {
+    logPollInFlight = false;
+  }
+}
+
+// render() replaces innerHTML, which resets scroll to the top - the reason logs
+// always opened on the oldest lines. Re-pin each pane to the newest output
+// unless the reader has deliberately scrolled up.
+const logScrollPinned = { latest: true, runtime: true };
+
+function applyLogScroll() {
+  for (const pane of app.querySelectorAll("[data-log-pane]")) {
+    const key = pane.dataset.logPane;
+    if (state.logOrder === "newest") {
+      pane.scrollTop = 0;
+    } else if (logScrollPinned[key] !== false) {
+      pane.scrollTop = pane.scrollHeight;
+    }
+
+    pane.addEventListener("scroll", () => {
+      const distanceFromBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight;
+      logScrollPinned[key] = distanceFromBottom < 40;
+    });
+  }
 }
 
 function selectedValues(select) {
@@ -1599,6 +2176,29 @@ app.addEventListener("click", async (event) => {
       return;
     }
 
+    if (action === "delete-world") {
+      const archiveName = target.dataset.archiveName;
+      // Unrecoverable: no trash, no undo. Make the name explicit in the prompt.
+      if (
+        !window.confirm(
+          `Permanently delete the world archive "${archiveName}" (${target.dataset.size})?\n\nThis cannot be undone. The active world is not affected.`
+        )
+      ) {
+        return;
+      }
+      const payload = await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/worlds/delete`, {
+        method: "POST",
+        body: { archiveName }
+      });
+      if (state.serverSnapshot) {
+        state.serverSnapshot.worlds = payload.worlds;
+      }
+      setNotice("success", `deleted archive ${payload.deleted}`);
+      await loadSnapshot();
+      render();
+      return;
+    }
+
     if (action === "activate-world") {
       await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/worlds/activate`, {
         method: "POST",
@@ -1610,8 +2210,58 @@ app.addEventListener("click", async (event) => {
       return;
     }
 
+    if (action === "toggle-log-auto") {
+      state.logAutoRefresh = !state.logAutoRefresh;
+      localStorage.setItem("rippermoonstash-log-auto", state.logAutoRefresh ? "on" : "off");
+      render();
+      return;
+    }
+
+    if (action === "toggle-log-order") {
+      state.logOrder = state.logOrder === "newest" ? "oldest" : "newest";
+      localStorage.setItem("rippermoonstash-log-order", state.logOrder);
+      logScrollPinned.latest = true;
+      logScrollPinned.runtime = true;
+      render();
+      return;
+    }
+
+    if (action === "jump-to-latest") {
+      logScrollPinned.latest = true;
+      logScrollPinned.runtime = true;
+      applyLogScroll();
+      return;
+    }
+
+    if (action === "test-integration") {
+      const payload = await api("/api/settings/integrations/test", { method: "POST" });
+      setNotice(payload.result.ok ? "success" : "error", payload.result.reason);
+      return;
+    }
+
+    if (action === "clear-integration") {
+      if (!window.confirm("Remove the stored CurseForge key? Search and installs will be disabled.")) {
+        return;
+      }
+      const payload = await api("/api/settings/integrations", {
+        method: "PUT",
+        body: { curseforgeApiKey: "" }
+      });
+      state.integrations = payload.integrations;
+      await loadBootstrap();
+      setNotice("success", "curseforge key removed");
+      return;
+    }
+
+    if (action === "dismiss-manual-download") {
+      state.manualDownload = null;
+      render();
+      return;
+    }
+
     if (action === "install-result") {
       state.updatePlan = null;
+      state.manualDownload = null;
       const payload =
         target.dataset.provider === "curseforge"
           ? { provider: "curseforge", modId: target.dataset.id }
@@ -1623,6 +2273,65 @@ app.addEventListener("click", async (event) => {
       setNotice("success", "install completed");
       await loadSnapshot();
       await loadServers();
+      render();
+      return;
+    }
+
+    if (action === "check-mod-updates") {
+      setNotice("success", "checking every tracked add-on against its provider…");
+      state.modUpdates = await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/mods/updates`);
+      setNotice(
+        state.modUpdates.updatable ? "success" : "success",
+        state.modUpdates.updatable
+          ? `${state.modUpdates.updatable} add-on update(s) available`
+          : "every tracked add-on is up to date"
+      );
+      return;
+    }
+
+    if (action === "dismiss-mod-updates") {
+      state.modUpdates = null;
+      render();
+      return;
+    }
+
+    if (action === "update-mod" || action === "update-all-mods") {
+      const single = action === "update-mod" ? target.dataset.fileName : null;
+      const fileNames = single
+        ? [single]
+        : (state.modUpdates?.entries || [])
+            .filter((entry) => entry.status === "update-available")
+            .map((entry) => entry.fileName);
+
+      if (!fileNames.length) {
+        setNotice("error", "nothing to update");
+        return;
+      }
+      if (
+        !window.confirm(
+          `Update ${fileNames.length} add-on(s)?\n\nThe server will be stopped first if it is running. Minecraft stays on ${state.modUpdates?.gameVersion || "the current version"}.`
+        )
+      ) {
+        return;
+      }
+
+      const payload = await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/mods/update`, {
+        method: "POST",
+        body: { fileNames }
+      });
+
+      const failed = payload.results.filter((entry) => !entry.ok);
+      const changed = payload.results.filter((entry) => entry.ok && entry.changed);
+      setNotice(
+        failed.length ? "error" : "success",
+        failed.length
+          ? `updated ${changed.length}, failed ${failed.length}: ${failed.map((entry) => `${entry.fileName} (${entry.error})`).join("; ")}`
+          : `updated ${changed.length} add-on(s)`
+      );
+
+      // Re-check so the panel reflects the new state rather than stale results.
+      state.modUpdates = await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/mods/updates`);
+      await loadSnapshot();
       render();
       return;
     }
@@ -1640,6 +2349,38 @@ app.addEventListener("click", async (event) => {
       setNotice("success", "add-on removed");
       await loadSnapshot();
       await loadServers();
+      render();
+      return;
+    }
+
+    if (action === "toggle-mod") {
+      state.updatePlan = null;
+      const fileName = target.dataset.fileName;
+      const currentlyEnabled = target.dataset.enabled === "true";
+      await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/mods/toggle`, {
+        method: "POST",
+        body: {
+          enabled: !currentlyEnabled,
+          fileName
+        }
+      });
+      setNotice("success", currentlyEnabled ? "add-on disabled" : "add-on enabled");
+      await loadSnapshot();
+      await loadServers();
+      render();
+      return;
+    }
+
+    if (action === "remove-server-operator") {
+      const uuid = target.dataset.uuid;
+      if (!uuid || !window.confirm("Remove this in-game operator from the server?")) {
+        return;
+      }
+      await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/operators/${encodeURIComponent(uuid)}`, {
+        method: "DELETE"
+      });
+      setNotice("success", "server admin removed");
+      await loadSnapshot();
       render();
       return;
     }
@@ -1707,6 +2448,9 @@ app.addEventListener("click", async (event) => {
       return;
     }
   } catch (error) {
+    if (error.manualDownload) {
+      state.manualDownload = error.manualDownload;
+    }
     setNotice("error", error.message);
   }
 });
@@ -1806,6 +2550,23 @@ app.addEventListener("submit", async (event) => {
         render();
         break;
       }
+      case "add-server-operator": {
+        const formData = new FormData(form);
+        await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/operators`, {
+          method: "POST",
+          body: {
+            bypassesPlayerLimit: formData.get("bypassesPlayerLimit") === "on",
+            level: formData.get("level"),
+            name: formData.get("name"),
+            uuid: formData.get("uuid")
+          }
+        });
+        setNotice("success", "server admin added");
+        form.reset();
+        await loadSnapshot();
+        render();
+        break;
+      }
       case "capture-world": {
         const data = Object.fromEntries(new FormData(form).entries());
         state.updatePlan = null;
@@ -1863,8 +2624,29 @@ app.addEventListener("submit", async (event) => {
         render();
         break;
       }
+      case "save-integration": {
+        const data = Object.fromEntries(new FormData(form).entries());
+        const payload = await api("/api/settings/integrations", {
+          method: "PUT",
+          body: { curseforgeApiKey: data.curseforgeApiKey || "" }
+        });
+        state.integrations = payload.integrations;
+        form.reset();
+        // Provider availability gates the curseforge option in mod search.
+        await loadBootstrap();
+        setNotice(
+          "success",
+          payload.integrations.curseforge.envOverride
+            ? "key verified and saved, but an environment variable is still overriding it"
+            : "curseforge key verified and saved"
+        );
+        render();
+        break;
+      }
       case "search-mods": {
         const data = Object.fromEntries(new FormData(form).entries());
+        state.modProvider = data.provider === "curseforge" ? "curseforge" : "modrinth";
+        state.modQuery = data.query || "";
         const payload = await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/mods/search`, {
           method: "POST",
           body: data
@@ -1908,20 +2690,36 @@ app.addEventListener("submit", async (event) => {
         const formData = new FormData(form);
         const mode = String(formData.get("mode") || "managed");
         const loader = String(formData.get("loader") || "vanilla");
-        if (mode !== "existing" && !["vanilla", "paper", "purpur"].includes(loader)) {
-          throw new Error("Managed server creation currently supports vanilla, Paper, and Purpur only. Switch to existing mode for the other loaders.");
+        if (mode !== "existing" && !isInstallableLoader(loader)) {
+          throw new Error(
+            `Managed server creation cannot provision the ${loader} loader. Supported loaders are ${installableLoaders().join(", ")}. Switch to existing mode to register a folder you installed yourself.`
+          );
         }
         state.updatePlan = null;
         const payload = await api("/api/servers", {
           method: "POST",
           body: Object.fromEntries(formData.entries())
         });
-        state.selectedServerId = payload.server.id;
-        state.view = "server";
-        state.serverSection = "overview";
+        // A backend that has not been restarted yet still answers 201 with the
+        // finished server instead of 202 with a job. Handle both so a stale
+        // service produces a working create rather than a crash.
+        if (payload && payload.job && payload.job.id) {
+          state.createJob = payload.job;
+          render();
+          await pollCreateJob(payload.job.id);
+          break;
+        }
+
         state.createVersionOpen = false;
         state.createServerMinecraftVersion = "latest";
-        setNotice("success", "server created");
+        if (payload && payload.server) {
+          state.selectedServerId = payload.server.id;
+          state.view = "server";
+          state.serverSection = "overview";
+          setNotice("success", `created ${payload.server.name}`);
+        } else {
+          setNotice("success", "server created");
+        }
         await refreshAll();
         break;
       }
@@ -2018,6 +2816,9 @@ app.addEventListener("submit", async (event) => {
         break;
     }
   } catch (error) {
+    if (error.manualDownload) {
+      state.manualDownload = error.manualDownload;
+    }
     setNotice("error", error.message);
   }
 });
@@ -2040,11 +2841,7 @@ app.addEventListener("change", (event) => {
   const isExistingMode = mode === "existing";
 
   if (loaderNote) {
-    loaderNote.textContent = isExistingMode
-      ? `Existing mode will register the folder as a ${loader} server.`
-      : ["vanilla", "paper", "purpur"].includes(loader)
-        ? `Managed mode will provision a ${loader} server for the selected Minecraft version.`
-        : `${loader} is not provisioned automatically yet. Switch to existing mode for that loader.`;
+    loaderNote.textContent = createLoaderNote(isExistingMode ? "existing" : "managed", loader);
   }
 });
 

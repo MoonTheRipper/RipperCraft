@@ -1,5 +1,6 @@
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
+const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
@@ -22,6 +23,15 @@ const {
 const MOJANG_MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 const PAPER_DOWNLOADS_API = "https://fill.papermc.io/v3";
 const PURPUR_DOWNLOADS_API = "https://api.purpurmc.org/v2/purpur";
+const FABRIC_META_API = "https://meta.fabricmc.net/v2";
+const NEOFORGE_VERSIONS_API = "https://maven.neoforged.net/api/maven/versions/releases/net/neoforged/neoforge";
+const NEOFORGE_MAVEN = "https://maven.neoforged.net/releases/net/neoforged/neoforge";
+const FORGE_PROMOTIONS_URL = "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json";
+const FORGE_MAVEN = "https://maven.minecraftforge.net/net/minecraftforge/forge";
+// Loaders the dashboard can provision end to end. Anything outside this set has
+// to be installed by hand and registered as an existing folder.
+const INSTALLABLE_LOADERS = new Set(["vanilla", "paper", "purpur", "fabric", "forge", "neoforge"]);
+const INSTALLER_LOADERS = new Set(["forge", "neoforge"]);
 const PAPER_LIKE_LOADERS = new Set(["paper", "purpur", "folia", "spigot", "bukkit"]);
 const COMBINED_UPDATE_LOADERS = new Set(["vanilla", "paper", "purpur"]);
 const REMOTE_USER_AGENT = process.env.RIPPERMOONSTASH_USER_AGENT || "RipperMoonStash/0.1 (https://localhost)";
@@ -53,6 +63,10 @@ function createServerManager(store) {
     data: null,
     expiresAt: 0,
     promise: null
+  };
+  const javaRuntimeCache = {
+    data: null,
+    expiresAt: 0
   };
 
   function withRemoteHeaders(headers = {}) {
@@ -91,6 +105,8 @@ function createServerManager(store) {
 
     return {
       kind: managedRuntime.kind || null,
+      launchKind: (managedRuntime.launch && managedRuntime.launch.kind) || "jar",
+      loaderVersion: managedRuntime.loaderVersion || null,
       source: managedRuntime.source || null,
       updatedAt: managedRuntime.updatedAt || null
     };
@@ -102,6 +118,7 @@ function createServerManager(store) {
       description: record.description,
       directory: record.directory,
       id: record.id,
+      javaBin: record.javaBin || "",
       loader: record.loader,
       logFile: record.logFile,
       maxMemory: record.maxMemory || "4G",
@@ -128,9 +145,11 @@ function createServerManager(store) {
       backupsDir: path.join(serverDir, "backups"),
       logFile: path.join(serverDir, record.logFile || "logs/latest.log"),
       modsDir: path.join(serverDir, PAPER_LIKE_LOADERS.has(record.loader) ? "plugins" : (record.modsDir || "mods")),
+      disabledModsDir: path.join(serverDir, ".rippermoon", "disabled-mods"),
       addonManifestFile: path.join(serverDir, ".rippermoon", "addons.json"),
       eulaFile: path.join(serverDir, "eula.txt"),
       pidFile: path.join(serverDir, ".rippermoon", "pid.json"),
+      opsFile: path.join(serverDir, "ops.json"),
       propertiesFile: path.join(serverDir, record.serverPropertiesFile || "server.properties"),
       managedLaunchScript: path.join(serverDir, ".rippermoon", "launch-server.sh"),
       runtimeDir: path.join(serverDir, ".rippermoon"),
@@ -344,6 +363,7 @@ function createServerManager(store) {
 
     return {
       ...withDirectory,
+      javaBin: String(withDirectory.javaBin || "").trim(),
       logFile: normalizeServerRelativePath(withDirectory, withDirectory.logFile, "logs/latest.log"),
       modsDir: normalizeServerRelativePath(withDirectory, withDirectory.modsDir, "mods"),
       serverPropertiesFile: normalizeServerRelativePath(withDirectory, withDirectory.serverPropertiesFile, "server.properties"),
@@ -728,6 +748,27 @@ function createServerManager(store) {
     };
   }
 
+  // A per-server Java path is needed because one dashboard can host servers
+  // that require different JDKs, while RIPPERMOONSTASH_JAVA_BIN is global to
+  // the whole service process.
+  async function validateJavaBin(javaBin) {
+    const trimmed = String(javaBin || "").trim();
+    if (!trimmed) {
+      return "";
+    }
+    if (!path.isAbsolute(trimmed)) {
+      throw userFacingError(
+        "The Java binary must be an absolute path, for example /usr/lib/jvm/java-17-openjdk-amd64/bin/java."
+      );
+    }
+    try {
+      await fsp.access(trimmed, fs.constants.X_OK);
+    } catch {
+      throw userFacingError(`Java binary not found or not executable: ${trimmed}`);
+    }
+    return trimmed;
+  }
+
   async function setServerMetadata(serverId, patch) {
     const server = await getServer(serverId);
     if (!server) {
@@ -735,6 +776,9 @@ function createServerManager(store) {
     }
 
     const nextPatch = { ...patch };
+    if (nextPatch.javaBin !== undefined) {
+      nextPatch.javaBin = await validateJavaBin(nextPatch.javaBin);
+    }
     if (typeof nextPatch.passphrase === "string") {
       const trimmed = nextPatch.passphrase.trim();
       nextPatch.passphraseHash = trimmed ? hashSecret(trimmed) : null;
@@ -835,6 +879,73 @@ function createServerManager(store) {
     return await readSafeAdminProperties(serverId);
   }
 
+  function offlinePlayerUuid(name) {
+    const hash = crypto.createHash("md5").update(`OfflinePlayer:${name}`, "utf8").digest();
+    hash[6] = (hash[6] & 0x0f) | 0x30;
+    hash[8] = (hash[8] & 0x3f) | 0x80;
+    const hex = hash.toString("hex");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+
+  function normalizeOperator(entry) {
+    const name = String(entry && entry.name ? entry.name : "").trim();
+    const uuid = String(entry && entry.uuid ? entry.uuid : "").trim().toLowerCase();
+    if (!name) {
+      return null;
+    }
+    return {
+      uuid: uuid || offlinePlayerUuid(name),
+      name,
+      level: Math.min(4, Math.max(1, Number.parseInt(entry.level, 10) || 4)),
+      bypassesPlayerLimit: entry.bypassesPlayerLimit === true
+    };
+  }
+
+  async function listServerOperators(serverId) {
+    const server = await getServer(serverId);
+    if (!server) {
+      throw new Error("Server not found.");
+    }
+    const paths = resolveRecordPaths(server);
+    const payload = await readJson(paths.opsFile, []);
+    return (Array.isArray(payload) ? payload : [])
+      .map(normalizeOperator)
+      .filter(Boolean)
+      .sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  async function writeServerOperators(serverId, operators) {
+    const server = await getServer(serverId);
+    if (!server) {
+      throw new Error("Server not found.");
+    }
+    const paths = resolveRecordPaths(server);
+    const unique = new Map();
+    for (const operator of operators || []) {
+      const normalized = normalizeOperator(operator);
+      if (normalized) {
+        unique.set(normalized.uuid, normalized);
+      }
+    }
+    const nextOperators = [...unique.values()].sort((left, right) => left.name.localeCompare(right.name));
+    await writeJson(paths.opsFile, nextOperators);
+    return nextOperators;
+  }
+
+  async function addServerOperator(serverId, operator) {
+    const current = await listServerOperators(serverId);
+    return await writeServerOperators(serverId, [...current, operator]);
+  }
+
+  async function removeServerOperator(serverId, uuid) {
+    const targetUuid = String(uuid || "").trim().toLowerCase();
+    const current = await listServerOperators(serverId);
+    return await writeServerOperators(
+      serverId,
+      current.filter((operator) => operator.uuid !== targetUuid)
+    );
+  }
+
   async function getServerLog(serverId) {
     const server = await getServer(serverId);
     if (!server) {
@@ -856,11 +967,16 @@ function createServerManager(store) {
     }
     const paths = resolveRecordPaths(server);
     await ensureDir(paths.modsDir);
+    await ensureDir(paths.disabledModsDir);
     const entries = await fsp.readdir(paths.modsDir, { withFileTypes: true });
-    return entries
+    const disabledEntries = await fsp.readdir(paths.disabledModsDir, { withFileTypes: true });
+    const active = entries
       .filter((entry) => entry.isFile())
-      .map((entry) => entry.name)
-      .sort((left, right) => left.localeCompare(right));
+      .map((entry) => ({ enabled: true, fileName: entry.name }));
+    const disabled = disabledEntries
+      .filter((entry) => entry.isFile())
+      .map((entry) => ({ enabled: false, fileName: entry.name }));
+    return [...active, ...disabled].sort((left, right) => left.fileName.localeCompare(right.fileName));
   }
 
   async function readAddonManifest(serverId) {
@@ -915,9 +1031,10 @@ function createServerManager(store) {
     const paths = resolveRecordPaths(server);
     const uniqueNames = [...new Set((fileNames || []).map((name) => safeFilename(name)).filter(Boolean))];
     await Promise.all(
-      uniqueNames.map((fileName) =>
-        fsp.rm(path.join(paths.modsDir, fileName), { force: true })
-      )
+      uniqueNames.flatMap((fileName) => [
+        fsp.rm(path.join(paths.modsDir, fileName), { force: true }),
+        fsp.rm(path.join(paths.disabledModsDir, fileName), { force: true })
+      ])
     );
   }
 
@@ -932,6 +1049,36 @@ function createServerManager(store) {
     const remaining = (await readAddonManifest(serverId)).filter((entry) => !removedNames.has(entry.fileName));
     await writeAddonManifest(serverId, remaining);
     return uniqueNames;
+  }
+
+  async function setAddonEnabled(serverId, fileName, enabled) {
+    const server = await getServer(serverId);
+    if (!server) {
+      throw new Error("Server not found.");
+    }
+    const paths = resolveRecordPaths(server);
+    await ensureDir(paths.modsDir);
+    await ensureDir(paths.disabledModsDir);
+
+    const cleanName = safeFilename(fileName);
+    if (!cleanName) {
+      throw new Error("Add-on file name is required.");
+    }
+
+    const activePath = path.join(paths.modsDir, cleanName);
+    const disabledPath = path.join(paths.disabledModsDir, cleanName);
+    const sourcePath = enabled ? disabledPath : activePath;
+    const targetPath = enabled ? activePath : disabledPath;
+
+    if (!(await exists(sourcePath))) {
+      throw new Error(`Add-on is already ${enabled ? "enabled" : "disabled"} or does not exist.`);
+    }
+    if (await exists(targetPath)) {
+      throw new Error(`Cannot ${enabled ? "enable" : "disable"} ${cleanName}; target file already exists.`);
+    }
+
+    await fsp.rename(sourcePath, targetPath);
+    return await listInstalledFiles(serverId);
   }
 
   async function installManagedFile(serverId, fileName, buffer) {
@@ -1031,6 +1178,260 @@ function createServerManager(store) {
     };
   }
 
+  // Fabric publishes a ready-made server launcher jar, so no installer run is
+  // needed - unlike Forge and NeoForge below.
+  async function resolveFabricRuntime(version) {
+    const targetVersion = await resolveRequestedReleaseVersion(version);
+    const loaders = await fetchJson(`${FABRIC_META_API}/versions/loader/${encodeURIComponent(targetVersion)}`);
+    const stableLoader = loaders.find((entry) => entry.loader && entry.loader.stable) || loaders[0];
+    if (!stableLoader) {
+      throw new Error(`Fabric has no loader build for Minecraft ${targetVersion}.`);
+    }
+
+    const installers = await fetchJson(`${FABRIC_META_API}/versions/installer`);
+    const stableInstaller = installers.find((entry) => entry.stable) || installers[0];
+    if (!stableInstaller) {
+      throw new Error("Fabric has no installer build available.");
+    }
+
+    const loaderVersion = stableLoader.loader.version;
+    const installerVersion = stableInstaller.version;
+    return {
+      downloadUrl: `${FABRIC_META_API}/versions/loader/${encodeURIComponent(targetVersion)}/${encodeURIComponent(loaderVersion)}/${encodeURIComponent(installerVersion)}/server/jar`,
+      loaderVersion,
+      source: `fabric ${loaderVersion}`,
+      targetVersion
+    };
+  }
+
+  async function resolveForgeRuntime(version) {
+    const targetVersion = await resolveRequestedReleaseVersion(version);
+    const promotions = await fetchJson(FORGE_PROMOTIONS_URL);
+    const promos = promotions.promos || {};
+    const forgeVersion = promos[`${targetVersion}-recommended`] || promos[`${targetVersion}-latest`];
+    if (!forgeVersion) {
+      throw new Error(`Forge has no build for Minecraft ${targetVersion}.`);
+    }
+
+    const artifact = `${targetVersion}-${forgeVersion}`;
+    return {
+      installerUrl: `${FORGE_MAVEN}/${artifact}/forge-${artifact}-installer.jar`,
+      loaderVersion: forgeVersion,
+      relativeArgFile: path.posix.join("libraries", "net", "minecraftforge", "forge", artifact, "unix_args.txt"),
+      source: `forge ${forgeVersion}`,
+      targetVersion
+    };
+  }
+
+  async function resolveNeoforgeRuntime(version) {
+    const targetVersion = await resolveRequestedReleaseVersion(version);
+    const payload = await fetchJson(NEOFORGE_VERSIONS_API);
+    // NeoForge encodes the Minecraft version in its own: 1.21.1 -> 21.1.x.
+    const [, minor, patch = "0"] = targetVersion.split(".");
+    const prefix = minor === undefined ? "" : `${String(Number(minor))}.${String(Number(patch))}.`;
+    const candidates = (payload.versions || []).filter(
+      (entry) => entry.startsWith(prefix) && !entry.includes("beta")
+    );
+    const neoforgeVersion = candidates[candidates.length - 1];
+    if (!prefix || !neoforgeVersion) {
+      throw new Error(
+        `NeoForge has no stable build for Minecraft ${targetVersion}. NeoForge starts at Minecraft 1.20.2.`
+      );
+    }
+
+    return {
+      installerUrl: `${NEOFORGE_MAVEN}/${neoforgeVersion}/neoforge-${neoforgeVersion}-installer.jar`,
+      loaderVersion: neoforgeVersion,
+      relativeArgFile: path.posix.join("libraries", "net", "neoforged", "neoforge", neoforgeVersion, "unix_args.txt"),
+      source: `neoforge ${neoforgeVersion}`,
+      targetVersion
+    };
+  }
+
+  // Directories distributions install JDKs into. Each child is probed for
+  // bin/java, plus the macOS Contents/Home layout.
+  function javaSearchRoots() {
+    return [
+      "/usr/lib/jvm",
+      "/usr/java",
+      "/opt/java",
+      "/opt/jdk",
+      path.join(os.homedir(), ".sdkman", "candidates", "java"),
+      "/Library/Java/JavaVirtualMachines"
+    ];
+  }
+
+  async function collectJavaCandidates() {
+    // Lower rank wins when two paths resolve to the same binary. A versioned
+    // JVM directory is preferred over /usr/bin/java, which floats with
+    // update-alternatives and would silently change a pinned server's JDK.
+    const candidates = [];
+    const add = (candidatePath, source, rank) => {
+      if (candidatePath) {
+        candidates.push({ path: candidatePath, rank, source });
+      }
+    };
+
+    for (const root of javaSearchRoots()) {
+      let entries = [];
+      try {
+        entries = await fsp.readdir(root, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        if (entry.name.startsWith(".")) {
+          continue;
+        }
+        add(path.join(root, entry.name, "bin", "java"), "installed", 0);
+        add(path.join(root, entry.name, "Contents", "Home", "bin", "java"), "installed", 0);
+      }
+    }
+
+    add(String(process.env.RIPPERMOONSTASH_JAVA_BIN || "").trim(), "environment", 1);
+    if (String(process.env.JAVA_HOME || "").trim()) {
+      add(path.join(process.env.JAVA_HOME.trim(), "bin", "java"), "environment", 1);
+    }
+
+    try {
+      const { stdout } = await runCommand("command", ["-v", "java"], { timeoutMs: 3000 });
+      add(stdout.trim(), "path", 2);
+    } catch {
+      try {
+        const { stdout } = await runCommand("/usr/bin/env", ["which", "java"], { timeoutMs: 3000 });
+        add(stdout.trim(), "path", 2);
+      } catch {
+        // No java on PATH; the installed scan may still have found some.
+      }
+    }
+
+    return candidates;
+  }
+
+  async function probeJavaVersion(javaPath) {
+    try {
+      // `java -version` writes to stderr on every JDK vendor.
+      const { stderr, stdout } = await runCommand(javaPath, ["-version"], { timeoutMs: 8000 });
+      const text = `${stderr}${stdout}`;
+      const match = text.match(/version "([^"]+)"/);
+      if (!match) {
+        return null;
+      }
+      const version = match[1];
+      // 1.8.0_x is Java 8; everything since uses the leading number.
+      const major = version.startsWith("1.")
+        ? Number(version.split(".")[1])
+        : Number(version.split(/[.\-+]/)[0]);
+      return { major: Number.isFinite(major) ? major : null, version };
+    } catch {
+      return null;
+    }
+  }
+
+  async function listJavaRuntimes(options = {}) {
+    const now = Date.now();
+    if (!options.refresh && javaRuntimeCache.data && javaRuntimeCache.expiresAt > now) {
+      return javaRuntimeCache.data;
+    }
+
+    const candidates = await collectJavaCandidates();
+
+    // Collapse symlinked duplicates: /usr/lib/jvm/java-1.17.0-... and
+    // java-17-... are the same JDK and must not appear twice.
+    const byRealPath = new Map();
+    for (const candidate of candidates) {
+      let realPath;
+      try {
+        realPath = await fsp.realpath(candidate.path);
+        await fsp.access(realPath, fs.constants.X_OK);
+      } catch {
+        continue;
+      }
+      const existing = byRealPath.get(realPath);
+      if (
+        !existing ||
+        candidate.rank < existing.rank ||
+        (candidate.rank === existing.rank && candidate.path.length < existing.path.length)
+      ) {
+        byRealPath.set(realPath, candidate);
+      }
+    }
+
+    const probed = await Promise.all(
+      [...byRealPath.values()].map(async (candidate) => {
+        const info = await probeJavaVersion(candidate.path);
+        if (!info) {
+          return null;
+        }
+        return {
+          label: `Java ${info.major ?? "?"} (${info.version})`,
+          major: info.major,
+          path: candidate.path,
+          source: candidate.source,
+          version: info.version
+        };
+      })
+    );
+
+    const runtimes = probed
+      .filter(Boolean)
+      .sort((left, right) => (left.major || 0) - (right.major || 0) || left.path.localeCompare(right.path));
+
+    javaRuntimeCache.data = runtimes;
+    javaRuntimeCache.expiresAt = now + 5 * 60 * 1000;
+    return runtimes;
+  }
+
+  // Mirrors the resolution order baked into the generated launch script, so the
+  // installer runs on the same JDK the server will.
+  function resolveJavaBinary(javaBin) {
+    const explicit = String(javaBin || "").trim();
+    if (explicit) {
+      return explicit;
+    }
+    if (String(process.env.RIPPERMOONSTASH_JAVA_BIN || "").trim()) {
+      return process.env.RIPPERMOONSTASH_JAVA_BIN.trim();
+    }
+    if (String(process.env.JAVA_HOME || "").trim()) {
+      return path.join(process.env.JAVA_HOME.trim(), "bin", "java");
+    }
+    return "java";
+  }
+
+  async function runLoaderInstaller(runtime, serverDir, javaBin, onProgress = () => {}) {
+    const javaBinary = resolveJavaBinary(javaBin);
+    const installerPath = path.join(serverDir, ".rippermoon", "loader-installer.jar");
+    await ensureDir(path.dirname(installerPath));
+    onProgress(`downloading ${runtime.source} installer`);
+    await fsp.writeFile(installerPath, await fetchBuffer(runtime.installerUrl));
+    onProgress(`running the ${runtime.source} installer (this usually takes under a minute)`);
+
+    try {
+      await runCommand(javaBinary, ["-jar", installerPath, "--installServer", serverDir], {
+        cwd: serverDir
+      });
+    } catch (error) {
+      const detail = String(error.stderr || error.stdout || error.message || "").trim().split("\n").slice(-3).join(" ");
+      throw new Error(
+        `The ${runtime.source} installer failed. Check that ${javaBinary} exists and can run installers. ${detail}`
+      );
+    } finally {
+      // The installer also drops a sibling <name>.jar.log next to its own cwd.
+      await Promise.all([
+        fsp.rm(installerPath, { force: true }),
+        fsp.rm(`${installerPath}.log`, { force: true }),
+        fsp.rm(path.join(serverDir, `${path.basename(installerPath)}.log`), { force: true })
+      ]);
+    }
+
+    const argFilePath = path.join(serverDir, runtime.relativeArgFile);
+    if (!(await exists(argFilePath))) {
+      throw new Error(
+        `The ${runtime.source} installer finished but did not produce ${runtime.relativeArgFile}. The server cannot be launched.`
+      );
+    }
+  }
+
   async function createVanillaServer(version, serverDir) {
     const runtime = await resolveVanillaRuntime(version);
     const targetDir = path.join(serverDir, "versions", runtime.targetVersion);
@@ -1049,8 +1450,9 @@ function createServerManager(store) {
     return runtime.targetVersion;
   }
 
-  async function createJarManagedRuntime(loader, version, serverDir) {
+  async function createJarManagedRuntime(loader, version, serverDir, options = {}) {
     const normalizedLoader = String(loader || "vanilla").trim().toLowerCase();
+    const report = typeof options.onProgress === "function" ? options.onProgress : () => {};
     if (normalizedLoader === "vanilla") {
       return {
         kind: "vanilla",
@@ -1085,18 +1487,56 @@ function createServerManager(store) {
       };
     }
 
+    if (normalizedLoader === "fabric") {
+      report("resolving Fabric build");
+      const runtime = await resolveFabricRuntime(version);
+      report(`downloading Fabric ${runtime.loaderVersion} server launcher`);
+      const bundlePath = path.join(serverDir, "server.jar");
+      const buffer = await fetchBuffer(runtime.downloadUrl);
+      await fsp.rm(bundlePath, { force: true });
+      await fsp.writeFile(bundlePath, buffer);
+      return {
+        kind: "fabric",
+        launch: { kind: "jar" },
+        loaderVersion: runtime.loaderVersion,
+        source: runtime.source,
+        targetVersion: runtime.targetVersion
+      };
+    }
+
+    if (INSTALLER_LOADERS.has(normalizedLoader)) {
+      report(`resolving ${normalizedLoader} build`);
+      const runtime =
+        normalizedLoader === "forge"
+          ? await resolveForgeRuntime(version)
+          : await resolveNeoforgeRuntime(version);
+      await runLoaderInstaller(runtime, serverDir, options.javaBin, report);
+      return {
+        kind: normalizedLoader,
+        // Forge and NeoForge produce argfiles instead of a runnable server.jar.
+        launch: { argFile: runtime.relativeArgFile, kind: "argfile" },
+        loaderVersion: runtime.loaderVersion,
+        source: runtime.source,
+        targetVersion: runtime.targetVersion
+      };
+    }
+
     throw new Error(
-      "Managed server creation currently supports vanilla, Paper, and Purpur only. Use register existing for Fabric, Forge, NeoForge, Quilt, or custom folders."
+      `Managed server creation does not support the ${normalizedLoader} loader. Supported loaders are ${[...INSTALLABLE_LOADERS].join(", ")}. Use register existing for anything else.`
     );
   }
 
-  function buildLaunchScript(minMemory = "2G", maxMemory = "4G") {
+  function buildLaunchScript(minMemory = "2G", maxMemory = "4G", launch = null) {
+    const launchLine = buildLaunchLine(launch);
     return `#!/usr/bin/env bash
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+
+MIN_MEMORY="${minMemory}"
+MAX_MEMORY="${maxMemory}"
 
 JAVA_BIN=""
 if [ -n "\${RIPPERMOONSTASH_JAVA_BIN:-}" ]; then
@@ -1114,12 +1554,30 @@ else
   exit 1
 fi
 
-exec "$JAVA_BIN" -Xms${minMemory} -Xmx${maxMemory} -jar server.jar nogui
+${launchLine}
 `;
   }
 
+  // Forge and NeoForge have no server.jar; they are launched through the
+  // argfile their installer generates, alongside user_jvm_args.txt.
+  function buildLaunchLine(launch) {
+    if (launch && launch.kind === "argfile" && launch.argFile) {
+      return `JVM_ARGS=""
+if [ -f user_jvm_args.txt ]; then
+  JVM_ARGS="@user_jvm_args.txt"
+fi
+
+exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.argFile}" nogui`;
+    }
+    return `exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} -jar server.jar nogui`;
+  }
+
   function getManagedLaunchScriptContents(server) {
-    return buildLaunchScript(server.minMemory || "2G", server.maxMemory || "4G");
+    return buildLaunchScript(
+      server.minMemory || "2G",
+      server.maxMemory || "4G",
+      server.managedRuntime && server.managedRuntime.launch
+    );
   }
 
   function shouldUseManagedLaunchCommand(server) {
@@ -1135,6 +1593,24 @@ exec "$JAVA_BIN" -Xms${minMemory} -Xmx${maxMemory} -jar server.jar nogui
     const error = new Error(message);
     error.statusCode = statusCode;
     return error;
+  }
+
+  function getInstallableLoaders() {
+    return [...INSTALLABLE_LOADERS];
+  }
+
+  function usesArgFileLaunch(server) {
+    const launch = server && server.managedRuntime && server.managedRuntime.launch;
+    return Boolean(launch && launch.kind === "argfile" && launch.argFile);
+  }
+
+  // Forge and NeoForge have no server.jar, so "is the runtime installed?" means
+  // checking for the argfile their installer generated instead.
+  function managedRuntimeArtifactPath(server, paths) {
+    if (usesArgFileLaunch(server)) {
+      return path.join(paths.serverDir, server.managedRuntime.launch.argFile);
+    }
+    return paths.serverJarFile;
   }
 
   async function ensureManagedServerArtifacts(serverId, options = {}) {
@@ -1170,7 +1646,33 @@ exec "$JAVA_BIN" -Xms${minMemory} -Xmx${maxMemory} -jar server.jar nogui
     await fsp.chmod(paths.managedLaunchScript, 0o755);
 
     let repairedRuntime = false;
-    if (!(await exists(paths.serverJarFile)) && options.repairRuntime === true) {
+    const runtimeArtifact = managedRuntimeArtifactPath(server, paths);
+    if (!(await exists(runtimeArtifact)) && options.repairRuntime === true) {
+      // Installer-based loaders cannot be repaired by the jar-swap update path;
+      // re-run their installer instead.
+      if (usesArgFileLaunch(server)) {
+        const runtime = await createJarManagedRuntime(
+          server.loader,
+          server.minecraftVersion,
+          paths.serverDir,
+          { javaBin: server.javaBin }
+        );
+        await setServerMetadata(serverId, {
+          managedRuntime: { ...runtime, updatedAt: nowIso() }
+        });
+        await fsp.writeFile(
+          paths.managedLaunchScript,
+          buildLaunchScript(server.minMemory, server.maxMemory, runtime.launch),
+          "utf8"
+        );
+        await fsp.chmod(paths.managedLaunchScript, 0o755);
+        return {
+          managed: true,
+          repairedRuntime: true,
+          startCommand: DEFAULT_MANAGED_START_COMMAND
+        };
+      }
+
       let runtimePlan;
       try {
         runtimePlan = await planServerRuntimeUpdate(serverId, server.minecraftVersion);
@@ -1214,7 +1716,8 @@ exec "$JAVA_BIN" -Xms${minMemory} -Xmx${maxMemory} -jar server.jar nogui
     };
   }
 
-  async function createServer(spec, actor) {
+  async function createServer(spec, actor, options = {}) {
+    const reportProgress = typeof options.onProgress === "function" ? options.onProgress : () => {};
     const serverId = safeFilename(spec.serverId || spec.directoryName || spec.name);
     if (!serverId) {
       throw new Error("A server name is required.");
@@ -1232,6 +1735,9 @@ exec "$JAVA_BIN" -Xms${minMemory} -Xmx${maxMemory} -jar server.jar nogui
 
     const mode = spec.mode === "existing" ? "existing" : "managed";
     const requestedLoader = String(spec.loader || "vanilla").trim().toLowerCase() || "vanilla";
+    // Validate before provisioning: Forge and NeoForge run their installer with
+    // this JDK, so a bad path should fail before anything is downloaded.
+    const javaBin = await validateJavaBin(spec.javaBin);
     const effectiveLoader = mode === "existing" ? requestedLoader : requestedLoader;
     if (mode === "existing") {
       if (!(await exists(serverDir))) {
@@ -1242,6 +1748,7 @@ exec "$JAVA_BIN" -Xms${minMemory} -Xmx${maxMemory} -jar server.jar nogui
         throw new Error(`Directory already exists: ${relativeDirectory}`);
       }
 
+      reportProgress("creating server folders");
       await ensureDir(serverDir);
       await ensureDir(path.join(serverDir, "logs"));
       await ensureDir(path.join(serverDir, "backups"));
@@ -1250,20 +1757,34 @@ exec "$JAVA_BIN" -Xms${minMemory} -Xmx${maxMemory} -jar server.jar nogui
       await ensureDir(path.join(serverDir, ".rippermoon"));
       await fsp.writeFile(path.join(serverDir, "eula.txt"), "eula=false\n", "utf8");
       await fsp.writeFile(path.join(serverDir, "server.properties"), `motd=${spec.name || displayNameFromSlug(serverId)}\nserver-port=${spec.port || 25565}\n`, "utf8");
-      const launchScriptPath = path.join(serverDir, ".rippermoon", "launch-server.sh");
-      await fsp.writeFile(launchScriptPath, buildLaunchScript(spec.minMemory, spec.maxMemory), "utf8");
-      await fsp.chmod(launchScriptPath, 0o755);
-      const runtime = await createJarManagedRuntime(requestedLoader, spec.minecraftVersion || "latest", serverDir);
+      // Provision first: the launch script shape depends on what the loader
+      // produced (a server.jar, or Forge/NeoForge argfiles).
+      const runtime = await createJarManagedRuntime(
+        requestedLoader,
+        spec.minecraftVersion || "latest",
+        serverDir,
+        { javaBin, onProgress: reportProgress }
+      );
       spec.minecraftVersion = runtime.targetVersion;
       spec.managedRuntime = runtime;
+      reportProgress("writing launch script");
+      const launchScriptPath = path.join(serverDir, ".rippermoon", "launch-server.sh");
+      await fsp.writeFile(
+        launchScriptPath,
+        buildLaunchScript(spec.minMemory, spec.maxMemory, runtime.launch),
+        "utf8"
+      );
+      await fsp.chmod(launchScriptPath, 0o755);
     }
 
+    reportProgress("registering the server");
     const record = await store.updateServerRecord(serverId, normalizeServerRecord(serverId, {
       id: serverId,
       createdAt: nowIso(),
       createdBy: actor.username,
       description: spec.description || "",
       directory: relativeDirectory,
+      javaBin,
       loader: effectiveLoader,
       logFile: spec.logFile || "logs/latest.log",
       maxMemory: spec.maxMemory || "4G",
@@ -1272,6 +1793,10 @@ exec "$JAVA_BIN" -Xms${minMemory} -Xmx${maxMemory} -jar server.jar nogui
           ? null
           : {
               kind: spec.managedRuntime?.kind || requestedLoader,
+              // The launch shape must survive into the record; the managed
+              // launch script is regenerated from it on every start.
+              launch: spec.managedRuntime?.launch || { kind: "jar" },
+              loaderVersion: spec.managedRuntime?.loaderVersion || null,
               source: spec.managedRuntime?.source || requestedLoader,
               updatedAt: nowIso()
             },
@@ -1364,15 +1889,23 @@ exec "$JAVA_BIN" -Xms${minMemory} -Xmx${maxMemory} -jar server.jar nogui
     }
 
     const shellCommand = resolveShellCommand();
+    // The launch script already prefers RIPPERMOONSTASH_JAVA_BIN, so a per-server
+    // override only needs to reach this child's environment.
+    const childEnv = { ...process.env };
+    if (server.javaBin) {
+      childEnv.RIPPERMOONSTASH_JAVA_BIN = server.javaBin;
+      childEnv.JAVA_HOME = path.dirname(path.dirname(server.javaBin));
+      runtimeLog.write(`[${nowIso()}] Using per-server Java: ${server.javaBin}\n`);
+    }
     const child = spawnDirectly
       ? spawn(directCommandPath, [], {
           cwd: paths.serverDir,
-          env: process.env,
+          env: childEnv,
           stdio: ["pipe", "pipe", "pipe"]
         })
       : spawn(shellCommand.command, [...shellCommand.args, command], {
           cwd: paths.serverDir,
-          env: process.env,
+          env: childEnv,
           stdio: ["pipe", "pipe", "pipe"]
         });
 
@@ -1809,6 +2342,7 @@ exec "$JAVA_BIN" -Xms${minMemory} -Xmx${maxMemory} -jar server.jar nogui
     const installedFiles = lockedForUser ? [] : await listInstalledFiles(serverId);
     const propertiesText = !lockedForUser && user.role === "owner" ? await readServerProperties(serverId) : null;
     const safeProperties = lockedForUser ? null : await readSafeAdminProperties(serverId);
+    const operators = !lockedForUser && user.role === "owner" ? await listServerOperators(serverId) : [];
     const worldRules = lockedForUser ? null : await readWorldRules(serverId);
     const logs = lockedForUser ? null : await getServerLog(serverId);
     const updateSupport = user.role === "owner" ? await getServerUpdateSupport(serverId) : null;
@@ -1838,6 +2372,7 @@ exec "$JAVA_BIN" -Xms${minMemory} -Xmx${maxMemory} -jar server.jar nogui
       logs,
       mods: installedFiles,
       propertiesText,
+      operators,
       safeProperties,
       safePropertyDefinitions: getSafeAdminSettingDefinitions(),
       settingsMode: user.role === "owner" ? "owner" : "admin-safe",
@@ -1862,9 +2397,13 @@ exec "$JAVA_BIN" -Xms${minMemory} -Xmx${maxMemory} -jar server.jar nogui
     PAPER_LIKE_LOADERS,
     SAFE_ADMIN_SETTING_DEFINITIONS,
     createServer,
+    addServerOperator,
     deleteServer,
     downloadAndInstallFile,
+    ensureManagedServerArtifacts,
     ensureServerStopped,
+    getInstallableLoaders,
+    listJavaRuntimes,
     getAllServers,
     getServerUpdateSupport,
     getServer,
@@ -1874,6 +2413,7 @@ exec "$JAVA_BIN" -Xms${minMemory} -Xmx${maxMemory} -jar server.jar nogui
     installManagedFile,
     listAvailableMinecraftVersions,
     listInstalledFiles,
+    listServerOperators,
     listServersForUser,
     listWorldArchives,
     listWorldEntries,
@@ -1886,10 +2426,12 @@ exec "$JAVA_BIN" -Xms${minMemory} -Xmx${maxMemory} -jar server.jar nogui
     readWorldMetadata,
     recordAddonInstalls,
     removeAddonFiles,
+    removeServerOperator,
     removeInstalledFiles,
     resolveRecordPaths,
     serializeServer,
     setActiveWorldName,
+    setAddonEnabled,
     setServerMetadata,
     startServer,
     stopServer,
@@ -1900,6 +2442,7 @@ exec "$JAVA_BIN" -Xms${minMemory} -Xmx${maxMemory} -jar server.jar nogui
     verifyServerPassphrase,
     applyServerRuntimeUpdate,
     writeEulaStatus,
+    writeServerOperators,
     writeSafeAdminProperties,
     writeAddonManifest,
     writeServerProperties
