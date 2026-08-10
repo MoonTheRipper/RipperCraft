@@ -338,11 +338,17 @@ test("view modules export their section renderers", async () => {
   assert.deepEqual(logs.prepareLogText("", "nothing"), { hiddenLines: 0, text: "nothing", totalLines: 0 });
 
   const auth = await load(path.join(jsRoot, "views", "auth.js"));
-  const login = auth.renderAuth("Sign in", "login");
+  const login = auth.renderAuth("Are You Worthy", "login");
   assert.ok(login.includes('data-form="login"'));
-  // The decorative quote is gone and the copy says what the page is for.
-  assert.equal(login.includes("auth-quote"), false);
-  assert.ok(login.includes("Minecraft servers"));
+  // The quote is the owner's, and deliberate. The login screen also stays
+  // quiet about what is behind it: an unauthenticated visitor is not told
+  // that this machine runs Minecraft servers.
+  assert.ok(login.includes("auth-quote"));
+  assert.ok(login.includes("great power comes great responsibility"));
+  assert.equal(/minecraft/i.test(login), false);
+
+  const setup = auth.renderAuth("Create the Owner Account", "setup");
+  assert.equal(/minecraft/i.test(setup), false);
 });
 
 test("log panes are focusable and named for keyboard and screen reader users", async () => {

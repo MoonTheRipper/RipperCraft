@@ -89,8 +89,8 @@
   --motion-base: 180ms;
   --ease: cubic-bezier(0.2, 0, 0.2, 1);
 
-  /* space reserved for fixed chrome so it never overlaps content */
-  --chrome-right: calc(var(--control-h-sm) + var(--s-4) + var(--s-4));
+  /* Top band reserved for the fixed nav toggle so it never overlaps content.
+     Zero on desktop, where the rail is always open and nothing floats. */
   --chrome-band: var(--s-0);
 }
 
@@ -224,6 +224,37 @@ h2 {
   align-content: center;
   justify-items: center;
   padding: var(--s-7);
+}
+
+.auth-quote {
+  margin: 0 0 var(--s-6);
+  text-align: center;
+}
+
+.auth-quote blockquote {
+  margin: 0;
+  color: var(--c-text);
+  font-size: var(--t-md);
+  font-style: italic;
+  line-height: var(--lh-base);
+}
+
+.auth-quote blockquote::before {
+  content: open-quote;
+}
+
+.auth-quote blockquote::after {
+  content: close-quote;
+}
+
+.auth-quote figcaption {
+  margin-top: var(--s-2);
+  color: var(--c-text-muted);
+  font-size: var(--t-sm);
+}
+
+.auth-quote figcaption::before {
+  content: "— ";
 }
 
 .auth-panel {
@@ -496,31 +527,6 @@ h2 {
 
 /* Plain icon button. No track, no sun, no moon, no rays, no glow, no
    infinite spin - the label lives in aria-label/title on the element. */
-.theme-toggle {
-  position: fixed;
-  top: var(--s-4);
-  right: var(--s-4);
-  z-index: 40;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--s-2);
-  min-width: var(--control-h-sm);
-  min-height: var(--control-h-sm);
-  padding: var(--s-1);
-  border: 1px solid var(--c-border-strong);
-  border-radius: var(--radius-sm);
-  background: var(--c-surface);
-  color: var(--c-text);
-  font: inherit;
-  line-height: var(--lh-tight);
-  cursor: pointer;
-}
-
-.theme-toggle:hover {
-  background: var(--c-surface-2);
-}
-
 /* --- icons -------------------------------------------------------------- */
 
 .icon,
@@ -544,12 +550,17 @@ h2 {
 
 /* --- content column ----------------------------------------------------- */
 
+/* Without a ceiling the cards stretch from the rail's border to the window
+   edge on a wide monitor, which is what made the column read as unpadded.
+   border-box means the max-width already accounts for the gutters. */
 .content {
-  padding: calc(var(--s-6) + var(--chrome-band)) var(--s-7) var(--s-9);
+  width: 100%;
+  max-width: calc(var(--content-max) + var(--s-8) * 2);
+  margin-inline: auto;
+  padding: calc(var(--s-6) + var(--chrome-band)) var(--s-8) var(--s-9);
 }
 
 .page-header {
-  padding-right: var(--chrome-right);
   padding-bottom: var(--s-4);
   border-bottom: 1px solid var(--c-border);
 }
@@ -587,9 +598,6 @@ h2 {
 /* --- notices ------------------------------------------------------------ */
 
 .notice {
-  /* the notice is the first thing in .content, so it has to clear the fixed
-     .theme-toggle exactly like .page-header does */
-  margin-right: var(--chrome-right);
   margin-bottom: var(--s-5);
   padding: var(--s-3) var(--s-4);
   border: 1px solid var(--c-border);
@@ -1007,7 +1015,6 @@ code {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: var(--s-5);
-  width: min(100%, var(--content-max));
 }
 
 .log-pane {
@@ -1018,10 +1025,9 @@ code {
 
 @media (max-width: 1000px) {
   :root {
-    /* one reserved band across the top holds both fixed buttons, so no fixed
-       chrome ever sits over the path line, the h1 or a long server name */
+    /* the nav toggle is fixed once the rail collapses to a drawer, so reserve
+       a band for it rather than letting it sit over the path line or the h1 */
     --chrome-band: calc(var(--tap-min) + var(--s-3) + var(--s-3));
-    --chrome-right: var(--s-0);
   }
 
   .shell {

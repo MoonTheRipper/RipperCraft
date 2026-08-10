@@ -1,6 +1,6 @@
 import { renderVersionDatalist } from "./components.js";
 import { getApp } from "./dom.js";
-import { escapeHtml, icon } from "./html.js";
+import { escapeHtml } from "./html.js";
 import { captureUiState, restoreUiState } from "./preserve.js";
 import { state } from "./state.js";
 import { applyTheme } from "./theme.js";
@@ -36,7 +36,7 @@ function buildHtml() {
   }
 
   if (!state.bootstrap.loggedIn) {
-    return renderAuth("Sign in to your Minecraft server dashboard", "login");
+    return renderAuth("Are You Worthy", "login");
   }
 
   const nextTheme = state.theme === "light" ? "dark" : "light";
@@ -56,10 +56,7 @@ function buildHtml() {
         <span></span>
       </button>
       ${state.navOpen ? '<button class="nav-scrim" type="button" data-action="close-nav" aria-label="Close navigation"></button>' : ""}
-      <button class="theme-toggle" type="button" data-action="toggle-theme" title="Switch to ${escapeHtml(nextTheme)} mode" aria-label="Switch to ${escapeHtml(nextTheme)} mode">
-        ${icon("theme")}
-      </button>
-      ${renderSidebar()}
+      ${renderSidebar(nextTheme)}
       <section class="content">
         ${state.notice
           ? `<div class="notice notice--${escapeHtml(state.notice.type)}" aria-hidden="true">${escapeHtml(state.notice.message)}</div>`

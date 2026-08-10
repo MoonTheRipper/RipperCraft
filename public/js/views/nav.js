@@ -73,7 +73,7 @@ export function renderOwnerTree() {
   `;
 }
 
-export function renderSidebar() {
+export function renderSidebar(nextTheme) {
   return `
     <aside class="rail ${state.navOpen ? "rail--open" : ""}" id="primary-nav">
       <div class="rail-top">
@@ -85,6 +85,9 @@ export function renderSidebar() {
         ${renderOwnerTree()}
       </nav>
       <div class="rail-bottom">
+        <button class="button button--quiet theme-toggle" type="button" data-action="toggle-theme" title="Switch to ${escapeHtml(nextTheme)} mode">
+          ${labelWithIcon("theme", `${nextTheme} mode`)}
+        </button>
         <button class="button button--quiet" data-action="logout">${labelWithIcon("stop", "log out")}</button>
       </div>
     </aside>
