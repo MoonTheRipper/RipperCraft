@@ -227,6 +227,7 @@ test("compatibility profiles distinguish modded, plugin, and unsupported servers
     installKind: "mod",
     loader: "fabric",
     projectType: "mod",
+    queryLoaders: ["fabric"],
     supportsCurseforge: true,
     supportsManagedInstalls: true
   });
@@ -236,6 +237,7 @@ test("compatibility profiles distinguish modded, plugin, and unsupported servers
     installKind: "plugin",
     loader: "paper",
     projectType: "plugin",
+    queryLoaders: ["paper", "spigot", "bukkit"],
     supportsCurseforge: false,
     supportsManagedInstalls: true
   });
@@ -245,9 +247,83 @@ test("compatibility profiles distinguish modded, plugin, and unsupported servers
     installKind: "unsupported",
     loader: "vanilla",
     projectType: null,
+    queryLoaders: [],
     supportsCurseforge: false,
     supportsManagedInstalls: false
   });
+
+  // Purpur and Folia are Paper forks: the plugins they run are tagged for
+  // paper/spigot/bukkit, never for the fork itself.
+  assert.deepEqual(
+    modManager.getCompatibilityProfile({ loader: "purpur", minecraftVersion: "1.21.4" }).queryLoaders,
+    ["purpur", "paper", "spigot", "bukkit"]
+  );
+  assert.deepEqual(
+    modManager.getCompatibilityProfile({ loader: "folia", minecraftVersion: "1.21.4" }).queryLoaders,
+    ["folia", "paper", "spigot", "bukkit"]
+  );
+});
+
+test("a purpur server installs a paper-tagged modrinth plugin", async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => {
+    global.fetch = originalFetch;
+  });
+
+  const seenLoaderQueries = [];
+  global.fetch = async (url) => {
+    const href = String(url);
+    if (href.includes("/project/luckperms/version")) {
+      const loaders = JSON.parse(new URL(href).searchParams.get("loaders"));
+      seenLoaderQueries.push(loaders);
+      // Mirrors the live API: a plugin release carries the paper/spigot/bukkit
+      // tags only, so asking for purpur alone comes back empty.
+      if (!loaders.includes("paper")) {
+        return {
+          ok: true,
+          async json() {
+            return [];
+          }
+        };
+      }
+      return {
+        ok: true,
+        async json() {
+          return [
+            {
+              date_published: "2026-02-01T00:00:00Z",
+              dependencies: [],
+              files: [{ filename: "LuckPerms-Bukkit-5.4.jar", primary: true, url: "https://cdn.modrinth.com/luckperms.jar" }],
+              game_versions: ["1.21.4"],
+              loaders: ["bukkit", "paper", "spigot"],
+              version_type: "release"
+            }
+          ];
+        }
+      };
+    }
+    throw new Error(`Unexpected fetch call: ${href}`);
+  };
+
+  const modManager = createModManager({
+    downloadAndInstallFile: async (serverId, url, fileName) => ({ fileName }),
+    getServer: async () => ({ id: "PurpurServer", loader: "purpur", minecraftVersion: "1.21.4" }),
+    recordAddonInstalls: async (serverId, entries) => entries
+  });
+
+  const installed = await modManager.install("PurpurServer", {
+    projectId: "luckperms",
+    provider: "modrinth"
+  });
+
+  assert.deepEqual(seenLoaderQueries, [["purpur", "paper", "spigot", "bukkit"]]);
+  assert.deepEqual(installed, [
+    {
+      fileName: "LuckPerms-Bukkit-5.4.jar",
+      provider: "modrinth",
+      sourceId: "luckperms"
+    }
+  ]);
 });
 
 test("curseforge availability only needs an api key and defaults to the minecraft game id", async (t) => {
@@ -587,6 +663,39 @@ test("operator uuids follow the server's online-mode and mismatches are repairab
     () => serverManager.addServerOperator("DemoServer", { level: 4, name: "NoSuchPlayer" }),
     /No Minecraft account named/
   );
+});
+
+test("adding an operator requires an explicit op level", async (t) => {
+  const root = await createFixtureRoot();
+  const store = createStore(root);
+  const serverManager = createServerManager(store);
+
+  t.after(async () => {
+    await fsp.rm(root, { recursive: true, force: true });
+  });
+
+  await store.ensureInitialized();
+  await serverManager.syncDiscoveredServers();
+  await fsp.writeFile(path.join(root, "servers", "DemoServer", "server.properties"), "online-mode=false\n", "utf8");
+
+  // Level 4 grants /stop, /ban and /op. Omitting the field used to hand that
+  // out silently, so a request that does not name a level is refused.
+  for (const level of [undefined, "", 0, 5, "owner"]) {
+    await assert.rejects(
+      () => serverManager.addServerOperator("DemoServer", { level, name: "RipperMoon" }),
+      /op level between 1 and 4/,
+      `level ${JSON.stringify(level)} should be refused`
+    );
+  }
+
+  const operators = await serverManager.addServerOperator("DemoServer", { level: 1, name: "RipperMoon" });
+  assert.equal(operators[0].level, 1);
+
+  // Entries already written to ops.json keep whatever powers they had, so an
+  // existing operator is never silently demoted by the stricter add path.
+  await serverManager.writeServerOperators("DemoServer", [{ name: "Legacy", uuid: "c81d3d67-a6c9-387e-90a4-a9dd4f476f2c" }]);
+  const listed = await serverManager.listServerOperators("DemoServer");
+  assert.equal(listed.find((entry) => entry.name === "Legacy").level, 4);
 });
 
 test("job registry tracks progress, completion and failure", async () => {
