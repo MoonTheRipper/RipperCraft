@@ -33,6 +33,8 @@ globalThis.localStorage = {
 };
 
 globalThis.document = {
+  activeElement: null,
+  addEventListener() {},
   documentElement: { dataset: {} },
   hidden: false,
   title: "",
@@ -53,7 +55,12 @@ globalThis.window = {
   },
   prompt() {
     return null;
-  }
+  },
+  // render() restores the scroll position that emptying #app would otherwise
+  // clamp to the top.
+  scrollTo() {},
+  scrollX: 0,
+  scrollY: 0
 };
 
 // public/app.js kicks off refreshAll() on load. A 204 keeps that path short and
@@ -138,6 +145,54 @@ test("html helpers escape and wrap markup", async () => {
   assert.ok(renderSelectOptions(["a", "b"], "b").includes('value="b" selected'));
 });
 
+test("escapeHtml keeps falsy values that are not empty", async () => {
+  const { escapeHtml } = await load(path.join(jsRoot, "html.js"));
+  // A server property set to 0 used to render as a blank input and save blank.
+  assert.equal(escapeHtml(0), "0");
+  assert.equal(escapeHtml(false), "false");
+  assert.equal(escapeHtml(""), "");
+  assert.equal(escapeHtml(null), "");
+  assert.equal(escapeHtml(undefined), "");
+});
+
+test("safe setting fields render a zero value instead of blanking it", async () => {
+  const { renderSafeSettingField } = await load(path.join(jsRoot, "components.js"));
+  assert.ok(renderSafeSettingField({ key: "spawn-protection", type: "number" }, 0).includes('value="0"'));
+  assert.ok(renderSafeSettingField({ key: "motd", type: "string" }, undefined).includes('value=""'));
+});
+
+test("safeUrl only lets absolute http(s) links through", async () => {
+  const { safeUrl } = await load(path.join(jsRoot, "html.js"));
+  assert.equal(safeUrl("https://www.curseforge.com/minecraft/mc-mods/x"), "https://www.curseforge.com/minecraft/mc-mods/x");
+  assert.equal(safeUrl("http://example.test/a"), "http://example.test/a");
+  // Everything below reached an href straight from a provider response.
+  assert.equal(safeUrl("javascript:alert(1)"), "");
+  assert.equal(safeUrl("  JavaScript:alert(1)"), "");
+  assert.equal(safeUrl("data:text/html,<script>alert(1)</script>"), "");
+  assert.equal(safeUrl("vbscript:msgbox(1)"), "");
+  assert.equal(safeUrl("/relative/path"), "");
+  assert.equal(safeUrl(""), "");
+  assert.equal(safeUrl(null), "");
+});
+
+test("provider links degrade to a note when the url is unusable", async () => {
+  const { renderProviderLink } = await load(path.join(jsRoot, "views", "server-mods.js"));
+  assert.ok(renderProviderLink("https://example.test/mod", "open curseforge").includes('href="https://example.test/mod"'));
+  const rejected = renderProviderLink("javascript:alert(1)", "open curseforge");
+  assert.equal(rejected.includes("<a"), false);
+  assert.equal(rejected.includes("javascript"), false);
+  assert.ok(rejected.includes("no usable link"));
+});
+
+test("meta rows escape values unless markup is opted into", async () => {
+  const { renderMetaRows } = await load(path.join(jsRoot, "components.js"));
+  const { rawHtml } = await load(path.join(jsRoot, "html.js"));
+  const escaped = renderMetaRows([["directory", "<img src=x onerror=alert(1)>"]]);
+  assert.equal(escaped.includes("<img"), false);
+  assert.ok(escaped.includes("&lt;img"));
+  assert.ok(renderMetaRows([["directory", rawHtml("<code>/srv</code>")]]).includes("<code>/srv</code>"));
+});
+
 test("icons module exports the icon table", async () => {
   const { ICONS } = await load(path.join(jsRoot, "icons.js"));
   assert.equal(typeof ICONS, "object");
@@ -153,23 +208,25 @@ test("api module exports the fetch wrapper and wait", async () => {
   assert.equal(await api("/api/anything"), null);
 });
 
-test("theme module exports theme and metadata helpers", async () => {
-  const { applyTheme, toggleTheme, syncDocumentMeta } = await load(path.join(jsRoot, "theme.js"));
-  for (const fn of [applyTheme, toggleTheme, syncDocumentMeta]) {
+test("theme module exports only the theme helpers", async () => {
+  const theme = await load(path.join(jsRoot, "theme.js"));
+  for (const fn of [theme.applyTheme, theme.toggleTheme]) {
     assert.equal(typeof fn, "function");
   }
-  applyTheme();
+  // The runtime SEO rewriter is gone along with the meta tags it targeted.
+  assert.equal(theme.syncDocumentMeta, undefined);
+  theme.applyTheme();
   assert.equal(globalThis.document.documentElement.dataset.theme, "dark");
 });
 
 test("format module exports date and permission helpers", async () => {
-  const { formatDate, getServerPermissions, isServerLocked } = await load(path.join(jsRoot, "format.js"));
-  for (const fn of [formatDate, getServerPermissions, isServerLocked]) {
+  const format = await load(path.join(jsRoot, "format.js"));
+  for (const fn of [format.formatDate, format.getServerPermissions]) {
     assert.equal(typeof fn, "function");
   }
-  assert.equal(formatDate(null), "unknown");
-  assert.equal(getServerPermissions({}).canControlRuntime, false);
-  assert.equal(isServerLocked({}), false);
+  assert.equal(format.formatDate(null), "unknown");
+  assert.equal(format.getServerPermissions({}).canControlRuntime, false);
+  assert.equal(format.isServerLocked, undefined);
 });
 
 test("notice module exports setNotice and clearNotice", async () => {
@@ -200,7 +257,6 @@ test("components module exports the shared renderers", async () => {
   for (const name of [
     "renderSafeSettingField",
     "renderVersionDatalist",
-    "renderMinecraftVersionOptions",
     "renderCreateVersionPicker",
     "renderPageHeader",
     "renderMetaRows",
@@ -210,6 +266,7 @@ test("components module exports the shared renderers", async () => {
   ]) {
     assert.equal(typeof components[name], "function", `components.js is missing ${name}`);
   }
+  assert.equal(components.renderMinecraftVersionOptions, undefined);
   assert.ok(components.renderPageHeader("p", "t", "s").includes("<h1>t</h1>"));
 });
 
@@ -281,7 +338,188 @@ test("view modules export their section renderers", async () => {
   assert.deepEqual(logs.prepareLogText("", "nothing"), { hiddenLines: 0, text: "nothing", totalLines: 0 });
 
   const auth = await load(path.join(jsRoot, "views", "auth.js"));
-  assert.ok(auth.renderAuth("Log In", "", "login").includes('data-form="login"'));
+  const login = auth.renderAuth("Sign in", "login");
+  assert.ok(login.includes('data-form="login"'));
+  // The decorative quote is gone and the copy says what the page is for.
+  assert.equal(login.includes("auth-quote"), false);
+  assert.ok(login.includes("Minecraft servers"));
+});
+
+test("log panes are focusable and named for keyboard and screen reader users", async () => {
+  const logs = await load(path.join(jsRoot, "views", "server-logs.js"));
+  const pane = logs.renderLogPane("latest", "latest.log", "one\ntwo", "nothing yet");
+  assert.ok(pane.includes('tabindex="0"'));
+  assert.ok(pane.includes('aria-labelledby="log-label-latest"'));
+  assert.ok(pane.includes('id="log-label-latest"'));
+});
+
+test("adding an in-game operator forces an explicit, non-owner op level", async () => {
+  const settings = await load(path.join(jsRoot, "views", "server-settings.js"));
+  const panel = settings.renderServerOperatorsPanel({ operators: [] });
+  assert.ok(panel.includes('<select name="level" required>'));
+  assert.ok(panel.includes('<option value="" selected disabled>'));
+  // Nothing may be preselected for the user, least of all full op.
+  assert.equal(panel.includes('<option value="4" selected'), false);
+  assert.equal(panel.includes("labelWithIcon"), false);
+});
+
+test("modal, preserve and confirm modules expose their behaviour", async () => {
+  const modal = await load(path.join(jsRoot, "modal.js"));
+  for (const name of ["applyModalBehaviour", "handleAppKeydown", "currentModalPanel"]) {
+    assert.equal(typeof modal[name], "function", `modal.js is missing ${name}`);
+  }
+  assert.equal(modal.currentModalPanel(), null);
+
+  const preserve = await load(path.join(jsRoot, "preserve.js"));
+  for (const name of ["captureUiState", "restoreUiState"]) {
+    assert.equal(typeof preserve[name], "function", `preserve.js is missing ${name}`);
+  }
+
+  const confirmModule = await load(path.join(jsRoot, "confirm.js"));
+  for (const name of ["serverIsRunning", "activeWorldName", "confirmRequiresStoppedServer", "confirmWithStopNotice", "confirmRestoreWorld"]) {
+    assert.equal(typeof confirmModule[name], "function", `confirm.js is missing ${name}`);
+  }
+  // Nothing to interrupt on a stopped server, so no prompt is raised (the
+  // stubbed window.confirm always says no).
+  assert.equal(confirmModule.serverIsRunning(), false);
+  assert.equal(confirmModule.confirmRequiresStoppedServer("Back up?"), true);
+});
+
+test("server-scoped state is cleared when the selected server changes", async () => {
+  const { resetServerScopedState, state } = await load(path.join(jsRoot, "state.js"));
+  state.manualDownload = { modName: "x" };
+  state.modQuery = "essentials";
+  state.modResults = [{ id: "1" }];
+  state.modUpdates = { entries: [], serverId: "A" };
+  state.updatePlan = { serverId: "A" };
+
+  resetServerScopedState();
+
+  assert.equal(state.manualDownload, null);
+  assert.equal(state.modQuery, "");
+  assert.deepEqual(state.modResults, []);
+  assert.equal(state.modUpdates, null);
+  assert.equal(state.updatePlan, null);
+});
+
+test("add-on updates from another server are never matched by filename alone", async () => {
+  const { state } = await load(path.join(jsRoot, "state.js"));
+  const { currentModUpdates, findAddonUpdate } = await load(path.join(jsRoot, "views", "server-mods.js"));
+
+  state.selectedServerId = "server-b";
+  state.modUpdates = {
+    entries: [{ fileName: "EssentialsX.jar", status: "update-available" }],
+    serverId: "server-a"
+  };
+  assert.equal(currentModUpdates(), null);
+  assert.equal(findAddonUpdate("EssentialsX.jar"), null);
+
+  state.modUpdates.serverId = "server-b";
+  assert.notEqual(currentModUpdates(), null);
+  assert.equal(findAddonUpdate("EssentialsX.jar").status, "update-available");
+
+  state.modUpdates = null;
+  state.selectedServerId = null;
+});
+
+// These exercise the decision logic of preserve.js - which controls are carried
+// across a re-render and which are not - against hand-built element objects.
+// They cannot prove the browser behaviour (focus rings, caret placement); that
+// needs a real DOM. What they do pin down is the rule that stops a re-render
+// eating unsaved input, and the rule that stops a stale edit eating fresh
+// server data.
+function fakeControl(overrides = {}) {
+  const element = {
+    checked: false,
+    closest() {
+      return element.form;
+    },
+    dataset: {},
+    defaultChecked: false,
+    defaultValue: "",
+    focus() {
+      element.focused = true;
+    },
+    focused: false,
+    form: { dataset: { form: "save-settings" } },
+    id: "",
+    name: "field",
+    scrollTop: 0,
+    selectionEnd: 0,
+    selectionStart: 0,
+    setSelectionRange() {},
+    tagName: "INPUT",
+    type: "text",
+    value: "",
+    ...overrides
+  };
+  return element;
+}
+
+function fakeContainer(controls) {
+  return {
+    querySelectorAll() {
+      return controls;
+    }
+  };
+}
+
+test("a re-render keeps edited fields and the focused control", async (t) => {
+  const { captureUiState, restoreUiState } = await load(path.join(jsRoot, "preserve.js"));
+
+  const typedInto = fakeControl({
+    defaultValue: "motd=Demo\n",
+    name: "propertiesText",
+    tagName: "TEXTAREA",
+    type: "textarea",
+    value: "motd=Demo\nmax-players=30\n"
+  });
+  const untouched = fakeControl({ defaultValue: "4G", name: "maxMemory", value: "4G" });
+  const ticked = fakeControl({ checked: true, defaultChecked: false, name: "servers", type: "checkbox" });
+
+  globalThis.document.activeElement = typedInto;
+  t.after(() => {
+    globalThis.document.activeElement = null;
+  });
+  const snapshot = captureUiState(fakeContainer([typedInto, untouched, ticked]));
+
+  // Only the two controls the user actually changed are worth carrying over.
+  assert.equal(snapshot.fields.size, 2);
+
+  const redrawnTyped = fakeControl({
+    defaultValue: "motd=Demo\n",
+    name: "propertiesText",
+    tagName: "TEXTAREA",
+    type: "textarea",
+    value: "motd=Demo\n"
+  });
+  const redrawnUntouched = fakeControl({ defaultValue: "6G", name: "maxMemory", value: "6G" });
+  const redrawnTicked = fakeControl({ checked: false, defaultChecked: false, name: "servers", type: "checkbox" });
+
+  restoreUiState(fakeContainer([redrawnTyped, redrawnUntouched, redrawnTicked]), snapshot);
+
+  assert.equal(redrawnTyped.value, "motd=Demo\nmax-players=30\n");
+  assert.equal(redrawnTyped.focused, true);
+  assert.equal(redrawnTicked.checked, true);
+  // Untouched fields take whatever the server just sent.
+  assert.equal(redrawnUntouched.value, "6G");
+});
+
+test("a re-render drops an edit whose underlying server value has changed", async (t) => {
+  const { captureUiState, restoreUiState } = await load(path.join(jsRoot, "preserve.js"));
+
+  const edited = fakeControl({ defaultValue: "2G", name: "minMemory", value: "3G" });
+  globalThis.document.activeElement = null;
+  t.after(() => {
+    globalThis.document.activeElement = null;
+  });
+  const snapshot = captureUiState(fakeContainer([edited]));
+
+  // Someone else (or a save) moved this setting underneath the edit: the fresh
+  // value has to win, otherwise the form silently re-proposes a stale one.
+  const redrawn = fakeControl({ defaultValue: "8G", name: "minMemory", value: "8G" });
+  restoreUiState(fakeContainer([redrawn]), snapshot);
+  assert.equal(redrawn.value, "8G");
 });
 
 test("action modules export the three delegated listeners", async () => {
@@ -293,8 +531,9 @@ test("action modules export the three delegated listeners", async () => {
   assert.equal(typeof forms.handleAppSubmit, "function");
   assert.equal(typeof change.handleAppChange, "function");
 
-  for (const name of ["selectedValues", "checkedValues", "normalizeAccessSelection"]) {
+  for (const name of ["checkedValues", "normalizeAccessSelection"]) {
     assert.equal(typeof forms[name], "function", `forms.js is missing ${name}`);
   }
+  assert.equal(forms.selectedValues, undefined);
   assert.deepEqual(forms.normalizeAccessSelection(["a"], ["a", "b"]), ["a", "b"]);
 });

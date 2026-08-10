@@ -1,16 +1,17 @@
 import { escapeHtml, labelWithIcon } from "../html.js";
 
-export function renderAuth(title, subtitle, mode) {
+export function renderAuth(title, mode) {
   const isSetup = mode === "setup";
   return `
     <main class="auth-shell">
-      <figure class="auth-quote">
-        <blockquote>with great power comes great responsibility</blockquote>
-        <figcaption>Uncle Ben</figcaption>
-      </figure>
       <section class="auth-panel">
         <p class="brand-line brand-inline">RipperMoonStash</p>
         <h1>${escapeHtml(title)}</h1>
+        <p class="muted copy">
+          ${isSetup
+            ? "This dashboard has no accounts yet. The first account you create owns every server on it."
+            : "This is the control panel for the Minecraft servers running on this machine. Sign in to start, stop, and manage them."}
+        </p>
         <form data-form="${isSetup ? "setup" : "login"}" class="form-grid">
           <label>
             <span>Username</span>

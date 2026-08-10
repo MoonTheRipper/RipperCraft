@@ -1,5 +1,5 @@
 import { renderMetaRows, renderSection } from "../components.js";
-import { escapeHtml, icon, labelWithIcon } from "../html.js";
+import { escapeHtml, icon, labelWithIcon, rawHtml } from "../html.js";
 import { state } from "../state.js";
 
 export function renderOverviewSection(snapshot) {
@@ -10,21 +10,22 @@ export function renderOverviewSection(snapshot) {
       <span class="muted">${server.passphraseConfigured ? "passphrase required for edits and installs" : "no passphrase set yet"}</span>
     </div>
     <form data-form="unlock-server" class="form-inline">
-      <input type="password" name="passphrase" placeholder="server passphrase" ${state.bootstrap.user.role === "owner" ? "" : "required"} />
+      <label class="visually-hidden" for="server-unlock-passphrase">server passphrase</label>
+      <input id="server-unlock-passphrase" type="password" name="passphrase" autocomplete="one-time-code" placeholder="server passphrase" ${state.bootstrap.user.role === "owner" ? "" : "required"} />
       <button class="button button--primary" type="submit">${labelWithIcon("unlock", state.bootstrap.user.role === "owner" ? "owner unlock" : "unlock")}</button>
     </form>
   `;
 
   const infoBody = `
     ${renderMetaRows([
-      ["status", escapeHtml(server.status.running ? "online" : "offline")],
-      ["eula", escapeHtml(server.eulaAccepted ? "accepted" : "pending")],
-      ["loader", escapeHtml(server.loader)],
-      ["minecraft", escapeHtml(server.minecraftVersion || "unknown")],
-      ["directory", `<code>${escapeHtml(server.directory)}</code>`],
-      ["addons dir", `<code>${escapeHtml(runtime.modsDir)}</code>`],
-      ["world archives", escapeHtml(String(worlds.length))],
-      ["installed addons", escapeHtml(String(mods.length))]
+      ["status", server.status.running ? "online" : "offline"],
+      ["eula", server.eulaAccepted ? "accepted" : "pending"],
+      ["loader", server.loader],
+      ["minecraft", server.minecraftVersion || "unknown"],
+      ["directory", rawHtml(`<code>${escapeHtml(server.directory)}</code>`)],
+      ["addons dir", rawHtml(`<code>${escapeHtml(runtime.modsDir)}</code>`)],
+      ["world archives", String(worlds.length)],
+      ["installed addons", String(mods.length)]
     ])}
   `;
 
@@ -103,10 +104,10 @@ export function renderUpdatePlanSummary(plan, server) {
       </div>
       ${blocked}
       ${renderMetaRows([
-        ["runtime", escapeHtml(plan.runtime?.runtimeKind || server.loader)],
-        ["managed add-ons", escapeHtml(String(plan.addons?.managedCount || 0))],
-        ["manual add-ons", escapeHtml(String(plan.addons?.manualCount || 0))],
-        ["untracked files", escapeHtml(String((plan.addons?.untrackedFiles || []).length))]
+        ["runtime", plan.runtime?.runtimeKind || server.loader],
+        ["managed add-ons", String(plan.addons?.managedCount || 0)],
+        ["manual add-ons", String(plan.addons?.manualCount || 0)],
+        ["untracked files", String((plan.addons?.untrackedFiles || []).length)]
       ])}
       ${updates}
     </div>
@@ -128,7 +129,9 @@ export function renderUpdatesSection(snapshot) {
     `
       <p class="muted">the server must be stopped. every add-on must be tracked by the dashboard, and a compatible build must exist for the selected Minecraft version before the update button appears.</p>
       <form data-form="plan-update" class="form-inline">
+        <label class="visually-hidden" for="update-target-version">target minecraft version</label>
         <input
+          id="update-target-version"
           name="targetVersion"
           list="minecraft-version-list"
           placeholder="${escapeHtml(server.minecraftVersion || "choose target version")}"

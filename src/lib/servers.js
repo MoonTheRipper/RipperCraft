@@ -1001,12 +1001,21 @@ function createServerManager(store) {
       throw userFacingError("A player name is required.", 400);
     }
 
+    // normalizeOperator falls back to level 4 so that hand-written ops.json
+    // entries keep the powers they already had. Granting that by default to a
+    // request that simply omitted the field is a different matter: level 4
+    // includes /stop, /ban and /op, so the caller has to say so out loud.
+    const level = Number.parseInt(operator && operator.level, 10);
+    if (!Number.isInteger(level) || level < 1 || level > 4) {
+      throw userFacingError("Choose an op level between 1 and 4 for this operator.", 400);
+    }
+
     const current = await listServerOperators(serverId);
     // Always derive the uuid from the server's auth mode rather than trusting
     // whatever the caller sent, so the entry can actually match a player.
     const uuid = await resolveOperatorUuid(serverId, name);
     const next = current.filter((entry) => entry.name.toLowerCase() !== name.toLowerCase());
-    return await writeServerOperators(serverId, [...next, { ...operator, name, uuid }]);
+    return await writeServerOperators(serverId, [...next, { ...operator, level, name, uuid }]);
   }
 
   // Rewrites existing operators to the uuid form the server's auth mode needs.

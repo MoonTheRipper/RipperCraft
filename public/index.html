@@ -3,57 +3,29 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>RipperMoonStash | Minimal Minecraft Server Dashboard</title>
-    <meta
-      name="description"
-      content="RipperMoonStash is a minimal Minecraft server dashboard for managing servers, mods, worlds, logs, admin access, and start-stop controls from the browser."
-    />
-    <meta
-      name="keywords"
-      content="Minecraft server dashboard, Minecraft server manager, server mods, world backups, admin access, RipperMoonStash"
-    />
+    <title>RipperMoonStash | Minecraft Server Dashboard</title>
+    <!-- This panel sits behind a login on a LAN box. There is nothing here for a
+         crawler to index, so it carries no social or search metadata. -->
+    <meta name="robots" content="noindex, nofollow" />
     <meta name="application-name" content="RipperMoonStash" />
     <meta name="apple-mobile-web-app-title" content="RipperMoonStash" />
     <meta name="theme-color" content="#0f1317" />
-    <meta name="robots" content="index,follow,max-image-preview:large" />
     <meta name="format-detection" content="telephone=no" />
-    <meta property="og:type" content="website" />
-    <meta property="og:site_name" content="RipperMoonStash" />
-    <meta property="og:title" content="RipperMoonStash | Minimal Minecraft Server Dashboard" />
-    <meta
-      property="og:description"
-      content="Manage Minecraft servers, worlds, mods, logs, and role-based admin access in one minimal browser interface."
-    />
-    <meta property="og:image" content="/icon.svg" />
-    <meta name="twitter:card" content="summary" />
-    <meta name="twitter:title" content="RipperMoonStash | Minimal Minecraft Server Dashboard" />
-    <meta
-      name="twitter:description"
-      content="A minimal Minecraft server control panel with server trees, world tools, mod installs, logs, and admin lanes."
-    />
     <link rel="icon" type="image/svg+xml" href="/icon.svg" />
     <link rel="manifest" href="/site.webmanifest" />
-    <link rel="stylesheet" href="/styles.css?v=20260426-password-reset" />
-    <script type="application/ld+json">
-      {
-        "@context": "https://schema.org",
-        "@type": "WebApplication",
-        "name": "RipperMoonStash",
-        "applicationCategory": "GameApplication",
-        "operatingSystem": "Windows, macOS, Linux",
-        "description": "A minimal Minecraft server dashboard for managing servers, worlds, mods, logs, and admin access in the browser.",
-        "keywords": "Minecraft server dashboard, Minecraft server manager, mods, worlds, admin access",
-        "offers": {
-          "@type": "Offer",
-          "price": "0",
-          "priceCurrency": "USD"
-        }
-      }
-    </script>
+    <link rel="stylesheet" href="/styles.css?v=20260810-ui-overhaul" />
   </head>
   <body>
-    <div class="background-orbit orbit-a"></div>
-    <div class="background-orbit orbit-b"></div>
+    <!-- Lives outside #app so it survives every re-render: a live region that is
+         inserted together with its text is not reliably announced. Hidden with
+         inline styles rather than a class so it cannot be un-hidden by a
+         stylesheet change. -->
+    <div
+      id="notice-live"
+      role="status"
+      aria-live="polite"
+      style="position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0,0,0,0);clip-path:inset(50%);border:0;white-space:nowrap"
+    ></div>
     <div id="app"></div>
     <noscript>
       <main class="auth-shell">
@@ -64,6 +36,6 @@
         </section>
       </main>
     </noscript>
-    <script type="module" src="/app.js?v=20260809-client-export"></script>
+    <script type="module" src="/app.js?v=20260810-ui-overhaul"></script>
   </body>
 </html>

@@ -1,10 +1,25 @@
 import { api } from "../api.js";
+import { confirmRestoreWorld, confirmRequiresStoppedServer, confirmWithStopNotice } from "../confirm.js";
 import { loadBootstrap, loadServers, loadSnapshot, refreshAll } from "../data.js";
 import { applyLogScroll, logScrollPinned } from "../logs-live.js";
+import { releaseReturnFocus, rememberReturnFocus } from "../modal.js";
 import { clearNotice, setNotice } from "../notice.js";
 import { render } from "../render.js";
-import { state } from "../state.js";
+import { resetServerScopedState, state } from "../state.js";
 import { toggleTheme } from "../theme.js";
+import { currentModUpdates } from "../views/server-mods.js";
+
+// Update results are keyed by filename alone, so they are stamped with the
+// server they were fetched for and discarded if the selection moved on while
+// the check was running.
+async function fetchModUpdates(serverId) {
+  const payload = await api(`/api/servers/${encodeURIComponent(serverId)}/mods/updates`);
+  if (serverId !== state.selectedServerId) {
+    return null;
+  }
+  state.modUpdates = { ...payload, serverId };
+  return state.modUpdates;
+}
 
 export async function handleAppClick(event) {
   if (state.createVersionOpen && !event.target.closest("[data-version-picker]")) {
@@ -56,6 +71,7 @@ export async function handleAppClick(event) {
     if (action === "edit-user") {
       state.editingUserId = target.dataset.userId;
       state.resettingUserId = null;
+      rememberReturnFocus(`[data-action="edit-user"][data-user-id="${target.dataset.userId}"]`);
       render();
       return;
     }
@@ -63,12 +79,14 @@ export async function handleAppClick(event) {
     if (action === "close-user-editor") {
       state.editingUserId = null;
       render();
+      releaseReturnFocus();
       return;
     }
 
     if (action === "reset-user-password") {
       state.resettingUserId = target.dataset.userId;
       state.editingUserId = null;
+      rememberReturnFocus(`[data-action="reset-user-password"][data-user-id="${target.dataset.userId}"]`);
       render();
       return;
     }
@@ -76,6 +94,7 @@ export async function handleAppClick(event) {
     if (action === "close-password-reset") {
       state.resettingUserId = null;
       render();
+      releaseReturnFocus();
       return;
     }
 
@@ -106,8 +125,7 @@ export async function handleAppClick(event) {
       state.view = "server";
       state.selectedServerId = target.dataset.serverId;
       state.serverSection = "overview";
-      state.modResults = [];
-      state.updatePlan = null;
+      resetServerScopedState();
       state.navOpen = false;
       await loadSnapshot();
       render();
@@ -182,13 +200,29 @@ export async function handleAppClick(event) {
     }
 
     if (action === "activate-world") {
+      const archiveName = target.dataset.archiveName;
+      // The only world action that deletes the live world directory, so it
+      // names what is being replaced and always asks first.
+      if (!confirmRestoreWorld(archiveName)) {
+        return;
+      }
       await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/worlds/activate`, {
         method: "POST",
-        body: { archiveName: target.dataset.archiveName }
+        body: { archiveName }
       });
-      setNotice("success", `activated world ${target.dataset.archiveName}`);
+      setNotice("success", `restored world ${archiveName}`);
+      await loadServers();
       await loadSnapshot();
       render();
+      return;
+    }
+
+    if (action === "export-active-world") {
+      // A plain download link, but the export zips the live world and is
+      // refused while the server is online. Cancelling cancels the navigation.
+      if (!confirmRequiresStoppedServer("Export the active world as a zip download?")) {
+        event.preventDefault();
+      }
       return;
     }
 
@@ -276,12 +310,23 @@ export async function handleAppClick(event) {
 
     if (action === "check-mod-updates") {
       setNotice("success", "checking every tracked add-on against its provider…");
-      state.modUpdates = await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/mods/updates`);
+      const updates = await fetchModUpdates(state.selectedServerId);
+      if (!updates) {
+        return;
+      }
+      // The ternary here used to read `updatable ? "success" : "success"`. Both
+      // outcomes are a successful check, so the branch that carries meaning is
+      // the one every neighbouring handler uses: entries the dashboard could
+      // not check at all are a failure and must not be reported as success.
+      const failed = updates.entries.filter((entry) => entry.status === "error").length;
       setNotice(
-        state.modUpdates.updatable ? "success" : "success",
-        state.modUpdates.updatable
-          ? `${state.modUpdates.updatable} add-on update(s) available`
-          : "every tracked add-on is up to date"
+        failed ? "error" : "success",
+        [
+          updates.updatable ? `${updates.updatable} add-on update(s) available` : "every tracked add-on is up to date",
+          failed ? `${failed} add-on(s) could not be checked` : ""
+        ]
+          .filter(Boolean)
+          .join(" • ")
       );
       return;
     }
@@ -293,10 +338,11 @@ export async function handleAppClick(event) {
     }
 
     if (action === "update-mod" || action === "update-all-mods") {
+      const updates = currentModUpdates();
       const single = action === "update-mod" ? target.dataset.fileName : null;
       const fileNames = single
         ? [single]
-        : (state.modUpdates?.entries || [])
+        : (updates?.entries || [])
             .filter((entry) => entry.status === "update-available")
             .map((entry) => entry.fileName);
 
@@ -305,8 +351,8 @@ export async function handleAppClick(event) {
         return;
       }
       if (
-        !window.confirm(
-          `Update ${fileNames.length} add-on(s)?\n\nThe server will be stopped first if it is running. Minecraft stays on ${state.modUpdates?.gameVersion || "the current version"}.`
+        !confirmWithStopNotice(
+          `Update ${fileNames.length} add-on(s)?\n\nMinecraft stays on ${updates?.gameVersion || "the current version"}.`
         )
       ) {
         return;
@@ -327,7 +373,7 @@ export async function handleAppClick(event) {
       );
 
       // Re-check so the panel reflects the new state rather than stale results.
-      state.modUpdates = await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/mods/updates`);
+      await fetchModUpdates(state.selectedServerId);
       await loadSnapshot();
       render();
       return;
@@ -386,8 +432,7 @@ export async function handleAppClick(event) {
       state.view = "server";
       state.selectedServerId = target.dataset.serverId;
       state.serverSection = "overview";
-      state.modResults = [];
-      state.updatePlan = null;
+      resetServerScopedState();
       await loadSnapshot();
       render();
       return;

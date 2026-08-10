@@ -1,8 +1,9 @@
 import { renderVersionDatalist } from "./components.js";
 import { getApp } from "./dom.js";
-import { escapeHtml } from "./html.js";
+import { escapeHtml, icon } from "./html.js";
+import { captureUiState, restoreUiState } from "./preserve.js";
 import { state } from "./state.js";
-import { applyTheme, syncDocumentMeta } from "./theme.js";
+import { applyTheme } from "./theme.js";
 import { renderAuth } from "./views/auth.js";
 import { renderSidebar } from "./views/nav.js";
 import { renderOwnerContent } from "./views/owner.js";
@@ -25,67 +26,62 @@ function runPostRenderHooks() {
   }
 }
 
-export function render() {
-  const app = getApp();
-  applyTheme();
-  syncDocumentMeta();
-  const nextTheme = state.theme === "light" ? "dark" : "light";
-
+function buildHtml() {
   if (!state.bootstrap) {
-    app.innerHTML = `<main class="auth-shell"><section class="auth-panel"><h1>loading...</h1></section></main>`;
-    return;
+    return `<main class="auth-shell"><section class="auth-panel"><h1>loading...</h1></section></main>`;
   }
 
   if (state.bootstrap.needsSetup) {
-    app.innerHTML = renderAuth(
-      "Create the Owner Account",
-      "Set up the first account with full control over servers, passphrase lanes, worlds, add-ons, and admin permissions.",
-      "setup"
-    );
-    return;
+    return renderAuth("Create the Owner Account", "setup");
   }
 
   if (!state.bootstrap.loggedIn) {
-    app.innerHTML = renderAuth(
-      "Are You Worthy",
-      "Access your Minecraft server workspace with your username and password. After login, choose a server from the left side and unlock it with its passphrase when required.",
-      "login"
-    );
-    return;
+    return renderAuth("Sign in to your Minecraft server dashboard", "login");
   }
 
-  app.innerHTML = `
+  const nextTheme = state.theme === "light" ? "dark" : "light";
+
+  return `
     <main class="shell">
-      <button class="nav-toggle ${state.navOpen ? "nav-toggle--open" : ""}" data-action="toggle-nav" aria-label="${state.navOpen ? "Close navigation" : "Open navigation"}">
+      <button
+        class="nav-toggle ${state.navOpen ? "nav-toggle--open" : ""}"
+        type="button"
+        data-action="toggle-nav"
+        aria-label="${state.navOpen ? "Close navigation" : "Open navigation"}"
+        aria-expanded="${state.navOpen ? "true" : "false"}"
+        aria-controls="primary-nav"
+      >
         <span></span>
         <span></span>
         <span></span>
       </button>
-      ${state.navOpen ? '<button class="nav-scrim" data-action="close-nav" aria-label="Close navigation"></button>' : ""}
-      <button class="theme-toggle" data-action="toggle-theme" title="Switch to ${escapeHtml(nextTheme)} mode" aria-label="Switch to ${escapeHtml(nextTheme)} mode">
-        <span class="theme-toggle__track">
-          <span class="theme-toggle__sun">
-            <span class="theme-toggle__ray theme-toggle__ray--1"></span>
-            <span class="theme-toggle__ray theme-toggle__ray--2"></span>
-            <span class="theme-toggle__ray theme-toggle__ray--3"></span>
-            <span class="theme-toggle__ray theme-toggle__ray--4"></span>
-            <span class="theme-toggle__ray theme-toggle__ray--5"></span>
-            <span class="theme-toggle__ray theme-toggle__ray--6"></span>
-            <span class="theme-toggle__ray theme-toggle__ray--7"></span>
-            <span class="theme-toggle__ray theme-toggle__ray--8"></span>
-          </span>
-          <span class="theme-toggle__moon"></span>
-        </span>
+      ${state.navOpen ? '<button class="nav-scrim" type="button" data-action="close-nav" aria-label="Close navigation"></button>' : ""}
+      <button class="theme-toggle" type="button" data-action="toggle-theme" title="Switch to ${escapeHtml(nextTheme)} mode" aria-label="Switch to ${escapeHtml(nextTheme)} mode">
+        ${icon("theme")}
       </button>
       ${renderSidebar()}
       <section class="content">
-        ${state.notice ? `<div class="notice notice--${escapeHtml(state.notice.type)}">${escapeHtml(state.notice.message)}</div>` : ""}
+        ${state.notice
+          ? `<div class="notice notice--${escapeHtml(state.notice.type)}" aria-hidden="true">${escapeHtml(state.notice.message)}</div>`
+          : ""}
         ${state.view === "owner" ? renderOwnerContent() : renderServerContent()}
       </section>
     </main>
     ${renderVersionDatalist("minecraft-version-list", false)}
-    ${renderVersionDatalist("minecraft-version-list-create", true)}
   `;
+}
+
+export function render() {
+  const app = getApp();
+  applyTheme();
+
+  // Replacing innerHTML discards every piece of DOM-only state. Snapshot it
+  // first and put it back after, so an unrelated re-render (theme toggle, nav
+  // toggle, the three-second log poll) cannot throw away what someone typed or
+  // where their focus was.
+  const uiState = captureUiState(app);
+  app.innerHTML = buildHtml();
+  restoreUiState(app, uiState);
 
   runPostRenderHooks();
 }

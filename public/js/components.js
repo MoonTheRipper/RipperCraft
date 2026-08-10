@@ -1,4 +1,4 @@
-import { escapeHtml, labelWithIcon, renderSelectOptions } from "./html.js";
+import { escapeHtml, labelWithIcon, renderSelectOptions, renderValue } from "./html.js";
 import { state } from "./state.js";
 
 export function renderSafeSettingField(definition, value) {
@@ -27,7 +27,7 @@ export function renderSafeSettingField(definition, value) {
   return `
     <label>
       <span>${escapeHtml(definition.key)}</span>
-      <input name="${escapeHtml(definition.key)}" value="${escapeHtml(value || "")}" ${definition.type === "number" ? 'inputmode="numeric"' : ""} />
+      <input name="${escapeHtml(definition.key)}" value="${escapeHtml(value ?? "")}" ${definition.type === "number" ? 'inputmode="numeric"' : ""} />
     </label>
   `;
 }
@@ -52,22 +52,6 @@ export function renderVersionDatalist(listId, includeLatest = false) {
         )
         .join("")}
     </datalist>
-  `;
-}
-
-export function renderMinecraftVersionOptions(includeLatest = false) {
-  const versions = state.versionCatalog?.versions || [];
-  return `
-    ${includeLatest ? '<option value="latest">latest release</option>' : ""}
-    ${versions
-      .map(
-        (version) => `
-          <option value="${escapeHtml(version.id)}">
-            ${escapeHtml(version.id)} ${version.type === "release" ? "release" : "snapshot"}
-          </option>
-        `
-      )
-      .join("")}
   `;
 }
 
@@ -131,6 +115,9 @@ export function renderPageHeader(pathLabel, title, subtitle, actions = "") {
   `;
 }
 
+// Values are escaped as text. A caller that genuinely needs markup has to say
+// so by wrapping the value in rawHtml(); passing a bare string can no longer
+// inject anything by accident.
 export function renderMetaRows(rows) {
   return `
     <div class="meta-list">
@@ -139,7 +126,7 @@ export function renderMetaRows(rows) {
           ([label, value]) => `
             <div class="meta-row">
               <span>${escapeHtml(label)}</span>
-              <strong>${value}</strong>
+              <strong>${renderValue(value)}</strong>
             </div>
           `
         )

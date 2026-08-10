@@ -23,7 +23,3 @@ export function getServerPermissions(snapshot = state.serverSnapshot) {
     }
   );
 }
-
-export function isServerLocked(snapshot = state.serverSnapshot) {
-  return Boolean(getServerPermissions(snapshot).requiresUnlock);
-}

@@ -133,11 +133,12 @@ export function renderServerOperatorsPanel(snapshot) {
           </label>
           <label>
             <span>op level</span>
-            <select name="level">
-              <option value="4">4 - owner</option>
-              <option value="3">3 - admin</option>
-              <option value="2">2 - moderator</option>
-              <option value="1">1 - helper</option>
+            <select name="level" required>
+              <option value="" selected disabled>choose a level</option>
+              <option value="1">1 - helper (bypass spawn protection)</option>
+              <option value="2">2 - moderator (/gamemode, /tp, command blocks)</option>
+              <option value="3">3 - admin (/ban, /kick, /op other players)</option>
+              <option value="4">4 - owner (everything, including /stop)</option>
             </select>
           </label>
           <label class="checkbox-line">
@@ -145,6 +146,7 @@ export function renderServerOperatorsPanel(snapshot) {
             <span>bypass player limit</span>
           </label>
         </div>
+        <p class="muted">start low. level 3 lets someone ban players and op other accounts, level 4 also lets them shut the server down.</p>
         <div class="submit-line">
           <button class="button button--primary" type="submit">${labelWithIcon("admin", "add admin")}</button>
         </div>
@@ -158,7 +160,7 @@ export function renderServerOperatorsPanel(snapshot) {
                     <strong>${escapeHtml(operator.name)}</strong>
                     <p class="muted">${escapeHtml(operator.uuid)} • level ${escapeHtml(String(operator.level || 4))}${operator.bypassesPlayerLimit ? " • bypasses limit" : ""}${operator.uuidKind ? ` • ${escapeHtml(operator.uuidKind)} uuid` : ""}${operator.uuidMatchesServerMode === false ? " • <strong>not active in game</strong>" : ""}</p>
                   </div>
-                  <button class="button button--quiet button--compact" type="button" data-action="remove-server-operator" data-uuid="${escapeHtml(operator.uuid)}">${labelWithIcon("delete", "remove")}</button>
+                  <button class="button button--quiet button--compact" type="button" data-action="remove-server-operator" data-uuid="${escapeHtml(operator.uuid)}">${labelWithIcon("stop", "remove")}</button>
                 </div>
               `)
               .join("")

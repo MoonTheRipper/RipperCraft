@@ -75,7 +75,7 @@ export function renderOwnerTree() {
 
 export function renderSidebar() {
   return `
-    <aside class="rail ${state.navOpen ? "rail--open" : ""}">
+    <aside class="rail ${state.navOpen ? "rail--open" : ""}" id="primary-nav">
       <div class="rail-top">
         <p class="brand-line">${labelWithIcon("server", "RipperMoonStash", "brand-inline")}</p>
         <p class="session-line">${escapeHtml(state.bootstrap.user.username)} <span>${escapeHtml(state.bootstrap.user.role)}</span></p>

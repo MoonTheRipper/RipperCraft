@@ -28,6 +28,19 @@ export const state = {
   resettingUserId: null
 };
 
+// Everything in state that belongs to one specific server. None of it carries a
+// server id of its own - add-on updates are keyed by filename, the manual
+// download handoff by mod name - so a leftover from server A silently attaches
+// itself to server B, and clicking "update" on B's list posts A's filename to
+// B. Switching servers has to clear the lot.
+export function resetServerScopedState() {
+  state.manualDownload = null;
+  state.modQuery = "";
+  state.modResults = [];
+  state.modUpdates = null;
+  state.updatePlan = null;
+}
+
 export const SERVER_SECTIONS = [
   ["overview", "overview"],
   ["settings", "settings"],

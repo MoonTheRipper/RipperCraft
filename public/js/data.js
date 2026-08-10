@@ -3,12 +3,32 @@ import { setNotice } from "./notice.js";
 import { render } from "./render.js";
 import { state } from "./state.js";
 
+// Responses can land out of order - selecting server A then server B quickly
+// let A's slower answer overwrite B's. Every loader stamps its request with a
+// generation, and a response whose generation has been superseded is dropped
+// instead of written to state.
+const requestGenerations = new Map();
+
+function beginRequest(key) {
+  const generation = (requestGenerations.get(key) || 0) + 1;
+  requestGenerations.set(key, generation);
+  return () => requestGenerations.get(key) === generation;
+}
+
 export async function loadBootstrap() {
-  state.bootstrap = await api("/api/bootstrap");
+  const isCurrent = beginRequest("bootstrap");
+  const payload = await api("/api/bootstrap");
+  if (isCurrent()) {
+    state.bootstrap = payload;
+  }
 }
 
 export async function loadServers() {
+  const isCurrent = beginRequest("servers");
   const payload = await api("/api/servers");
+  if (!isCurrent()) {
+    return;
+  }
   state.servers = payload.servers;
   if (!state.selectedServerId && state.servers.length) {
     state.selectedServerId = state.servers[0].id;
@@ -16,12 +36,25 @@ export async function loadServers() {
 }
 
 export async function loadSnapshot() {
-  if (!state.selectedServerId) {
+  const isCurrent = beginRequest("snapshot");
+  const serverId = state.selectedServerId;
+
+  if (!serverId) {
     state.serverSnapshot = null;
     return;
   }
+
   state.updatePlan = null;
-  state.serverSnapshot = await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}`);
+  const snapshot = await api(`/api/servers/${encodeURIComponent(serverId)}`);
+
+  // Dropping a stale snapshot matters more here than anywhere else: the view is
+  // rendered from state.serverSnapshot while every action handler targets
+  // state.selectedServerId, so a mismatch means the delete button on a world
+  // row from server A issues its DELETE against server B.
+  if (!isCurrent() || serverId !== state.selectedServerId) {
+    return;
+  }
+  state.serverSnapshot = snapshot;
 }
 
 export async function loadUsers() {
@@ -29,8 +62,11 @@ export async function loadUsers() {
     state.users = [];
     return;
   }
+  const isCurrent = beginRequest("users");
   const payload = await api("/api/users");
-  state.users = payload.users;
+  if (isCurrent()) {
+    state.users = payload.users;
+  }
 }
 
 export async function loadVersionCatalog() {
@@ -38,7 +74,11 @@ export async function loadVersionCatalog() {
     state.versionCatalog = null;
     return;
   }
-  state.versionCatalog = await api("/api/minecraft/versions");
+  const isCurrent = beginRequest("versions");
+  const payload = await api("/api/minecraft/versions");
+  if (isCurrent()) {
+    state.versionCatalog = payload;
+  }
 }
 
 export async function loadIntegrations() {
@@ -46,8 +86,11 @@ export async function loadIntegrations() {
     state.integrations = null;
     return;
   }
+  const isCurrent = beginRequest("integrations");
   const payload = await api("/api/settings/integrations");
-  state.integrations = payload.integrations;
+  if (isCurrent()) {
+    state.integrations = payload.integrations;
+  }
 }
 
 // Polls a provisioning job to completion, re-rendering on each step so the
@@ -97,8 +140,11 @@ export async function loadJavaRuntimes() {
     state.javaRuntimes = [];
     return;
   }
+  const isCurrent = beginRequest("java-runtimes");
   const payload = await api("/api/java-runtimes");
-  state.javaRuntimes = payload.runtimes || [];
+  if (isCurrent()) {
+    state.javaRuntimes = payload.runtimes || [];
+  }
 }
 
 export async function refreshAll() {

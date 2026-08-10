@@ -1,13 +1,32 @@
 import { renderSection } from "../components.js";
 import { getServerPermissions } from "../format.js";
-import { escapeHtml, labelWithIcon } from "../html.js";
+import { escapeHtml, labelWithIcon, safeUrl } from "../html.js";
 import { state } from "../state.js";
 
+// Renders a provider link only when the URL is an absolute http(s) one. A
+// rejected or missing link degrades to a plain instruction rather than an
+// anchor that does nothing (or worse, runs a javascript: URL).
+export function renderProviderLink(url, label) {
+  const href = safeUrl(url);
+  if (!href) {
+    return `<span class="muted">no usable link was supplied — search for it on curseforge.com</span>`;
+  }
+  return `<a class="button button--quiet" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${labelWithIcon("mods", label)}</a>`;
+}
+
+// Update entries are keyed by filename only, so a check run against one server
+// would otherwise light up an identically named jar on another. The results
+// carry the server they were fetched for and are ignored anywhere else.
+export function currentModUpdates() {
+  return state.modUpdates && state.modUpdates.serverId === state.selectedServerId ? state.modUpdates : null;
+}
+
 export function findAddonUpdate(fileName) {
-  if (!state.modUpdates) {
+  const updates = currentModUpdates();
+  if (!updates) {
     return null;
   }
-  return state.modUpdates.entries.find((entry) => entry.fileName === fileName) || null;
+  return updates.entries.find((entry) => entry.fileName === fileName) || null;
 }
 
 export function renderAddonUpdateLabel(update) {
@@ -30,7 +49,7 @@ export function renderAddonUpdateLabel(update) {
 }
 
 export function renderAddonUpdatePanel() {
-  const updates = state.modUpdates;
+  const updates = currentModUpdates();
   if (!updates) {
     return "";
   }
@@ -90,9 +109,7 @@ export function renderModsSection(snapshot) {
                   </div>
                   <div class="row-actions">
                     ${result.manualDownloadOnly
-                      ? (result.pageUrl
-                          ? `<a class="button button--quiet" href="${escapeHtml(result.pageUrl)}" target="_blank" rel="noopener noreferrer">${labelWithIcon("mods", "open curseforge")}</a>`
-                          : "")
+                      ? renderProviderLink(result.pageUrl, "open curseforge")
                       : `<button
                       class="button button--quiet"
                       data-action="install-result"
@@ -121,9 +138,7 @@ export function renderModsSection(snapshot) {
             <p class="muted">download it, then add it below with "upload file".</p>
           </div>
           <div class="row-actions">
-            ${handoff.pageUrl
-              ? `<a class="button button--quiet" href="${escapeHtml(handoff.pageUrl)}" target="_blank" rel="noopener noreferrer">${labelWithIcon("mods", "open curseforge")}</a>`
-              : ""}
+            ${renderProviderLink(handoff.pageUrl, "open curseforge")}
             <button class="button button--quiet" data-action="dismiss-manual-download">${labelWithIcon("stop", "dismiss")}</button>
           </div>
         </div>
@@ -139,11 +154,13 @@ export function renderModsSection(snapshot) {
         ${addonCompatibility.installKind !== "unsupported"
           ? `
             <form data-form="search-mods" class="form-inline">
-              <select name="provider">
+              <label class="visually-hidden" for="mod-search-provider">add-on source</label>
+              <select id="mod-search-provider" name="provider">
                 <option value="modrinth"${activeProvider === "modrinth" ? " selected" : ""}>modrinth</option>
                 ${canUseCurseforge ? `<option value="curseforge"${activeProvider === "curseforge" ? " selected" : ""}>curseforge</option>` : ""}
               </select>
-              <input name="query" value="${escapeHtml(state.modQuery)}" placeholder="search mods or plugins" required />
+              <label class="visually-hidden" for="mod-search-query">search mods or plugins</label>
+              <input id="mod-search-query" name="query" value="${escapeHtml(state.modQuery)}" placeholder="search mods or plugins" required />
               <button class="button button--primary" type="submit">${labelWithIcon("search", "search")}</button>
             </form>
           `
@@ -151,12 +168,14 @@ export function renderModsSection(snapshot) {
         ${permissions.canUseManualAddons && addonCompatibility.installKind !== "unsupported"
           ? `
             <form data-form="install-direct" class="form-inline">
-              <input name="url" placeholder="direct .jar url" required />
+              <label class="visually-hidden" for="mod-direct-url">direct .jar url</label>
+              <input id="mod-direct-url" name="url" type="url" placeholder="direct .jar url" required />
               <input type="hidden" name="confirmManualCompatibility" value="true" />
               <button class="button button--quiet" type="submit">${labelWithIcon("mods", "install url")}</button>
             </form>
             <form data-form="upload-mod" class="form-inline" enctype="multipart/form-data">
-              <input type="file" name="file" accept=".jar" required />
+              <label class="visually-hidden" for="mod-upload-file">add-on .jar file to upload</label>
+              <input id="mod-upload-file" type="file" name="file" accept=".jar" required />
               <input type="hidden" name="confirmManualCompatibility" value="true" />
               <button class="button button--quiet" type="submit">${labelWithIcon("mods", "upload file")}</button>
             </form>
@@ -174,7 +193,7 @@ export function renderModsSection(snapshot) {
           <strong>installed</strong>
           <div class="row-actions">
             ${permissions.canManageAddonSettings
-              ? `<button class="button button--quiet" data-action="check-mod-updates">${labelWithIcon("refresh", state.modUpdates ? "re-check updates" : "check for updates")}</button>`
+              ? `<button class="button button--quiet" data-action="check-mod-updates">${labelWithIcon("refresh", currentModUpdates() ? "re-check updates" : "check for updates")}</button>`
               : ""}
             <a class="button button--quiet" href="/api/servers/${encodeURIComponent(server.id)}/mods/client-list">${labelWithIcon("logs", "client list (.txt)")}</a>
             <a class="button button--quiet" href="/api/servers/${encodeURIComponent(server.id)}/mods/modpack">${labelWithIcon("mods", "client modpack (.mrpack)")}</a>

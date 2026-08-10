@@ -29,10 +29,17 @@ export function renderLogPane(key, label, raw, emptyMessage) {
     ? `${prepared.totalLines} lines${prepared.hiddenLines ? ` • oldest ${prepared.hiddenLines} hidden` : ""}`
     : "empty";
 
+  // The pane scrolls, so it has to be reachable and scrollable from the
+  // keyboard (WCAG 2.1.1) and it needs a name to be worth landing on.
   return `
     <div class="log-pane">
-      <p class="log-label">${escapeHtml(label)} <span class="muted">${escapeHtml(meta)}</span></p>
-      <pre data-log-pane="${escapeHtml(key)}">${escapeHtml(prepared.text)}</pre>
+      <p class="log-label" id="log-label-${escapeHtml(key)}">${escapeHtml(label)} <span class="muted">${escapeHtml(meta)}</span></p>
+      <pre
+        data-log-pane="${escapeHtml(key)}"
+        tabindex="0"
+        role="region"
+        aria-labelledby="log-label-${escapeHtml(key)}"
+      >${escapeHtml(prepared.text)}</pre>
     </div>
   `;
 }

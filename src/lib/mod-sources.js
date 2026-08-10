@@ -9,6 +9,20 @@ const CURSEFORGE_API = "https://api.curseforge.com/v1";
 const CURSEFORGE_MINECRAFT_GAME_ID = "432";
 const MODDED_LOADERS = new Set(["fabric", "forge", "neoforge", "quilt"]);
 const PLUGIN_LOADERS = new Set(["paper", "purpur", "folia", "spigot", "bukkit"]);
+// Modrinth tags a release with the platform its author actually targets, not
+// with every fork that can run it. Purpur and Folia are Paper forks and run
+// Paper/Spigot/Bukkit plugins, yet almost nobody tags "purpur" - querying the
+// server's own loader alone returns zero versions for EssentialsX, LuckPerms,
+// WorldEdit and friends, which made installs fail outright on Purpur. Each
+// loader therefore carries the full list of tags that are compatible with it,
+// most specific first.
+const LOADER_QUERY_TAGS = {
+  bukkit: ["bukkit"],
+  folia: ["folia", "paper", "spigot", "bukkit"],
+  paper: ["paper", "spigot", "bukkit"],
+  purpur: ["purpur", "paper", "spigot", "bukkit"],
+  spigot: ["spigot", "bukkit"]
+};
 const RELEASE_PRIORITY = {
   release: 0,
   beta: 1,
@@ -64,6 +78,7 @@ function createModManager(serverManager, options = {}) {
         installKind: "mod",
         loader,
         projectType: "mod",
+        queryLoaders: LOADER_QUERY_TAGS[loader] || [loader],
         supportsCurseforge: true,
         supportsManagedInstalls: Boolean(gameVersion)
       };
@@ -75,6 +90,7 @@ function createModManager(serverManager, options = {}) {
         installKind: "plugin",
         loader,
         projectType: "plugin",
+        queryLoaders: LOADER_QUERY_TAGS[loader] || [loader],
         supportsCurseforge: false,
         supportsManagedInstalls: Boolean(gameVersion)
       };
@@ -85,6 +101,7 @@ function createModManager(serverManager, options = {}) {
       installKind: "unsupported",
       loader,
       projectType: null,
+      queryLoaders: [],
       supportsCurseforge: false,
       supportsManagedInstalls: false
     };
@@ -138,7 +155,9 @@ function createModManager(serverManager, options = {}) {
     const profile = assertManagedInstallServer(server);
     const facets = [];
 
-    facets.push([`categories:${profile.loader}`]);
+    // Facets are AND-ed with each other and OR-ed inside one entry, so this asks
+    // for "tagged with any loader this server can run".
+    facets.push(profile.queryLoaders.map((tag) => `categories:${tag}`));
     facets.push([`versions:${profile.gameVersion}`]);
     facets.push([`project_type:${profile.projectType}`]);
 
@@ -301,7 +320,7 @@ function createModManager(serverManager, options = {}) {
   async function resolveModrinthVersion(projectId, server) {
     const profile = assertManagedInstallServer(server);
     const url = new URL(`${MODRINTH_API}/project/${projectId}/version`);
-    url.searchParams.set("loaders", JSON.stringify([profile.loader]));
+    url.searchParams.set("loaders", JSON.stringify(profile.queryLoaders));
     url.searchParams.set("game_versions", JSON.stringify([profile.gameVersion]));
     url.searchParams.set("include_changelog", "false");
 

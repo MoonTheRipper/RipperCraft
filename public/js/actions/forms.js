@@ -1,13 +1,11 @@
 import { api } from "../api.js";
+import { confirmRequiresStoppedServer } from "../confirm.js";
 import { loadBootstrap, loadServers, loadSnapshot, pollCreateJob, refreshAll } from "../data.js";
 import { installableLoaders, isInstallableLoader } from "../loaders.js";
+import { releaseReturnFocus } from "../modal.js";
 import { clearNotice, setNotice } from "../notice.js";
 import { render } from "../render.js";
 import { state } from "../state.js";
-
-export function selectedValues(select) {
-  return Array.from(select.selectedOptions).map((option) => option.value);
-}
 
 export function checkedValues(form, name) {
   return Array.from(form.querySelectorAll(`input[name="${name}"]:checked`)).map((input) => input.value);
@@ -130,6 +128,11 @@ export async function handleAppSubmit(event) {
       }
       case "capture-world": {
         const data = Object.fromEntries(new FormData(form).entries());
+        // Archiving zips the live world directory, which the backend refuses to
+        // do underneath a running server.
+        if (!confirmRequiresStoppedServer("Back up the active world of this server?")) {
+          break;
+        }
         state.updatePlan = null;
         await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/worlds/capture`, {
           method: "POST",
@@ -142,6 +145,15 @@ export async function handleAppSubmit(event) {
       }
       case "create-world": {
         const formData = new FormData(form);
+        // Creating archives the world that is live now and repoints the server
+        // at a brand new one, so it needs the server down as well.
+        if (
+          !confirmRequiresStoppedServer(
+            `Create the new world "${formData.get("name") || ""}"? The world that is live now is archived first, and the server switches to the new one.`
+          )
+        ) {
+          break;
+        }
         state.updatePlan = null;
         await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/worlds/create`, {
           method: "POST",
@@ -355,6 +367,7 @@ export async function handleAppSubmit(event) {
         setNotice("success", "user updated");
         state.editingUserId = null;
         await refreshAll();
+        releaseReturnFocus();
         break;
       }
       case "reset-user-password": {
@@ -371,6 +384,7 @@ export async function handleAppSubmit(event) {
         setNotice("success", "password reset");
         state.resettingUserId = null;
         await refreshAll();
+        releaseReturnFocus();
         break;
       }
       default:
