@@ -887,6 +887,57 @@ function createServerManager(store) {
     return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
   }
 
+  // Offline UUIDs are version 3 (name-based MD5); Mojang issues version 4.
+  // The version nibble is the first character of the third group.
+  function uuidKind(uuid) {
+    const normalized = String(uuid || "").trim().toLowerCase();
+    const match = normalized.match(/^[0-9a-f]{8}-[0-9a-f]{4}-([0-9a-f])[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    if (!match) {
+      return "unknown";
+    }
+    return match[1] === "3" ? "offline" : match[1] === "4" ? "online" : "unknown";
+  }
+
+  async function serverIsOnlineMode(serverId) {
+    try {
+      const properties = parseServerPropertiesText(await readServerProperties(serverId));
+      // Minecraft defaults online-mode to true when the key is absent.
+      return String(properties["online-mode"] ?? "true").trim().toLowerCase() !== "false";
+    } catch {
+      return true;
+    }
+  }
+
+  // On an online-mode server an offline UUID can never match a real player: the
+  // operator silently has no powers. Resolve the real one from Mojang instead.
+  async function resolveMojangUuid(name) {
+    const response = await fetch(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(name)}`, {
+      headers: withRemoteHeaders()
+    });
+    if (response.status === 404 || response.status === 204) {
+      throw userFacingError(`No Minecraft account named "${name}" exists. Check the spelling.`, 404);
+    }
+    if (!response.ok) {
+      throw userFacingError(
+        `Could not reach Mojang to look up "${name}" (HTTP ${response.status}). Try again in a moment.`,
+        502
+      );
+    }
+    const payload = await response.json();
+    const raw = String(payload.id || "").replace(/-/g, "");
+    if (raw.length !== 32) {
+      throw userFacingError(`Mojang returned an unexpected id for "${name}".`, 502);
+    }
+    return `${raw.slice(0, 8)}-${raw.slice(8, 12)}-${raw.slice(12, 16)}-${raw.slice(16, 20)}-${raw.slice(20)}`.toLowerCase();
+  }
+
+  async function resolveOperatorUuid(serverId, name) {
+    if (await serverIsOnlineMode(serverId)) {
+      return await resolveMojangUuid(name);
+    }
+    return offlinePlayerUuid(name);
+  }
+
   function normalizeOperator(entry) {
     const name = String(entry && entry.name ? entry.name : "").trim();
     const uuid = String(entry && entry.uuid ? entry.uuid : "").trim().toLowerCase();
@@ -908,9 +959,21 @@ function createServerManager(store) {
     }
     const paths = resolveRecordPaths(server);
     const payload = await readJson(paths.opsFile, []);
+    const onlineMode = await serverIsOnlineMode(serverId);
+    const expected = onlineMode ? "online" : "offline";
     return (Array.isArray(payload) ? payload : [])
       .map(normalizeOperator)
       .filter(Boolean)
+      .map((operator) => {
+        const kind = uuidKind(operator.uuid);
+        return {
+          ...operator,
+          // A mismatch here means the entry can never match a joining player,
+          // and Minecraft gives no indication - it just ignores the operator.
+          uuidKind: kind,
+          uuidMatchesServerMode: kind === expected
+        };
+      })
       .sort((left, right) => left.name.localeCompare(right.name));
   }
 
@@ -933,8 +996,43 @@ function createServerManager(store) {
   }
 
   async function addServerOperator(serverId, operator) {
+    const name = String((operator && operator.name) || "").trim();
+    if (!name) {
+      throw userFacingError("A player name is required.", 400);
+    }
+
     const current = await listServerOperators(serverId);
-    return await writeServerOperators(serverId, [...current, operator]);
+    // Always derive the uuid from the server's auth mode rather than trusting
+    // whatever the caller sent, so the entry can actually match a player.
+    const uuid = await resolveOperatorUuid(serverId, name);
+    const next = current.filter((entry) => entry.name.toLowerCase() !== name.toLowerCase());
+    return await writeServerOperators(serverId, [...next, { ...operator, name, uuid }]);
+  }
+
+  // Rewrites existing operators to the uuid form the server's auth mode needs.
+  // Fixes entries added before the mode was known or changed afterwards.
+  async function repairServerOperators(serverId) {
+    const current = await listServerOperators(serverId);
+    const next = [];
+    const failures = [];
+    let repaired = 0;
+
+    for (const operator of current) {
+      if (operator.uuidMatchesServerMode) {
+        next.push(operator);
+        continue;
+      }
+      try {
+        next.push({ ...operator, uuid: await resolveOperatorUuid(serverId, operator.name) });
+        repaired += 1;
+      } catch (error) {
+        failures.push({ name: operator.name, reason: error.message });
+        next.push(operator);
+      }
+    }
+
+    await writeServerOperators(serverId, next);
+    return { failures, operators: await listServerOperators(serverId), repaired };
   }
 
   async function removeServerOperator(serverId, uuid) {
@@ -2427,6 +2525,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     recordAddonInstalls,
     removeAddonFiles,
     removeServerOperator,
+    repairServerOperators,
     removeInstalledFiles,
     resolveRecordPaths,
     serializeServer,

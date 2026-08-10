@@ -900,6 +900,7 @@ function renderSettingsSection(snapshot) {
 
 function renderServerOperatorsPanel(snapshot) {
   const operators = snapshot.operators || [];
+  const broken = operators.filter((operator) => operator.uuidMatchesServerMode === false);
   return `
     <div class="subpanel">
       <div class="section-heading">
@@ -908,6 +909,19 @@ function renderServerOperatorsPanel(snapshot) {
           <h3>in-game operators</h3>
         </div>
       </div>
+      ${broken.length
+        ? `
+          <div class="list-row list-row--notice">
+            <div class="list-row__main">
+              <strong>${broken.length} operator${broken.length === 1 ? "" : "s"} cannot take effect</strong>
+              <p class="muted">${escapeHtml(broken.map((operator) => operator.name).join(", "))} — the stored uuid is the wrong kind for this server's <code>online-mode</code>, so minecraft ignores the entry and the player has no powers in game.</p>
+            </div>
+            <div class="row-actions">
+              <button class="button button--primary" type="button" data-action="repair-operators">${labelWithIcon("refresh", "fix uuids")}</button>
+            </div>
+          </div>
+        `
+        : ""}
       <form data-form="add-server-operator" class="form-grid">
         <div class="input-grid">
           <label>
@@ -916,7 +930,7 @@ function renderServerOperatorsPanel(snapshot) {
           </label>
           <label>
             <span>uuid</span>
-            <input name="uuid" placeholder="leave blank for cracked/offline UUID" />
+            <input name="uuid" placeholder="resolved automatically" disabled />
           </label>
           <label>
             <span>op level</span>
@@ -940,10 +954,10 @@ function renderServerOperatorsPanel(snapshot) {
         ${operators.length
           ? operators
               .map((operator) => `
-                <div class="list-row admin-row">
+                <div class="list-row admin-row ${operator.uuidMatchesServerMode === false ? "list-row--notice" : ""}">
                   <div>
                     <strong>${escapeHtml(operator.name)}</strong>
-                    <p class="muted">${escapeHtml(operator.uuid)} • level ${escapeHtml(String(operator.level || 4))}${operator.bypassesPlayerLimit ? " • bypasses limit" : ""}</p>
+                    <p class="muted">${escapeHtml(operator.uuid)} • level ${escapeHtml(String(operator.level || 4))}${operator.bypassesPlayerLimit ? " • bypasses limit" : ""}${operator.uuidKind ? ` • ${escapeHtml(operator.uuidKind)} uuid` : ""}${operator.uuidMatchesServerMode === false ? " • <strong>not active in game</strong>" : ""}</p>
                   </div>
                   <button class="button button--quiet button--compact" type="button" data-action="remove-server-operator" data-uuid="${escapeHtml(operator.uuid)}">${labelWithIcon("delete", "remove")}</button>
                 </div>
@@ -2233,6 +2247,21 @@ app.addEventListener("click", async (event) => {
       return;
     }
 
+    if (action === "repair-operators") {
+      const payload = await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/operators/repair`, {
+        method: "POST"
+      });
+      setNotice(
+        payload.failures.length ? "error" : "success",
+        payload.failures.length
+          ? `some uuids could not be resolved: ${payload.failures.map((f) => `${f.name} (${f.reason})`).join("; ")}`
+          : "operator uuids fixed — restart the server for minecraft to reload ops.json"
+      );
+      await loadSnapshot();
+      render();
+      return;
+    }
+
     if (action === "test-integration") {
       const payload = await api("/api/settings/integrations/test", { method: "POST" });
       setNotice(payload.result.ok ? "success" : "error", payload.result.reason);
@@ -2557,8 +2586,7 @@ app.addEventListener("submit", async (event) => {
           body: {
             bypassesPlayerLimit: formData.get("bypassesPlayerLimit") === "on",
             level: formData.get("level"),
-            name: formData.get("name"),
-            uuid: formData.get("uuid")
+            name: formData.get("name")
           }
         });
         setNotice("success", "server admin added");

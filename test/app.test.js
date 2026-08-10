@@ -523,6 +523,72 @@ test("world archives can be deleted without touching the active world", async (t
   assert.equal(final.filter((world) => world.kind === "archive").length, 1);
 });
 
+test("operator uuids follow the server's online-mode and mismatches are repairable", async (t) => {
+  const root = await createFixtureRoot();
+  const store = createStore(root);
+  const serverManager = createServerManager(store);
+  const previousFetch = globalThis.fetch;
+  const MOJANG = "9c47ffc4-16a9-4fb5-9618-d6a48db8d79e";
+
+  t.after(async () => {
+    globalThis.fetch = previousFetch;
+    await fsp.rm(root, { recursive: true, force: true });
+  });
+
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("api.mojang.com")) {
+      return new Response(JSON.stringify({ id: MOJANG.replace(/-/g, ""), name: "RipperMoon" }), {
+        headers: { "content-type": "application/json" },
+        status: 200
+      });
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+
+  await store.ensureInitialized();
+  await serverManager.syncDiscoveredServers();
+  const propertiesPath = path.join(root, "servers", "DemoServer", "server.properties");
+
+  // Offline-mode server: the name-based uuid is the correct one.
+  await fsp.writeFile(propertiesPath, "online-mode=false\n", "utf8");
+  let ops = await serverManager.addServerOperator("DemoServer", { level: 4, name: "RipperMoon" });
+  assert.equal(ops[0].uuid[14], "3", "offline servers need a version 3 uuid");
+  let listed = await serverManager.listServerOperators("DemoServer");
+  assert.equal(listed[0].uuidKind, "offline");
+  assert.equal(listed[0].uuidMatchesServerMode, true);
+
+  // Flipping to online-mode makes that same entry inert - Minecraft will never
+  // match it against a real player, and says nothing about it.
+  await fsp.writeFile(propertiesPath, "online-mode=true\n", "utf8");
+  listed = await serverManager.listServerOperators("DemoServer");
+  assert.equal(listed[0].uuidMatchesServerMode, false);
+  assert.equal(listed[0].uuidKind, "offline");
+
+  // Repair rewrites it to the real Mojang uuid.
+  const repair = await serverManager.repairServerOperators("DemoServer");
+  assert.equal(repair.failures.length, 0);
+  assert.equal(repair.operators[0].uuid, MOJANG);
+  assert.equal(repair.operators[0].uuidMatchesServerMode, true);
+
+  // Adding on an online-mode server resolves from Mojang, and a caller-supplied
+  // uuid must not be able to reintroduce the broken form.
+  await serverManager.writeServerOperators("DemoServer", []);
+  ops = await serverManager.addServerOperator("DemoServer", {
+    level: 4,
+    name: "RipperMoon",
+    uuid: "c81d3d67-a6c9-387e-90a4-a9dd4f476f2c"
+  });
+  assert.equal(ops.length, 1);
+  assert.equal(ops[0].uuid, MOJANG);
+
+  // A name that does not exist must fail loudly rather than store a bad entry.
+  globalThis.fetch = async () => new Response("", { status: 404 });
+  await assert.rejects(
+    () => serverManager.addServerOperator("DemoServer", { level: 4, name: "NoSuchPlayer" }),
+    /No Minecraft account named/
+  );
+});
+
 test("job registry tracks progress, completion and failure", async () => {
   const jobs = createJobRegistry();
 

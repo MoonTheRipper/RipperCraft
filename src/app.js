@@ -621,6 +621,17 @@ async function createApp(rootDir = process.cwd(), options = {}) {
             return;
           }
 
+          if (req.method === "POST" && segments[4] === "repair") {
+            const result = await serverManager.repairServerOperators(serverId);
+            logger.info("Operator uuids repaired", {
+              actor: context.user.username,
+              failures: result.failures.length,
+              serverId
+            });
+            json(res, 200, result);
+            return;
+          }
+
           if (req.method === "DELETE" && segments[4]) {
             const operators = await serverManager.removeServerOperator(serverId, decodeURIComponent(segments[4]));
             json(res, 200, { operators });
