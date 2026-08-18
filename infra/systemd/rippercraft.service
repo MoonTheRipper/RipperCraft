@@ -1,0 +1,40 @@
+[Unit]
+Description=RipperCraft web dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ripper-moon
+Group=ripper-moon
+WorkingDirectory=/home/ripper-moon/minecraft-server
+Environment=NODE_ENV=production
+Environment=HOST=0.0.0.0
+Environment=PORT=4300
+# Optional secrets (CURSEFORGE_API_KEY, ...). The leading "-" keeps the service
+# starting normally when the file is absent. Never commit the key itself.
+# Both names are read so a host that still has the pre-rename file keeps working;
+# rippercraft.env is loaded second and therefore wins on any duplicate key.
+EnvironmentFile=-/etc/rippermoonstash.env
+EnvironmentFile=-/etc/rippercraft.env
+Environment=PATH=/home/ripper-moon/.nvm/versions/node/v24.15.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/ripper-moon/.nvm/versions/node/v24.15.0/bin/node /home/ripper-moon/minecraft-server/src/server.js
+Restart=on-failure
+RestartSec=5
+
+# Minecraft servers are spawned as children of this process, so they live in
+# this unit's cgroup. Under the default KillMode=control-group, restarting the
+# dashboard SIGTERMs every running game server with it and SIGKILLs any still
+# saving when TimeoutStopSec expires - a web restart would drop every player
+# mid-session and risk a half-written world.
+#
+# Signalling only the main process leaves the game servers running across a
+# dashboard restart. The dashboard re-attaches to them through the pid files it
+# wrote (.rippermoon/pid.json), so they still show as running and can still be
+# stopped from the UI afterwards.
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

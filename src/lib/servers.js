@@ -2294,9 +2294,27 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
         child.kill("SIGKILL");
       }
     } else {
+      // The server outlived the dashboard process that started it - a restart
+      // of the web service, now that game servers are no longer torn down with
+      // it. There is no stdin to write "stop" to and no exit event to await, so
+      // this drives the same escalation by pid instead.
+      //
+      // Waiting matters: clearing the pid while Minecraft is still saving would
+      // report the server as stopped, and starting it again from there would
+      // put a second JVM on the same port.
       const pidInfo = await getPidInfo(serverId);
       if (pidInfo && isProcessAlive(pidInfo.pid)) {
+        // Minecraft's shutdown hook runs on SIGTERM and saves the world.
         process.kill(pidInfo.pid, "SIGTERM");
+
+        for (let attempt = 0; attempt < 20 && isProcessAlive(pidInfo.pid); attempt += 1) {
+          await sleep(1_000);
+        }
+
+        if (isProcessAlive(pidInfo.pid)) {
+          process.kill(pidInfo.pid, "SIGKILL");
+          await sleep(1_000);
+        }
       }
     }
 
