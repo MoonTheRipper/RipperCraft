@@ -49,7 +49,7 @@ const COMBINED_UPDATE_LOADERS = new Set(["vanilla", "paper", "purpur", "fabric",
 // back - without the game version changing at all.
 const LOADER_VERSIONED_LOADERS = new Set(["fabric", "forge", "neoforge"]);
 const FORGE_MAVEN_METADATA_URL = `${FORGE_MAVEN}/maven-metadata.xml`;
-const REMOTE_USER_AGENT = readEnv("USER_AGENT", "RipperCraft/0.1 (https://github.com/moontheripper/rippercraft)");
+const REMOTE_USER_AGENT = readEnv("USER_AGENT", "RipperCraft/0.1 (https://github.com/MoonTheRipper/RipperCraft)");
 const DEFAULT_EXISTING_START_COMMAND = "./launch-server.sh";
 const DEFAULT_MANAGED_START_COMMAND = "./.rippermoon/launch-server.sh";
 const SAFE_ADMIN_SETTING_DEFINITIONS = [

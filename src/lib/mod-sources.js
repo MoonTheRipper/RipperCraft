@@ -28,7 +28,7 @@ const RELEASE_PRIORITY = {
   beta: 1,
   alpha: 2
 };
-const REMOTE_USER_AGENT = readEnv("USER_AGENT", "RipperCraft/0.1 (https://github.com/moontheripper/rippercraft)");
+const REMOTE_USER_AGENT = readEnv("USER_AGENT", "RipperCraft/0.1 (https://github.com/MoonTheRipper/RipperCraft)");
 
 // Normalises the two providers' side fields onto one vocabulary. Modrinth
 // publishes client_side/server_side per project; CurseForge has no equivalent,
