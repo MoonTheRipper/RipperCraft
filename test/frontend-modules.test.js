@@ -398,6 +398,9 @@ test("server-scoped state is cleared when the selected server changes", async ()
   state.modResults = [{ id: "1" }];
   state.modUpdates = { entries: [], serverId: "A" };
   state.updatePlan = { serverId: "A" };
+  // The loader catalog is annotated with server A's mod conflicts, so leaving it
+  // behind would show B a list of blocked builds that has nothing to do with B.
+  state.loaderOptions = { options: { versions: [] }, serverId: "A" };
 
   resetServerScopedState();
 
@@ -406,6 +409,7 @@ test("server-scoped state is cleared when the selected server changes", async ()
   assert.deepEqual(state.modResults, []);
   assert.equal(state.modUpdates, null);
   assert.equal(state.updatePlan, null);
+  assert.equal(state.loaderOptions, null);
 });
 
 test("add-on updates from another server are never matched by filename alone", async () => {
@@ -542,4 +546,169 @@ test("action modules export the three delegated listeners", async () => {
   }
   assert.equal(forms.selectedValues, undefined);
   assert.deepEqual(forms.normalizeAccessSelection(["a"], ["a", "b"]), ["a", "b"]);
+});
+
+test("the icon set covers every name the views ask for", async () => {
+  const { ICONS } = await load(path.join(jsRoot, "icons.js"));
+
+  // A missing key renders an empty <span>, which looks like a layout bug rather
+  // than a missing icon, so the set is checked against real usage instead.
+  const used = new Set();
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!entry.name.endsWith(".js")) {
+        continue;
+      }
+      const source = fs.readFileSync(full, "utf8");
+      for (const match of source.matchAll(/\b(?:icon|labelWithIcon)\(\s*"([a-z-]+)"/g)) {
+        used.add(match[1]);
+      }
+    }
+  };
+  walk(jsRoot);
+
+  const missing = [...used].filter((name) => !(name in ICONS)).sort();
+  assert.deepEqual(missing, [], `icons.js is missing: ${missing.join(", ")}`);
+
+  // Every glyph is pixel art on the same 24-unit grid; a stray viewBox would
+  // render at a different weight from the rest of the set.
+  for (const [name, markup] of Object.entries(ICONS)) {
+    assert.match(markup, /viewBox="0 0 24 24"/, `${name} is not on the 24-unit grid`);
+    assert.match(markup, /aria-hidden="true"/, `${name} is not hidden from assistive tech`);
+  }
+});
+
+test("add-on side badges name where a mod has to be installed", async () => {
+  const { describeAddonSide } = await load(path.join(jsRoot, "components.js"));
+
+  // A mod the server cannot load. Worth flagging: on the server it does nothing
+  // at all, which is indistinguishable from a mod that is quietly broken.
+  assert.equal(describeAddonSide("required", "unsupported").label, "client only");
+  assert.equal(describeAddonSide("required", "unsupported").tone, "danger");
+
+  assert.equal(describeAddonSide("unsupported", "required").label, "server only");
+  assert.equal(describeAddonSide("required", "required").label, "client + server");
+  assert.equal(describeAddonSide("optional", "required").label, "server • client optional");
+  assert.equal(describeAddonSide("required", "optional").label, "client • server optional");
+
+  // CurseForge publishes no split at all, so nothing is asserted about it.
+  assert.equal(describeAddonSide("unknown", "unknown").label, "side unknown");
+  assert.equal(describeAddonSide(undefined, undefined).label, "side unknown");
+  assert.equal(describeAddonSide("nonsense", "garbage").label, "side unknown");
+});
+
+test("add-on artwork falls back to the blocky placeholder", async () => {
+  const { renderAddonIcon } = await load(path.join(jsRoot, "components.js"));
+
+  const withIcon = renderAddonIcon("https://cdn.modrinth.com/data/abc/icon.png", "Some Mod");
+  assert.match(withIcon, /<img/);
+  // Browsing the dashboard must not leak its address to the provider's CDN.
+  assert.match(withIcon, /referrerpolicy="no-referrer"/);
+  assert.match(withIcon, /loading="lazy"/);
+
+  // The glyph sits behind the artwork, so a CDN failure reveals it rather than
+  // leaving an empty bordered box.
+  assert.match(withIcon, /addon-icon__fallback/);
+
+  const withoutIcon = renderAddonIcon("", "Some Mod");
+  assert.match(withoutIcon, /addon-icon__fallback/);
+  assert.doesNotMatch(withoutIcon, /<img/);
+
+  // A URL carrying quotes must not be able to break out of the attribute.
+  const hostile = renderAddonIcon('https://evil/"onerror="alert(1)', "x");
+  assert.doesNotMatch(hostile, /"onerror="alert/);
+});
+
+test("browser preferences survive the rename from the old storage keys", async () => {
+  const stored = { "rippermoonstash-theme": "light" };
+  const previousLocalStorage = globalThis.localStorage;
+  globalThis.localStorage = {
+    getItem(key) {
+      return key in stored ? stored[key] : null;
+    },
+    setItem(key, value) {
+      stored[key] = value;
+    },
+    removeItem(key) {
+      delete stored[key];
+    }
+  };
+
+  try {
+    // Cache-busted so the module re-evaluates against the stubbed storage.
+    const url = `${pathToFileURL(path.join(jsRoot, "state.js")).href}?rename-fallback`;
+    const { readStored, state, writeStored } = await import(url);
+
+    // A returning user keeps the theme they chose before the rename.
+    assert.equal(state.theme, "light");
+    assert.equal(readStored("theme"), "light");
+
+    // Writes only ever use the new key, so the old one ages out on its own.
+    writeStored("theme", "dark");
+    assert.equal(stored["rippercraft-theme"], "dark");
+    assert.equal(stored["rippermoonstash-theme"], "light");
+    assert.equal(readStored("theme"), "dark");
+  } finally {
+    globalThis.localStorage = previousLocalStorage;
+  }
+});
+
+test("every brand asset the page and manifest reference actually exists", async () => {
+  // A missing favicon fails silently in the browser - the tab just shows a
+  // blank page glyph - so the references are checked against the filesystem.
+  const html = fs.readFileSync(path.join(publicRoot, "index.html"), "utf8");
+  const manifest = JSON.parse(fs.readFileSync(path.join(publicRoot, "site.webmanifest"), "utf8"));
+
+  const referenced = new Set();
+  for (const match of html.matchAll(/(?:href|src)="\/([^"?]+)/g)) {
+    referenced.add(match[1]);
+  }
+  for (const entry of manifest.icons) {
+    referenced.add(entry.src.replace(/^\//, ""));
+  }
+
+  const missing = [...referenced]
+    .filter((name) => !name.startsWith("api/"))
+    .filter((name) => !fs.existsSync(path.join(publicRoot, name)))
+    .sort();
+  assert.deepEqual(missing, [], `public/ is missing: ${missing.join(", ")}`);
+
+  // The mark has to cover the three contexts an OS actually asks for.
+  assert.ok(referenced.has("favicon.ico"), "no .ico for clients that ask by convention");
+  assert.ok(referenced.has("apple-touch-icon.png"), "no iOS home screen icon");
+  assert.ok(
+    manifest.icons.some((entry) => entry.purpose === "maskable"),
+    "no maskable icon, so launchers crop the mark into their own shape"
+  );
+  assert.ok(
+    manifest.icons.some((entry) => entry.sizes === "512x512" && entry.purpose === "any"),
+    "no 512px icon, which is the install prompt's minimum"
+  );
+
+  // Favicons are fetched on every cold load of a dashboard that runs on a LAN
+  // box; the master art is 1.4MB and must never be what gets served.
+  for (const name of ["favicon-16.png", "favicon-32.png", "favicon.ico"]) {
+    const bytes = fs.statSync(path.join(publicRoot, name)).size;
+    assert.ok(bytes < 20_000, `${name} is ${bytes} bytes, too heavy for a favicon`);
+  }
+});
+
+test("the brand mark is decorative and sized so the rail cannot be stretched", async () => {
+  const { renderBrandMark } = await load(path.join(jsRoot, "components.js"));
+  const markup = renderBrandMark("brand-mark--rail");
+
+  assert.match(markup, /src="\/logo\.png"/);
+  assert.match(markup, /class="brand-mark brand-mark--rail"/);
+  // The product name is rendered as text beside it, so announcing the image too
+  // would read "RipperCraft" twice.
+  assert.match(markup, /alt=""/);
+  // Intrinsic dimensions let the browser reserve the box before the image
+  // lands, so the rail does not jump on first paint.
+  assert.match(markup, /width="512"/);
+  assert.match(markup, /height="404"/);
 });

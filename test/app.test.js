@@ -203,13 +203,24 @@ test("server admins can manage add-on loader settings and remove add-ons after u
     }
   ]);
 
-  assert.deepEqual(await serverManager.listInstalledFiles("DemoServer"), [
+  // Installed files now carry the tracked manifest's display metadata, so the
+  // add-on list can show artwork and a client/server side without a lookup.
+  const listed = await serverManager.listInstalledFiles("DemoServer");
+  assert.deepEqual(listed.map((entry) => ({ enabled: entry.enabled, fileName: entry.fileName })), [
     { enabled: true, fileName: "example-mod.jar" }
   ]);
-  assert.deepEqual(await serverManager.setAddonEnabled("DemoServer", "example-mod.jar", false), [
+  assert.equal(listed[0].tracked, true);
+  assert.equal(listed[0].provider, "upload");
+  // An uploaded jar has no project behind it, so its side stays honestly unknown.
+  assert.equal(listed[0].clientSide, "unknown");
+  assert.equal(listed[0].serverSide, "unknown");
+
+  const afterDisable = await serverManager.setAddonEnabled("DemoServer", "example-mod.jar", false);
+  assert.deepEqual(afterDisable.map((entry) => ({ enabled: entry.enabled, fileName: entry.fileName })), [
     { enabled: false, fileName: "example-mod.jar" }
   ]);
-  assert.deepEqual(await serverManager.setAddonEnabled("DemoServer", "example-mod.jar", true), [
+  const afterEnable = await serverManager.setAddonEnabled("DemoServer", "example-mod.jar", true);
+  assert.deepEqual(afterEnable.map((entry) => ({ enabled: entry.enabled, fileName: entry.fileName })), [
     { enabled: true, fileName: "example-mod.jar" }
   ]);
   assert.deepEqual(await serverManager.removeAddonFiles("DemoServer", ["example-mod.jar"]), ["example-mod.jar"]);
@@ -432,7 +443,10 @@ test("a per-server java binary is validated and reaches the launched process", a
   const capture = path.join(root, "captured-env.txt");
   await fsp.writeFile(
     probe,
-    `#!/usr/bin/env bash\nprintf '%s' "\${RIPPERMOONSTASH_JAVA_BIN:-unset}" > ${capture}\nsleep 5\n`
+    // Captures both names: the launch scripts this dashboard generates read the
+    // new one, but scripts written before the rename read the old one and must
+    // keep receiving the per-server JDK.
+    `#!/usr/bin/env bash\nprintf '%s|%s' "\${RIPPERCRAFT_JAVA_BIN:-unset}" "\${RIPPERMOONSTASH_JAVA_BIN:-unset}" > ${capture}\nsleep 5\n`
   );
   // writeFile only honours mode when it creates the file, and the fixture
   // already made this one.
@@ -443,12 +457,13 @@ test("a per-server java binary is validated and reaches the launched process", a
     await serverManager.stopServer("DemoServer").catch(() => {});
   });
 
+  const expectedCapture = `${fakeJava}|${fakeJava}`;
   let captured = "";
-  for (let attempt = 0; attempt < 40 && captured !== fakeJava; attempt += 1) {
+  for (let attempt = 0; attempt < 40 && captured !== expectedCapture; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 50));
     captured = await fsp.readFile(capture, "utf8").catch(() => "");
   }
-  assert.equal(captured, fakeJava);
+  assert.equal(captured, expectedCapture);
 
   // Clearing it puts the server back on the dashboard-wide default.
   await serverManager.stopServer("DemoServer");
@@ -1210,6 +1225,8 @@ test("managed server creation defaults the server id to the directory name", asy
   assert.equal(created.directory, "servers/moon-keep");
   const launchScript = await fsp.readFile(path.join(root, "servers", "moon-keep", ".rippermoon", "launch-server.sh"), "utf8");
   assert.match(launchScript, /dirname "\$\{BASH_SOURCE\[0\]\}"\)\/\.\./);
+  assert.match(launchScript, /RIPPERCRAFT_JAVA_BIN/);
+  // The pre-rename variable stays supported for existing deployments.
   assert.match(launchScript, /RIPPERMOONSTASH_JAVA_BIN/);
   assert.match(launchScript, /command -v java/);
 });
@@ -1426,4 +1443,338 @@ test("startServer blocks until the server eula is accepted", async (t) => {
 
   assert.equal(await serverManager.writeEulaStatus("DemoServer", true), true);
   assert.equal(await serverManager.readEulaStatus("DemoServer"), true);
+});
+
+// ---------------------------------------------------------------------------
+// Loader version updates
+// ---------------------------------------------------------------------------
+
+// A stored-method zip, which is all a mod jar is. Kept local so this file stays
+// runnable on its own.
+function makeStoredJar(entries) {
+  const zlib = require("node:zlib");
+  const localChunks = [];
+  const centralChunks = [];
+  let offset = 0;
+
+  for (const [name, contents] of Object.entries(entries)) {
+    const nameBuffer = Buffer.from(name, "utf8");
+    const dataBuffer = Buffer.from(contents, "utf8");
+    const crc = zlib.crc32(dataBuffer);
+
+    const header = Buffer.alloc(30);
+    header.writeUInt32LE(0x04034b50, 0);
+    header.writeUInt16LE(20, 4);
+    header.writeUInt32LE(crc, 14);
+    header.writeUInt32LE(dataBuffer.length, 18);
+    header.writeUInt32LE(dataBuffer.length, 22);
+    header.writeUInt16LE(nameBuffer.length, 26);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(dataBuffer.length, 20);
+    central.writeUInt32LE(dataBuffer.length, 24);
+    central.writeUInt16LE(nameBuffer.length, 28);
+    central.writeUInt32LE(offset, 42);
+
+    localChunks.push(header, nameBuffer, dataBuffer);
+    centralChunks.push(central, nameBuffer);
+    offset += header.length + nameBuffer.length + dataBuffer.length;
+  }
+
+  const centralBuffer = Buffer.concat(centralChunks);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(Object.keys(entries).length, 8);
+  eocd.writeUInt16LE(Object.keys(entries).length, 10);
+  eocd.writeUInt32LE(centralBuffer.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+
+  return Buffer.concat([...localChunks, centralBuffer, eocd]);
+}
+
+function fabricModJar(id, name, loaderRange) {
+  return makeStoredJar({
+    "fabric.mod.json": JSON.stringify({ depends: { fabricloader: loaderRange }, id, name, version: "1.0.0" })
+  });
+}
+
+// Mirrors the shape of the live endpoints the loader picker depends on.
+function stubFabricMeta({ gameVersion = "26.1.2", loaderVersions = [] } = {}) {
+  return async (url) => {
+    const href = String(url);
+    if (href.includes("version_manifest_v2.json")) {
+      return {
+        ok: true,
+        async json() {
+          return { latest: { release: gameVersion }, versions: [{ id: gameVersion, releaseTime: "2026-01-01T00:00:00Z", type: "release" }] };
+        }
+      };
+    }
+    if (href.includes("/versions/installer")) {
+      return { ok: true, async json() { return [{ stable: true, version: "1.1.2" }]; } };
+    }
+    if (href.includes(`/versions/loader/${gameVersion}/`)) {
+      // The server launcher jar download.
+      return { ok: true, async arrayBuffer() { return Buffer.from(`launcher for ${href}`); } };
+    }
+    if (href.includes(`/versions/loader/${gameVersion}`)) {
+      return {
+        ok: true,
+        async json() {
+          return loaderVersions.map((entry) => ({ loader: { stable: entry.stable !== false, version: entry.version } }));
+        }
+      };
+    }
+    throw new Error(`Unexpected fetch call: ${href}`);
+  };
+}
+
+async function createFabricFixture(t, { loaderVersion = "0.19.2", mods = {} } = {}) {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rippermoonstash-loader-"));
+  const serverDir = path.join(root, "servers", "FabricServer");
+  await fsp.mkdir(path.join(serverDir, "mods"), { recursive: true });
+  await fsp.mkdir(path.join(serverDir, "logs"), { recursive: true });
+  await fsp.mkdir(path.join(serverDir, "world"), { recursive: true });
+  await fsp.writeFile(path.join(serverDir, "server.jar"), "existing fabric launcher", "utf8");
+  await fsp.writeFile(path.join(serverDir, "server.properties"), "motd=Fabric\n", "utf8");
+  await fsp.writeFile(path.join(serverDir, "eula.txt"), "eula=true\n", "utf8");
+  for (const [fileName, buffer] of Object.entries(mods)) {
+    await fsp.writeFile(path.join(serverDir, "mods", fileName), buffer);
+  }
+
+  t.after(async () => {
+    await fsp.rm(root, { recursive: true, force: true });
+  });
+
+  const store = createStore(root);
+  await store.ensureInitialized();
+  const serverManager = createServerManager(store);
+  await serverManager.syncDiscoveredServers();
+  await serverManager.setServerMetadata("FabricServer", {
+    loader: "fabric",
+    managedRuntime: {
+      kind: "fabric",
+      launch: { kind: "jar" },
+      loaderVersion,
+      source: `fabric ${loaderVersion}`,
+      updatedAt: new Date().toISOString()
+    },
+    minecraftVersion: "26.1.2",
+    startCommand: "./.rippermoon/launch-server.sh"
+  });
+
+  return { root, serverDir, serverManager, store };
+}
+
+test("the loader picker ranks builds by what the installed mods accept", async (t) => {
+  const previousFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+  });
+
+  const { serverManager } = await createFabricFixture(t, {
+    mods: {
+      "worldedit-items.jar": fabricModJar("worldedit_items", "WorldEdit Items", ">=0.19.3"),
+      "relaxed.jar": fabricModJar("relaxed", "Relaxed Mod", ">=0.16.0")
+    }
+  });
+
+  globalThis.fetch = stubFabricMeta({
+    loaderVersions: [
+      { version: "0.19.4", stable: false },
+      { version: "0.19.3" },
+      { version: "0.19.2" },
+      { version: "0.18.0" }
+    ]
+  });
+
+  const options = await serverManager.getLoaderVersionOptions("FabricServer", "26.1.2");
+
+  assert.equal(options.loaderVersioned, true);
+  assert.equal(options.currentLoaderVersion, "0.19.2");
+  assert.equal(options.modScan.floor.version, "0.19.3");
+  assert.deepEqual(options.modScan.floor.requiredBy.map((mod) => mod.name), ["WorldEdit Items"]);
+
+  const byVersion = Object.fromEntries(options.versions.map((entry) => [entry.version, entry]));
+  assert.equal(byVersion["0.19.4"].satisfiesInstalledMods, true);
+  assert.equal(byVersion["0.19.3"].satisfiesInstalledMods, true);
+  assert.equal(byVersion["0.19.2"].satisfiesInstalledMods, false);
+  assert.equal(byVersion["0.19.2"].current, true);
+  // Only the strict mod rejects 0.18.0; the relaxed one still accepts it.
+  assert.deepEqual(byVersion["0.18.0"].conflicts.map((conflict) => conflict.name), ["WorldEdit Items"]);
+
+  // 0.19.4 is newer but unstable, so the stable build that clears the floor wins.
+  assert.equal(options.recommendedLoaderVersion, "0.19.3");
+});
+
+test("a loader-only plan moves the loader and leaves the game version alone", async (t) => {
+  const previousFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+  });
+
+  const { serverManager } = await createFabricFixture(t, {
+    mods: { "worldedit-items.jar": fabricModJar("worldedit_items", "WorldEdit Items", ">=0.19.3") }
+  });
+  globalThis.fetch = stubFabricMeta({
+    loaderVersions: [{ version: "0.19.3" }, { version: "0.19.2" }]
+  });
+
+  const plan = await serverManager.planServerRuntimeUpdate("FabricServer", "");
+
+  assert.equal(plan.supported, true);
+  assert.equal(plan.mode, "loader-only");
+  assert.equal(plan.targetVersion, "26.1.2");
+  assert.equal(plan.versionDirection, "unchanged");
+  assert.equal(plan.loaderVersion, "0.19.3");
+  assert.equal(plan.currentLoaderVersion, "0.19.2");
+  assert.equal(plan.loaderDirection, "upgrade");
+});
+
+test("a loader build the installed mods reject is refused and names them", async (t) => {
+  const previousFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+  });
+
+  const { serverManager } = await createFabricFixture(t, {
+    loaderVersion: "0.19.3",
+    mods: { "worldedit-items.jar": fabricModJar("worldedit_items", "WorldEdit Items", ">=0.19.3") }
+  });
+  globalThis.fetch = stubFabricMeta({
+    loaderVersions: [{ version: "0.19.3" }, { version: "0.19.2" }]
+  });
+
+  const plan = await serverManager.planServerRuntimeUpdate("FabricServer", "", { loaderVersion: "0.19.2" });
+
+  assert.equal(plan.supported, false);
+  assert.equal(plan.loaderDirection, "downgrade");
+  assert.match(plan.reason, /rejected by 1 installed mod/);
+  assert.match(plan.reason, /WorldEdit Items needs/);
+  assert.deepEqual(plan.loaderConflicts.map((conflict) => conflict.name), ["WorldEdit Items"]);
+});
+
+test("a downgrade the mods still accept is planned and applied", async (t) => {
+  const previousFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+  });
+
+  const { serverDir, serverManager } = await createFabricFixture(t, {
+    loaderVersion: "0.19.3",
+    mods: { "relaxed.jar": fabricModJar("relaxed", "Relaxed Mod", ">=0.16.0") }
+  });
+  globalThis.fetch = stubFabricMeta({
+    loaderVersions: [{ version: "0.19.3" }, { version: "0.19.2" }, { version: "0.18.0" }]
+  });
+
+  const plan = await serverManager.planServerRuntimeUpdate("FabricServer", "", { loaderVersion: "0.18.0" });
+  assert.equal(plan.supported, true);
+  assert.equal(plan.loaderDirection, "downgrade");
+  assert.equal(plan.mode, "loader-only");
+
+  const result = await serverManager.applyServerRuntimeUpdate("FabricServer", plan);
+  assert.equal(result.loaderVersion, "0.18.0");
+  assert.equal(result.previousLoaderVersion, "0.19.3");
+
+  const server = await serverManager.getServer("FabricServer");
+  assert.equal(server.managedRuntime.loaderVersion, "0.18.0");
+  assert.equal(server.managedRuntime.previousLoaderVersion, "0.19.3");
+  // The game version must not drift as a side effect of a loader change.
+  assert.equal(server.minecraftVersion, "26.1.2");
+
+  // The replaced runtime is kept, so a bad loader move can be undone by hand.
+  const backups = await fsp.readdir(path.join(serverDir, ".rippermoon", "server-backups"));
+  assert.equal(backups.some((name) => name.includes("loader-0.19.3")), true);
+});
+
+test("an existing server is adopted into a managed runtime with its script preserved", async (t) => {
+  const previousFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+  });
+
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rippermoonstash-adopt-"));
+  const serverDir = path.join(root, "servers", "LegacyFabric");
+  await fsp.mkdir(path.join(serverDir, "mods"), { recursive: true });
+  await fsp.mkdir(path.join(serverDir, "logs"), { recursive: true });
+  await fsp.writeFile(
+    path.join(serverDir, "launch-server.sh"),
+    "#!/usr/bin/env bash\nexec java -Xmx8G -jar fabric-server-launch.jar nogui\n",
+    "utf8"
+  );
+  await fsp.writeFile(
+    path.join(serverDir, "mods", "worldedit-items.jar"),
+    fabricModJar("worldedit_items", "WorldEdit Items", ">=0.19.3")
+  );
+  t.after(async () => {
+    await fsp.rm(root, { recursive: true, force: true });
+  });
+
+  const store = createStore(root);
+  await store.ensureInitialized();
+  const serverManager = createServerManager(store);
+  await serverManager.syncDiscoveredServers();
+  await serverManager.setServerMetadata("LegacyFabric", {
+    loader: "fabric",
+    minecraftVersion: "26.1.2",
+    startCommand: "./launch-server.sh"
+  });
+
+  globalThis.fetch = stubFabricMeta({
+    loaderVersions: [{ version: "0.19.3" }, { version: "0.19.2" }]
+  });
+
+  // Before adoption the dashboard refuses to update a runtime it does not own.
+  const support = await serverManager.getServerUpdateSupport("LegacyFabric");
+  assert.equal(support.supported, false);
+  assert.equal(support.adoptable, true);
+
+  const result = await serverManager.adoptManagedRuntime("LegacyFabric", { loaderVersion: "0.19.3" });
+  assert.equal(result.adopted, true);
+  assert.equal(result.loaderVersion, "0.19.3");
+
+  const server = await serverManager.getServer("LegacyFabric");
+  assert.equal(server.managedRuntime.kind, "fabric");
+  assert.equal(server.managedRuntime.loaderVersion, "0.19.3");
+  assert.equal(server.managedRuntime.adoptedFromStartCommand, "./launch-server.sh");
+  assert.equal(server.startCommand, "./.rippermoon/launch-server.sh");
+
+  // The hand-written script may carry flags worth recovering, so it is kept.
+  const backups = await fsp.readdir(path.join(serverDir, ".rippermoon", "server-backups"));
+  assert.equal(backups.some((name) => name.startsWith("launch-server.adopted-")), true);
+
+  // And the runtime is now updatable.
+  assert.equal((await serverManager.getServerUpdateSupport("LegacyFabric")).supported, true);
+});
+
+test("repairing a missing runtime reinstalls the pinned loader instead of drifting to the newest", async (t) => {
+  const previousFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+  });
+
+  const { serverDir, serverManager } = await createFabricFixture(t, {
+    loaderVersion: "0.19.2",
+    mods: { "relaxed.jar": fabricModJar("relaxed", "Relaxed Mod", ">=0.16.0") }
+  });
+  globalThis.fetch = stubFabricMeta({
+    loaderVersions: [{ version: "0.19.3" }, { version: "0.19.2" }]
+  });
+
+  // The runtime jar has gone missing, which is what triggers a repair on start.
+  await fsp.rm(path.join(serverDir, "server.jar"));
+
+  const ensured = await serverManager.ensureManagedServerArtifacts("FabricServer", { repairRuntime: true });
+  assert.equal(ensured.repairedRuntime, true);
+
+  const server = await serverManager.getServer("FabricServer");
+  // 0.19.3 exists and the mods would accept it, but the server was pinned to
+  // 0.19.2 - a repair must not quietly become an upgrade.
+  assert.equal(server.managedRuntime.loaderVersion, "0.19.2");
+  assert.equal(server.minecraftVersion, "26.1.2");
 });

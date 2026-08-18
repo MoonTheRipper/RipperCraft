@@ -1,3 +1,4 @@
+import { renderBrandMark } from "../components.js";
 import { escapeHtml, labelWithIcon } from "../html.js";
 import { OWNER_SECTIONS, SERVER_SECTIONS, state } from "../state.js";
 
@@ -77,7 +78,7 @@ export function renderSidebar(nextTheme) {
   return `
     <aside class="rail ${state.navOpen ? "rail--open" : ""}" id="primary-nav">
       <div class="rail-top">
-        <p class="brand-line">${labelWithIcon("server", "RipperMoonStash", "brand-inline")}</p>
+        <p class="brand-line brand-inline">${renderBrandMark("brand-mark--rail")}<span>RipperCraft</span></p>
         <p class="session-line">${escapeHtml(state.bootstrap.user.username)} <span>${escapeHtml(state.bootstrap.user.role)}</span></p>
       </div>
       <nav class="tree-nav">

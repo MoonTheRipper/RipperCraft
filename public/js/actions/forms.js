@@ -1,5 +1,5 @@
 import { api } from "../api.js";
-import { confirmRequiresStoppedServer } from "../confirm.js";
+import { confirmRequiresStoppedServer, confirmWithStopNotice } from "../confirm.js";
 import { loadBootstrap, loadServers, loadSnapshot, pollCreateJob, refreshAll } from "../data.js";
 import { installableLoaders, isInstallableLoader } from "../loaders.js";
 import { releaseReturnFocus } from "../modal.js";
@@ -299,15 +299,45 @@ export async function handleAppSubmit(event) {
       case "plan-update": {
         const formData = new FormData(form);
         const targetVersion = String(formData.get("targetVersion") || "").trim();
+        const loaderVersion = String(formData.get("loaderVersion") || "").trim();
         const payload = await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/updates/plan`, {
           method: "POST",
-          body: { targetVersion }
+          body: { loaderVersion, targetVersion }
         });
         state.updatePlan = {
           plan: payload.plan,
           serverId: state.selectedServerId
         };
         setNotice(payload.plan.safe ? "success" : "error", payload.plan.safe ? "safe update is ready" : (payload.plan.blockedReasons?.[0] || "combined update is blocked"));
+        render();
+        break;
+      }
+      case "adopt-runtime": {
+        const formData = new FormData(form);
+        const loaderVersion = String(formData.get("loaderVersion") || "").trim();
+        const serverName = state.serverSnapshot?.server?.name || state.selectedServerId;
+        // Always confirms: adoption changes how the server starts, so it earns a
+        // prompt whether or not the server happens to be online right now.
+        if (!confirmWithStopNotice(
+          `Adopt the runtime for ${serverName}?\n\nThe dashboard will provision the loader and take over the launch script. Your existing launch-server.sh is copied into .rippermoon/server-backups/ first. The world, mods and configuration are not touched.`
+        )) {
+          break;
+        }
+
+        const payload = await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/runtime/adopt`, {
+          method: "POST",
+          body: { loaderVersion }
+        });
+        state.serverSnapshot = payload.snapshot;
+        // The adopted build changes what the picker should show, so the stale
+        // catalog is dropped rather than left to describe the previous runtime.
+        state.loaderOptions = null;
+        state.updatePlan = null;
+        setNotice(
+          "success",
+          `runtime adopted — ${payload.result.loader} ${payload.result.loaderVersion || ""} on ${payload.result.minecraftVersion}`.trim()
+        );
+        await loadServers();
         render();
         break;
       }

@@ -37,7 +37,7 @@ function createStore(rootDir) {
       await writeJson(
         APP_FILE,
         {
-          appName: "RipperMoonStash",
+          appName: "RipperCraft",
           cookieSecret: crypto.randomBytes(32).toString("hex"),
           integrations: {},
           sessionTtlHours: 24,

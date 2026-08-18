@@ -1,6 +1,8 @@
-# RipperMoonStash
+# RipperCraft
 
-`RipperMoonStash` is a browser-based Minecraft server control panel that wraps the local `servers/` directory in this workspace.
+`RipperCraft` is a browser-based Minecraft server control panel that wraps the local `servers/` directory in this workspace.
+
+> Formerly `RipperMoonStash`. The `RIPPERMOONSTASH_*` environment variables and `rippermoonstash-` browser storage keys are still read, so an existing deployment keeps working across the rename. The systemd unit and hosting domain are deliberately untouched — rename those yourself when you are ready.
 
 Current feature set:
 
@@ -37,7 +39,7 @@ On first launch:
 ## Notes
 
 - New vanilla servers are created with `eula=false`. Review Mojang's EULA before switching them to `true`.
-- Graceful stopping works best for servers started through `RipperMoonStash` itself.
+- Graceful stopping works best for servers started through `RipperCraft` itself.
 - CurseForge automation is disabled until a key is configured. Save one in Owner → Integrations (verified against CurseForge before it is stored, kept in `data/app.json`, never sent back to the browser), or set `CURSEFORGE_API_KEY`. The environment variable always wins, and the Owner page says so when it is in effect. `CURSEFORGE_GAME_ID` is optional and defaults to `432` (Minecraft).
 - `data/app.json`, `data/users.json`, and `data/servers.json` hold the cookie secret, password hashes, and server passphrase hashes. They are forced to mode `600` on startup.
 - Forge and NeoForge are installed by running their official installer, which needs a working Java. They produce argfiles rather than a `server.jar`, and the generated launch script handles both shapes. NeoForge has no builds before Minecraft 1.20.2.

@@ -177,21 +177,46 @@ async function createApp(rootDir = process.cwd(), options = {}) {
     };
   }
 
-  async function buildCombinedUpdatePlan(serverId, targetVersion) {
-    const runtime = await serverManager.planServerRuntimeUpdate(serverId, targetVersion);
+  async function buildCombinedUpdatePlan(serverId, targetVersion, options = {}) {
+    const runtime = await serverManager.planServerRuntimeUpdate(serverId, targetVersion, {
+      loaderVersion: options.loaderVersion
+    });
+
+    // A loader-only change swaps the runtime and leaves every mod file where it
+    // is, so the add-on re-resolution - and the untracked/manual gate that comes
+    // with it - does not apply. The jars are instead checked directly against
+    // the candidate loader build, which is the constraint that actually governs
+    // whether the server will boot.
+    if (runtime.mode === "loader-only") {
+      const blockedReasons = [
+        ...(runtime.supported === false && runtime.reason ? [runtime.reason] : []),
+        ...(runtime.blockedReasons || [])
+      ];
+      return {
+        addons: null,
+        blockedReasons,
+        mode: "loader-only",
+        runtime,
+        safe: runtime.supported === true && blockedReasons.length === 0,
+        targetVersion: runtime.targetVersion || targetVersion || ""
+      };
+    }
+
     const addons = await modManager.planCombinedAddonUpdate(
       serverId,
       runtime.targetVersion || targetVersion
     );
     const blockedReasons = [
       ...(runtime.supported === false && runtime.reason ? [runtime.reason] : []),
+      ...(runtime.blockedReasons || []),
       ...(addons.blockedReasons || [])
     ];
     return {
       addons,
       blockedReasons,
+      mode: "version",
       runtime,
-      safe: runtime.supported === true && addons.safe === true,
+      safe: runtime.supported === true && addons.safe === true && blockedReasons.length === 0,
       targetVersion: runtime.targetVersion || addons.targetVersion || targetVersion || ""
     };
   }
@@ -213,7 +238,10 @@ async function createApp(rootDir = process.cwd(), options = {}) {
   }
 
   async function serveStaticAsset(res, pathname) {
-    const requestedPath = pathname === "/favicon.ico" ? "/icon.svg" : (pathname === "/" ? "/index.html" : pathname);
+    // /favicon.ico is a real file now, so it needs no redirect of its own -
+    // browsers that request it without reading the link tags get served it
+    // directly.
+    const requestedPath = pathname === "/" ? "/index.html" : pathname;
     const targetPath = path.resolve(publicRoot, `.${requestedPath}`);
     if (withinParent(publicRoot, targetPath) && (await exists(targetPath))) {
       sendFile(res, targetPath);
@@ -862,6 +890,25 @@ async function createApp(rootDir = process.cwd(), options = {}) {
             return;
           }
 
+          if (req.method === "POST" && segments[4] === "refresh-details") {
+            if (!canMutateServer(context, server)) {
+              json(res, 403, { error: "Unlock the server before refreshing add-on details." });
+              return;
+            }
+            if (!serverManager.userCanManageAddons(context.user, server)) {
+              json(res, 403, { error: "You do not have permission to manage add-ons on this server." });
+              return;
+            }
+            const result = await modManager.refreshAddonDetails(serverId);
+            logger.info("Add-on details refreshed", {
+              actor: context.user.username,
+              refreshed: result.refreshed,
+              serverId
+            });
+            json(res, 200, { mods: await serverManager.listInstalledFiles(serverId), result });
+            return;
+          }
+
           if (req.method === "POST" && segments[4] === "update") {
             if (!canMutateServer(context, server)) {
               json(res, 403, { error: "Unlock the server before updating add-ons." });
@@ -958,12 +1005,53 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           }
         }
 
+        if (segments[3] === "loader-versions" && req.method === "GET") {
+          if (!ensureOwner(res, context)) {
+            return;
+          }
+          json(res, 200, {
+            loaderOptions: await serverManager.getLoaderVersionOptions(
+              serverId,
+              url.searchParams.get("gameVersion") || ""
+            )
+          });
+          return;
+        }
+
+        if (segments[3] === "runtime" && segments[4] === "adopt" && req.method === "POST") {
+          if (!ensureOwner(res, context)) {
+            return;
+          }
+          const status = await serverManager.getServerStatus(serverId);
+          if (status.running) {
+            json(res, 409, { error: "Stop the server before adopting its runtime." });
+            return;
+          }
+          const body = await parseJsonBody(req);
+          const result = await serverManager.adoptManagedRuntime(serverId, {
+            loaderVersion: body.loaderVersion,
+            minecraftVersion: body.minecraftVersion
+          });
+          const snapshot = await serverManager.getServerSnapshot(serverId, context.user, true);
+          snapshot.addonCompatibility = modManager.getCompatibilityProfile(snapshot.server);
+          logger.info("Managed runtime adopted", {
+            actor: context.user.username,
+            loader: result.loader,
+            loaderVersion: result.loaderVersion,
+            serverId
+          });
+          json(res, 200, { result, snapshot });
+          return;
+        }
+
         if (segments[3] === "updates" && segments[4] === "plan" && req.method === "POST") {
           if (!ensureOwner(res, context)) {
             return;
           }
           const body = await parseJsonBody(req);
-          const plan = await buildCombinedUpdatePlan(serverId, body.targetVersion);
+          const plan = await buildCombinedUpdatePlan(serverId, body.targetVersion, {
+            loaderVersion: body.loaderVersion
+          });
           json(res, 200, { plan });
           return;
         }
@@ -978,7 +1066,9 @@ async function createApp(rootDir = process.cwd(), options = {}) {
             return;
           }
           const body = await parseJsonBody(req);
-          const plan = await buildCombinedUpdatePlan(serverId, body.targetVersion);
+          const plan = await buildCombinedUpdatePlan(serverId, body.targetVersion, {
+            loaderVersion: body.loaderVersion
+          });
           if (!plan.safe) {
             json(res, 409, {
               error: plan.blockedReasons[0] || "Combined safe update is not available for this server.",
@@ -988,7 +1078,10 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           }
 
           const runtimeResult = await serverManager.applyServerRuntimeUpdate(serverId, plan.runtime);
-          const addonResult = await modManager.applyCombinedAddonUpdate(serverId, plan.addons);
+          // Loader-only updates leave the add-ons untouched by design.
+          const addonResult = plan.addons
+            ? await modManager.applyCombinedAddonUpdate(serverId, plan.addons)
+            : { installed: [], updatedCount: 0 };
           const snapshot = await serverManager.getServerSnapshot(serverId, context.user, true);
           snapshot.addonCompatibility = modManager.getCompatibilityProfile(snapshot.server);
           json(res, 200, {

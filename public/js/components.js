@@ -1,4 +1,4 @@
-import { escapeHtml, labelWithIcon, renderSelectOptions, renderValue } from "./html.js";
+import { escapeHtml, icon, labelWithIcon, renderSelectOptions, renderValue } from "./html.js";
 import { state } from "./state.js";
 
 export function renderSafeSettingField(definition, value) {
@@ -98,6 +98,88 @@ export function renderCreateVersionPicker() {
         : ""}
     </div>
   `;
+}
+
+// Where an add-on has to be installed, as a badge.
+//
+// The case worth surfacing is "client only": a mod the server cannot load at
+// all. That is not necessarily a mistake - packs keep client mods in the folder
+// so the modpack export picks them up - but on the server a jar that silently
+// does nothing looks exactly like one that works, which is how a mod ends up
+// being blamed for a problem it was never running for.
+//
+// CurseForge publishes no client/server split, so its add-ons read "side
+// unknown" rather than being guessed at.
+export function describeAddonSide(clientSide, serverSide) {
+  const known = ["required", "optional", "unsupported"];
+  const client = known.includes(clientSide) ? clientSide : "unknown";
+  const server = known.includes(serverSide) ? serverSide : "unknown";
+
+  if (client === "unknown" && server === "unknown") {
+    return { icon: "search", label: "side unknown", tone: "idle" };
+  }
+  if (server === "unsupported") {
+    return { icon: "client", label: "client only", tone: "danger" };
+  }
+  if (client === "unsupported") {
+    return { icon: "server", label: "server only", tone: "ok" };
+  }
+  if (client === "optional") {
+    return { icon: "server", label: "server • client optional", tone: "ok" };
+  }
+  if (server === "optional") {
+    return { icon: "client", label: "client • server optional", tone: "ok" };
+  }
+  if (client === "required" && server === "required") {
+    return { icon: "client", label: "client + server", tone: "ok" };
+  }
+  return { icon: "search", label: `client ${client} • server ${server}`, tone: "idle" };
+}
+
+export function renderAddonSideBadge(clientSide, serverSide) {
+  const side = describeAddonSide(clientSide, serverSide);
+  return `<span class="status-inline status-inline--${side.tone}">${labelWithIcon(side.icon, side.label)}</span>`;
+}
+
+// Project artwork, with the blocky mods glyph behind it.
+//
+// The glyph is always present and the image is stacked over it in the same grid
+// cell, so a missing icon and one whose CDN fails both land on the placeholder
+// rather than an empty bordered box. `onerror` only has to remove the image;
+// what shows through is already there.
+//
+// The alt is empty on purpose: the add-on's name sits next to it as real text,
+// so describing the artwork again would just be read out twice.
+export function renderAddonIcon(iconUrl, title) {
+  const fallback = `<span class="addon-icon__fallback">${icon("mods")}</span>`;
+  if (!iconUrl) {
+    return `<span class="addon-icon">${fallback}</span>`;
+  }
+  return `
+    <span class="addon-icon">
+      ${fallback}
+      <img
+        src="${escapeHtml(iconUrl)}"
+        alt=""
+        loading="lazy"
+        decoding="async"
+        referrerpolicy="no-referrer"
+        onerror="this.remove()"
+      />
+    </span>
+  `;
+}
+
+/**
+ * The RipperCraft mark.
+ *
+ * Served as a transparent PNG so it sits on the dashboard's own surface in
+ * either theme, and marked decorative because the product name is always
+ * rendered as real text beside it - a screen reader announcing both would just
+ * say "RipperCraft" twice.
+ */
+export function renderBrandMark(extraClass = "") {
+  return `<img class="brand-mark ${extraClass}" src="/logo.png" alt="" width="512" height="404" decoding="async" />`;
 }
 
 export function renderPageHeader(pathLabel, title, subtitle, actions = "") {

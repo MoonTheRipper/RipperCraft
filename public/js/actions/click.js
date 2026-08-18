@@ -5,7 +5,7 @@ import { applyLogScroll, logScrollPinned } from "../logs-live.js";
 import { releaseReturnFocus, rememberReturnFocus } from "../modal.js";
 import { clearNotice, setNotice } from "../notice.js";
 import { render } from "../render.js";
-import { resetServerScopedState, state } from "../state.js";
+import { resetServerScopedState, state, writeStored } from "../state.js";
 import { toggleTheme } from "../theme.js";
 import { currentModUpdates } from "../views/server-mods.js";
 
@@ -228,14 +228,14 @@ export async function handleAppClick(event) {
 
     if (action === "toggle-log-auto") {
       state.logAutoRefresh = !state.logAutoRefresh;
-      localStorage.setItem("rippermoonstash-log-auto", state.logAutoRefresh ? "on" : "off");
+      writeStored("log-auto", state.logAutoRefresh ? "on" : "off");
       render();
       return;
     }
 
     if (action === "toggle-log-order") {
       state.logOrder = state.logOrder === "newest" ? "oldest" : "newest";
-      localStorage.setItem("rippermoonstash-log-order", state.logOrder);
+      writeStored("log-order", state.logOrder);
       logScrollPinned.latest = true;
       logScrollPinned.runtime = true;
       render();
@@ -464,27 +464,83 @@ export async function handleAppClick(event) {
       return;
     }
 
+    if (action === "refresh-mod-details") {
+      const serverId = state.selectedServerId;
+      const payload = await api(`/api/servers/${encodeURIComponent(serverId)}/mods/refresh-details`, {
+        method: "POST"
+      });
+      if (serverId !== state.selectedServerId) {
+        return;
+      }
+      if (state.serverSnapshot) {
+        state.serverSnapshot = { ...state.serverSnapshot, mods: payload.mods };
+      }
+      setNotice(
+        "success",
+        `refreshed ${payload.result.refreshed} add-on${payload.result.refreshed === 1 ? "" : "s"} — ${payload.result.withSide} report a client/server side`
+      );
+      render();
+      return;
+    }
+
+    if (action === "load-loader-versions") {
+      const serverId = state.selectedServerId;
+      // The catalog is fetched against the version currently typed in the form,
+      // so the builds listed are the ones that exist for the intended target.
+      const targetVersion = String(
+        document.querySelector('[data-form="plan-update"] [name="targetVersion"]')?.value || ""
+      ).trim();
+      const query = targetVersion ? `?gameVersion=${encodeURIComponent(targetVersion)}` : "";
+      const payload = await api(`/api/servers/${encodeURIComponent(serverId)}/loader-versions${query}`);
+      if (serverId !== state.selectedServerId) {
+        return;
+      }
+      state.loaderOptions = { options: payload.loaderOptions, serverId };
+      const floor = payload.loaderOptions.modScan?.floor;
+      setNotice(
+        "success",
+        floor
+          ? `${payload.loaderOptions.versions.length} builds listed — installed mods need ${floor.version} or newer`
+          : `${payload.loaderOptions.versions.length} builds listed`
+      );
+      render();
+      return;
+    }
+
     if (action === "apply-update") {
       if (!state.updatePlan?.plan?.safe) {
         setNotice("error", "run the update safety check first");
         return;
       }
 
-      const targetVersion = state.updatePlan.plan.targetVersion || state.serverSnapshot?.server?.minecraftVersion || "";
-      const confirmed = window.confirm(
-        `Apply the safe combined update for ${state.serverSnapshot.server.name} to ${targetVersion}? The server must remain stopped during the update.`
-      );
+      const plan = state.updatePlan.plan;
+      const targetVersion = plan.targetVersion || state.serverSnapshot?.server?.minecraftVersion || "";
+      const loaderVersion = plan.runtime?.loaderVersion || "";
+      // The prompt names both axes, because "update to 26.1.2" reads as a no-op
+      // when the game version is unchanged and only the loader is moving.
+      const summary = plan.mode === "loader-only"
+        ? `Move the loader build to ${loaderVersion} on Minecraft ${targetVersion}? Mod files are left untouched.`
+        : `Apply the safe combined update for ${state.serverSnapshot.server.name} to Minecraft ${targetVersion}${
+            loaderVersion ? ` with loader build ${loaderVersion}` : ""
+          }? Managed add-ons are re-resolved for the new version.`;
+      const confirmed = window.confirm(`${summary}\n\nThe server must remain stopped during the update.`);
       if (!confirmed) {
         return;
       }
 
       const payload = await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/updates/apply`, {
         method: "POST",
-        body: { targetVersion }
+        body: { loaderVersion, targetVersion }
       });
       state.serverSnapshot = payload.snapshot;
       state.updatePlan = { plan: payload.plan, serverId: state.selectedServerId };
-      setNotice("success", "combined server update applied");
+      state.loaderOptions = null;
+      setNotice(
+        "success",
+        payload.runtimeResult?.loaderVersion
+          ? `runtime updated — loader build ${payload.runtimeResult.loaderVersion}`
+          : "combined server update applied"
+      );
       await loadServers();
       render();
       return;

@@ -1,4 +1,4 @@
-import { renderSection } from "../components.js";
+import { renderAddonIcon, renderAddonSideBadge, renderSection } from "../components.js";
 import { getServerPermissions } from "../format.js";
 import { escapeHtml, labelWithIcon, safeUrl } from "../html.js";
 import { state } from "../state.js";
@@ -97,10 +97,12 @@ export function renderModsSection(snapshot) {
           ${state.modResults
             .map(
               (result) => `
-                <div class="list-row">
+                <div class="list-row list-row--media">
+                  ${renderAddonIcon(result.iconUrl, result.title)}
                   <div class="list-row__main">
                     <strong>${escapeHtml(result.title)}</strong>
                     <p class="muted">${escapeHtml(result.provider)} • ${escapeHtml(result.author || "unknown author")} • ${Number(result.downloads || 0).toLocaleString()} downloads</p>
+                    <p class="badge-row">${renderAddonSideBadge(result.clientSide, result.serverSide)}</p>
                     ${result.compatibilityLabel ? `<p class="muted">${escapeHtml(result.compatibilityLabel)}</p>` : ""}
                     <p class="muted">${escapeHtml(result.description || "")}</p>
                     ${result.manualDownloadOnly
@@ -193,7 +195,10 @@ export function renderModsSection(snapshot) {
           <strong>installed</strong>
           <div class="row-actions">
             ${permissions.canManageAddonSettings
-              ? `<button class="button button--quiet" data-action="check-mod-updates">${labelWithIcon("refresh", currentModUpdates() ? "re-check updates" : "check for updates")}</button>`
+              ? `
+                <button class="button button--quiet" data-action="check-mod-updates">${labelWithIcon("refresh", currentModUpdates() ? "re-check updates" : "check for updates")}</button>
+                <button class="button button--quiet" data-action="refresh-mod-details">${labelWithIcon("image", "refresh icons & sides")}</button>
+              `
               : ""}
             <a class="button button--quiet" href="/api/servers/${encodeURIComponent(server.id)}/mods/client-list">${labelWithIcon("logs", "client list (.txt)")}</a>
             <a class="button button--quiet" href="/api/servers/${encodeURIComponent(server.id)}/mods/modpack">${labelWithIcon("mods", "client modpack (.mrpack)")}</a>
@@ -203,14 +208,25 @@ export function renderModsSection(snapshot) {
           ? mods
               .map(
                 (item) => {
-                  const fileName = typeof item === "string" ? item : item.fileName;
-                  const enabled = typeof item === "string" ? true : item.enabled !== false;
+                  const entry = typeof item === "string" ? { enabled: true, fileName: item } : item;
+                  const fileName = entry.fileName;
+                  const enabled = entry.enabled !== false;
                   const update = findAddonUpdate(fileName);
+                  // Untracked jars were dropped in by hand, so there is no
+                  // project behind them and nothing truthful to show but the
+                  // file itself.
+                  const heading = entry.title
+                    ? `<strong>${escapeHtml(entry.title)}</strong><code class="addon-file">${escapeHtml(fileName)}</code>`
+                    : `<code>${escapeHtml(fileName)}</code>`;
                   return `
-                  <div class="list-row ${update && update.status === "update-available" ? "list-row--notice" : ""}">
+                  <div class="list-row list-row--media ${update && update.status === "update-available" ? "list-row--notice" : ""}">
+                    ${renderAddonIcon(entry.iconUrl, entry.title || fileName)}
                     <div class="list-row__main">
-                      <code>${escapeHtml(fileName)}</code>
-                      <p class="muted">${enabled ? "enabled" : "disabled"}${renderAddonUpdateLabel(update)}</p>
+                      ${heading}
+                      <p class="muted">${enabled ? "enabled" : "disabled"}${entry.tracked === false ? " • untracked" : ""}${renderAddonUpdateLabel(update)}</p>
+                      ${entry.tracked === false
+                        ? ""
+                        : `<p class="badge-row">${renderAddonSideBadge(entry.clientSide, entry.serverSide)}</p>`}
                     </div>
                     ${permissions.canManageAddonSettings
                       ? `
