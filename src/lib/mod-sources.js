@@ -2,7 +2,7 @@ const crypto = require("node:crypto");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
-const { ensureDir, nowIso, runCommand, safeFilename } = require("./utils");
+const { ensureDir, nowIso, readEnv, runCommand, safeFilename } = require("./utils");
 
 const MODRINTH_API = "https://api.modrinth.com/v2";
 const CURSEFORGE_API = "https://api.curseforge.com/v1";
@@ -28,12 +28,24 @@ const RELEASE_PRIORITY = {
   beta: 1,
   alpha: 2
 };
-const REMOTE_USER_AGENT = process.env.RIPPERMOONSTASH_USER_AGENT || "RipperMoonStash/0.1 (https://localhost)";
+const REMOTE_USER_AGENT = readEnv("USER_AGENT", "RipperCraft/0.1 (https://github.com/moontheripper/rippercraft)");
+
+// Normalises the two providers' side fields onto one vocabulary. Modrinth
+// publishes client_side/server_side per project; CurseForge has no equivalent,
+// so its add-ons stay "unknown" rather than being guessed at.
+function normalizeSide(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return ["required", "optional", "unsupported"].includes(normalized) ? normalized : "unknown";
+}
 
 function createModManager(serverManager, options = {}) {
   // Owner-managed keys live in data/app.json; an environment variable always
   // wins so ops can override whatever is stored without editing the UI.
   const readIntegrations = options.readIntegrations || (async () => ({}));
+  // Project metadata (title, icon, which side it belongs on) is stable and gets
+  // asked for once per add-on per install or refresh, so a short cache keeps a
+  // 40-mod refresh from making 40 uncached round trips per pass.
+  const projectDetailCache = new Map();
 
   function curseforgeGameId() {
     return String(process.env.CURSEFORGE_GAME_ID || CURSEFORGE_MINECRAFT_GAME_ID);
@@ -172,12 +184,17 @@ function createModManager(serverManager, options = {}) {
     const payload = await fetchJson(url.toString());
     return payload.hits.map((result) => ({
       author: result.author,
+      // Search hits already carry the client/server split, so where an add-on
+      // belongs is visible before it is installed rather than after.
+      clientSide: normalizeSide(result.client_side),
       compatibilityLabel: `${profile.loader} • ${profile.gameVersion} • ${profile.projectType}`,
       description: result.description,
       downloads: result.downloads,
       iconUrl: result.icon_url,
       id: result.project_id,
+      pageUrl: result.slug ? `https://modrinth.com/mod/${result.slug}` : "",
       provider: "modrinth",
+      serverSide: normalizeSide(result.server_side),
       slug: result.slug,
       title: result.title
     }));
@@ -271,11 +288,15 @@ function createModManager(serverManager, options = {}) {
 
     return payload.data.map((result) => ({
       author: (result.authors || []).map((author) => author.name).join(", "),
+      // CurseForge publishes no client/server split, so this stays unknown
+      // instead of implying a certainty the API does not provide.
+      clientSide: "unknown",
       compatibilityLabel: `${profile.loader} • ${profile.gameVersion} • mod`,
       description: result.summary,
       downloads: result.downloadCount,
       iconUrl: result.logo && result.logo.thumbnailUrl,
       id: String(result.id),
+      serverSide: "unknown",
       // Authors can disable third-party downloads; flag it here so the UI can
       // point at CurseForge instead of offering an install that cannot succeed.
       manualDownloadOnly: result.allowModDistribution === false,
@@ -436,20 +457,97 @@ function createModManager(serverManager, options = {}) {
     return files[0];
   }
 
+  /**
+   * Title, artwork and client/server split for one project.
+   *
+   * Failures are swallowed into a null-ish record on purpose: this is display
+   * metadata, and an add-on that installed correctly must not be reported as
+   * broken because its project page could not be reached.
+   */
+  async function fetchProjectDetails(provider, sourceId) {
+    const cacheKey = `${provider}:${sourceId}`;
+    if (projectDetailCache.has(cacheKey)) {
+      return projectDetailCache.get(cacheKey);
+    }
+
+    let details = { clientSide: "unknown", iconUrl: "", pageUrl: "", serverSide: "unknown", title: "" };
+    try {
+      if (provider === "modrinth") {
+        const project = await fetchJson(`${MODRINTH_API}/project/${encodeURIComponent(sourceId)}`);
+        details = {
+          clientSide: normalizeSide(project.client_side),
+          iconUrl: project.icon_url || "",
+          pageUrl: `https://modrinth.com/mod/${project.slug || sourceId}`,
+          serverSide: normalizeSide(project.server_side),
+          title: project.title || ""
+        };
+      } else if (provider === "curseforge") {
+        const payload = await fetchJson(`${CURSEFORGE_API}/mods/${encodeURIComponent(sourceId)}`, {
+          headers: await curseforgeHeaders()
+        });
+        const data = payload.data || {};
+        const website = (data.links && data.links.websiteUrl) || "";
+        details = {
+          // CurseForge exposes no client/server split at all, so this stays
+          // unknown rather than being invented.
+          clientSide: "unknown",
+          iconUrl: (data.logo && (data.logo.thumbnailUrl || data.logo.url)) || "",
+          pageUrl: /^https?:\/\//i.test(website) ? website : "",
+          serverSide: "unknown",
+          title: data.name || ""
+        };
+      }
+    } catch {
+      // Leave the blank record in place; the caller falls back to the filename.
+    }
+
+    projectDetailCache.set(cacheKey, details);
+    return details;
+  }
+
   function normalizeTrackedEntry(server, entry) {
     const profile = getCompatibilityProfile(server);
     return {
+      clientSide: normalizeSide(entry.clientSide),
       dependencyOf: entry.dependencyOf || null,
       direct: entry.direct !== false,
       fileName: safeFilename(entry.fileName),
       gameVersion: entry.gameVersion || server.minecraftVersion || "",
+      // Display metadata, carried in the manifest so the add-on list renders
+      // without a network round trip on every page load.
+      iconUrl: String(entry.iconUrl || ""),
       installKind: entry.installKind || profile.installKind,
       loader: entry.loader || server.loader || "vanilla",
       managed: entry.managed !== false,
       manual: entry.manual === true,
+      pageUrl: String(entry.pageUrl || ""),
       provider: entry.provider,
-      sourceId: String(entry.sourceId)
+      serverSide: normalizeSide(entry.serverSide),
+      sourceId: String(entry.sourceId),
+      title: String(entry.title || "")
     };
+  }
+
+  // Fills in display metadata for entries that do not carry it yet, so newly
+  // installed add-ons and manifests written before these fields existed end up
+  // in the same shape.
+  async function withProjectDetails(entries) {
+    return await Promise.all(
+      entries.map(async (entry) => {
+        if (entry.title && entry.clientSide && entry.clientSide !== "unknown") {
+          return entry;
+        }
+        const details = await fetchProjectDetails(entry.provider, entry.sourceId);
+        return {
+          ...entry,
+          clientSide: entry.clientSide && entry.clientSide !== "unknown" ? entry.clientSide : details.clientSide,
+          iconUrl: entry.iconUrl || details.iconUrl,
+          pageUrl: entry.pageUrl || details.pageUrl,
+          serverSide: entry.serverSide && entry.serverSide !== "unknown" ? entry.serverSide : details.serverSide,
+          title: entry.title || details.title
+        };
+      })
+    );
   }
 
   function publicInstallRecord(entry) {
@@ -460,10 +558,52 @@ function createModManager(serverManager, options = {}) {
     };
   }
 
+  // Every write to the manifest funnels through here, so enriching at this one
+  // point covers installs, updates and combined updates alike.
   async function writeTrackedEntries(serverId, server, entries) {
-    const normalized = entries.map((entry) => normalizeTrackedEntry(server, entry));
+    const enriched = await withProjectDetails(entries.map((entry) => normalizeTrackedEntry(server, entry)));
+    const normalized = enriched.map((entry) => normalizeTrackedEntry(server, entry));
     await serverManager.writeAddonManifest(serverId, normalized);
     return normalized;
+  }
+
+  /**
+   * Re-read title, artwork and client/server split for every tracked add-on.
+   *
+   * Manifests written before these fields existed have no metadata at all, and
+   * a project's client/server split can change between releases, so this is
+   * offered as an explicit refresh rather than run on every page load.
+   */
+  async function refreshAddonDetails(serverId) {
+    const server = await serverManager.getServer(serverId);
+    if (!server) {
+      throw new Error("Server not found.");
+    }
+
+    const manifest = await serverManager.readAddonManifest(serverId);
+    // Drop what is cached so a refresh actually re-queries rather than handing
+    // back the values it is meant to be replacing.
+    projectDetailCache.clear();
+
+    const refreshed = await Promise.all(
+      manifest.map(async (entry) => {
+        const details = await fetchProjectDetails(entry.provider, entry.sourceId);
+        return normalizeTrackedEntry(server, {
+          ...entry,
+          clientSide: details.clientSide,
+          iconUrl: details.iconUrl || entry.iconUrl,
+          pageUrl: details.pageUrl || entry.pageUrl,
+          serverSide: details.serverSide,
+          title: details.title || entry.title
+        });
+      })
+    );
+
+    await serverManager.writeAddonManifest(serverId, refreshed);
+    return {
+      refreshed: refreshed.length,
+      withSide: refreshed.filter((entry) => entry.clientSide !== "unknown" || entry.serverSide !== "unknown").length
+    };
   }
 
   async function installModrinth(serverId, server, projectId, seenProjects = new Set(), dependencyOf = null) {
@@ -1029,7 +1169,7 @@ function createModManager(serverManager, options = {}) {
       lines.push("");
     }
 
-    lines.push("Generated by RipperMoonStash.");
+    lines.push("Generated by RipperCraft.");
     return `${lines.join("\n")}\n`;
   }
 
@@ -1290,8 +1430,10 @@ function createModManager(serverManager, options = {}) {
     applyCombinedAddonUpdate,
     buildClientManifest,
     buildModpackArchive,
+    fetchProjectDetails,
     getCompatibilityProfile,
     planAddonUpdates,
+    refreshAddonDetails,
     renderClientListText,
     install,
     installUpload,
@@ -1303,5 +1445,6 @@ function createModManager(serverManager, options = {}) {
 }
 
 module.exports = {
-  createModManager
+  createModManager,
+  normalizeSide
 };

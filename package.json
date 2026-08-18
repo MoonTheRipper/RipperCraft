@@ -1,7 +1,7 @@
 {
-  "name": "rippermoonstash",
+  "name": "rippercraft",
   "version": "0.1.0",
-  "description": "Browser-based Minecraft server manager for RipperMoonStash",
+  "description": "RipperCraft - a browser-based Minecraft server manager",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",

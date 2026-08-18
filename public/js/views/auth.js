@@ -1,3 +1,4 @@
+import { renderBrandMark } from "../components.js";
 import { escapeHtml, labelWithIcon } from "../html.js";
 
 export function renderAuth(title, mode) {
@@ -9,7 +10,7 @@ export function renderAuth(title, mode) {
         <figcaption>Uncle Ben</figcaption>
       </figure>
       <section class="auth-panel">
-        <p class="brand-line brand-inline">RipperMoonStash</p>
+        <p class="brand-line brand-inline brand-line--stacked">${renderBrandMark("brand-mark--auth")}<span>RipperCraft</span></p>
         <h1>${escapeHtml(title)}</h1>
         <form data-form="${isSetup ? "setup" : "login"}" class="form-grid">
           <label>

@@ -3,6 +3,23 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 
+// The project was renamed from RipperMoonStash to RipperCraft. Configuration
+// lives in the environment of whoever deployed it - a systemd unit, an env file,
+// a shell profile - none of which this code can rewrite, so the old prefix keeps
+// working. New installs use RIPPERCRAFT_*; existing ones do not break on upgrade.
+const ENV_PREFIX = "RIPPERCRAFT_";
+const LEGACY_ENV_PREFIX = "RIPPERMOONSTASH_";
+
+function readEnv(name, fallbackValue = "") {
+  for (const prefix of [ENV_PREFIX, LEGACY_ENV_PREFIX]) {
+    const value = process.env[`${prefix}${name}`];
+    if (value !== undefined && String(value).trim() !== "") {
+      return String(value);
+    }
+  }
+  return fallbackValue;
+}
+
 async function ensureDir(targetPath) {
   await fs.mkdir(targetPath, { recursive: true });
 }
@@ -151,11 +168,14 @@ function withinParent(parentPath, childPath) {
 }
 
 module.exports = {
+  ENV_PREFIX,
+  LEGACY_ENV_PREFIX,
   coerceBoolean,
   displayNameFromSlug,
   ensureDir,
   exists,
   nowIso,
+  readEnv,
   randomId,
   readJson,
   runCommand,

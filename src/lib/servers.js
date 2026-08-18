@@ -6,11 +6,21 @@ const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 const { hashSecret } = require("./auth");
 const {
+  compareVersions,
+  evaluateLoaderCandidate,
+  evaluateMinecraftCandidate,
+  readJarTextEntry,
+  scanLoaderRequirements
+} = require("./loader-deps");
+const {
+  ENV_PREFIX,
+  LEGACY_ENV_PREFIX,
   coerceBoolean,
   displayNameFromSlug,
   ensureDir,
   exists,
   nowIso,
+  readEnv,
   readJson,
   runCommand,
   safeFilename,
@@ -33,8 +43,13 @@ const FORGE_MAVEN = "https://maven.minecraftforge.net/net/minecraftforge/forge";
 const INSTALLABLE_LOADERS = new Set(["vanilla", "paper", "purpur", "fabric", "forge", "neoforge"]);
 const INSTALLER_LOADERS = new Set(["forge", "neoforge"]);
 const PAPER_LIKE_LOADERS = new Set(["paper", "purpur", "folia", "spigot", "bukkit"]);
-const COMBINED_UPDATE_LOADERS = new Set(["vanilla", "paper", "purpur"]);
-const REMOTE_USER_AGENT = process.env.RIPPERMOONSTASH_USER_AGENT || "RipperMoonStash/0.1 (https://localhost)";
+const COMBINED_UPDATE_LOADERS = new Set(["vanilla", "paper", "purpur", "fabric", "forge", "neoforge"]);
+// Loaders that version their runtime separately from Minecraft, so the loader
+// build is a choice the operator can make - pin it, move it forward, or move it
+// back - without the game version changing at all.
+const LOADER_VERSIONED_LOADERS = new Set(["fabric", "forge", "neoforge"]);
+const FORGE_MAVEN_METADATA_URL = `${FORGE_MAVEN}/maven-metadata.xml`;
+const REMOTE_USER_AGENT = readEnv("USER_AGENT", "RipperCraft/0.1 (https://github.com/moontheripper/rippercraft)");
 const DEFAULT_EXISTING_START_COMMAND = "./launch-server.sh";
 const DEFAULT_MANAGED_START_COMMAND = "./.rippermoon/launch-server.sh";
 const SAFE_ADMIN_SETTING_DEFINITIONS = [
@@ -68,6 +83,11 @@ function createServerManager(store) {
     data: null,
     expiresAt: 0
   };
+  // Planning a loader change asks for the same build list twice - once to
+  // annotate the picker, once to resolve the download - and the picker itself is
+  // re-opened often. Loader release lists barely move, so a short cache keeps
+  // that to one request.
+  const loaderCatalogCache = new Map();
 
   function withRemoteHeaders(headers = {}) {
     return {
@@ -85,6 +105,17 @@ function createServerManager(store) {
       throw new Error(`Request failed with status ${response.status}.`);
     }
     return await response.json();
+  }
+
+  async function fetchText(url, options = {}) {
+    const response = await fetch(url, {
+      ...options,
+      headers: withRemoteHeaders(options.headers || {})
+    });
+    if (!response.ok) {
+      throw new Error(`Request failed with status ${response.status}.`);
+    }
+    return await response.text();
   }
 
   async function fetchBuffer(url, options = {}) {
@@ -749,7 +780,7 @@ function createServerManager(store) {
   }
 
   // A per-server Java path is needed because one dashboard can host servers
-  // that require different JDKs, while RIPPERMOONSTASH_JAVA_BIN is global to
+  // that require different JDKs, while the JAVA_BIN environment override is global to
   // the whole service process.
   async function validateJavaBin(javaBin) {
     const trimmed = String(javaBin || "").trim();
@@ -1083,7 +1114,33 @@ function createServerManager(store) {
     const disabled = disabledEntries
       .filter((entry) => entry.isFile())
       .map((entry) => ({ enabled: false, fileName: entry.name }));
-    return [...active, ...disabled].sort((left, right) => left.fileName.localeCompare(right.fileName));
+
+    // Join the tracked manifest onto what is actually on disk, so the add-on
+    // list can show a title, artwork and which side the mod belongs on instead
+    // of a bare filename. Files with no manifest entry were dropped in by hand
+    // and stay deliberately bare - there is nothing truthful to show for them.
+    const manifest = await readAddonManifest(serverId);
+    const detailsByFileName = new Map(manifest.map((entry) => [entry.fileName, entry]));
+
+    return [...active, ...disabled]
+      .map((entry) => {
+        const tracked = detailsByFileName.get(entry.fileName);
+        if (!tracked) {
+          return { ...entry, tracked: false };
+        }
+        return {
+          ...entry,
+          clientSide: tracked.clientSide || "unknown",
+          iconUrl: tracked.iconUrl || "",
+          pageUrl: tracked.pageUrl || "",
+          provider: tracked.provider || "",
+          serverSide: tracked.serverSide || "unknown",
+          sourceId: tracked.sourceId || "",
+          title: tracked.title || "",
+          tracked: true
+        };
+      })
+      .sort((left, right) => left.fileName.localeCompare(right.fileName));
   }
 
   async function readAddonManifest(serverId) {
@@ -1285,15 +1342,120 @@ function createServerManager(store) {
     };
   }
 
+  // Every loader build published for a Minecraft version, newest first. This is
+  // what makes pinning, upgrading and downgrading possible: without the full
+  // list the dashboard can only ever take whatever "latest" happens to be.
+  async function listFabricLoaderVersions(gameVersion) {
+    const entries = await fetchJson(`${FABRIC_META_API}/versions/loader/${encodeURIComponent(gameVersion)}`);
+    return (entries || [])
+      .filter((entry) => entry && entry.loader && entry.loader.version)
+      .map((entry) => ({
+        stable: entry.loader.stable === true,
+        version: entry.loader.version
+      }));
+  }
+
+  async function listForgeLoaderVersions(gameVersion) {
+    const [metadataXml, promotions] = await Promise.all([
+      fetchText(FORGE_MAVEN_METADATA_URL),
+      fetchJson(FORGE_PROMOTIONS_URL).catch(() => ({ promos: {} }))
+    ]);
+
+    const promos = promotions.promos || {};
+    const recommended = promos[`${gameVersion}-recommended`] || null;
+    const latest = promos[`${gameVersion}-latest`] || null;
+
+    const prefix = `${gameVersion}-`;
+    const versions = [...metadataXml.matchAll(/<version>([^<]+)<\/version>/g)]
+      .map((match) => match[1].trim())
+      // Forge artifacts are "<mc>-<forge>", sometimes with a branch suffix.
+      .filter((artifact) => artifact.startsWith(prefix))
+      .map((artifact) => artifact.slice(prefix.length));
+
+    return versions
+      .map((version) => ({
+        recommended: version === recommended,
+        stable: version === recommended || version === latest,
+        version
+      }))
+      .reverse();
+  }
+
+  async function listNeoforgeLoaderVersions(gameVersion) {
+    const payload = await fetchJson(NEOFORGE_VERSIONS_API);
+    // NeoForge encodes the Minecraft version in its own: 1.21.1 -> 21.1.x.
+    const [, minor, patch = "0"] = String(gameVersion).split(".");
+    if (minor === undefined) {
+      return [];
+    }
+    const prefix = `${String(Number(minor))}.${String(Number(patch))}.`;
+    return (payload.versions || [])
+      .filter((entry) => entry.startsWith(prefix))
+      .map((version) => ({
+        stable: !version.includes("beta"),
+        version
+      }))
+      .reverse();
+  }
+
+  async function listLoaderVersionsFor(loader, gameVersion) {
+    const normalizedLoader = String(loader || "").trim().toLowerCase();
+    const resolvedGameVersion = await resolveRequestedReleaseVersion(gameVersion);
+    const cacheKey = `${normalizedLoader}:${resolvedGameVersion}`;
+    const cached = loaderCatalogCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.value;
+    }
+
+    let versions = [];
+    if (normalizedLoader === "fabric") {
+      versions = await listFabricLoaderVersions(resolvedGameVersion);
+    } else if (normalizedLoader === "forge") {
+      versions = await listForgeLoaderVersions(resolvedGameVersion);
+    } else if (normalizedLoader === "neoforge") {
+      versions = await listNeoforgeLoaderVersions(resolvedGameVersion);
+    }
+    // Vanilla, Paper and Purpur have no loader version of their own - the build
+    // is chosen by the game version alone, so the list stays empty.
+
+    const value = { gameVersion: resolvedGameVersion, versions };
+    loaderCatalogCache.set(cacheKey, { expiresAt: Date.now() + 5 * 60_000, value });
+    return value;
+  }
+
+  // Pick the loader build to install. An explicit request is honoured only if
+  // that build actually exists for the target game version, which is what stops
+  // an upgrade or downgrade from silently producing an unlaunchable server.
+  async function selectLoaderVersion(loader, gameVersion, requestedVersion, describeLoader) {
+    const catalog = await listLoaderVersionsFor(loader, gameVersion);
+    const available = catalog.versions;
+    if (!available.length) {
+      throw new Error(`${describeLoader} has no build for Minecraft ${gameVersion}.`);
+    }
+
+    const requested = String(requestedVersion || "").trim();
+    if (requested) {
+      const match = available.find((entry) => entry.version === requested);
+      if (!match) {
+        throw new Error(
+          `${describeLoader} ${requested} is not published for Minecraft ${gameVersion}. Available builds: ${available
+            .slice(0, 6)
+            .map((entry) => entry.version)
+            .join(", ")}${available.length > 6 ? ", ..." : ""}.`
+        );
+      }
+      return match.version;
+    }
+
+    const preferred = available.find((entry) => entry.recommended) || available.find((entry) => entry.stable);
+    return (preferred || available[0]).version;
+  }
+
   // Fabric publishes a ready-made server launcher jar, so no installer run is
   // needed - unlike Forge and NeoForge below.
-  async function resolveFabricRuntime(version) {
+  async function resolveFabricRuntime(version, loaderVersionRequest) {
     const targetVersion = await resolveRequestedReleaseVersion(version);
-    const loaders = await fetchJson(`${FABRIC_META_API}/versions/loader/${encodeURIComponent(targetVersion)}`);
-    const stableLoader = loaders.find((entry) => entry.loader && entry.loader.stable) || loaders[0];
-    if (!stableLoader) {
-      throw new Error(`Fabric has no loader build for Minecraft ${targetVersion}.`);
-    }
+    const loaderVersion = await selectLoaderVersion("fabric", targetVersion, loaderVersionRequest, "Fabric Loader");
 
     const installers = await fetchJson(`${FABRIC_META_API}/versions/installer`);
     const stableInstaller = installers.find((entry) => entry.stable) || installers[0];
@@ -1301,7 +1463,6 @@ function createServerManager(store) {
       throw new Error("Fabric has no installer build available.");
     }
 
-    const loaderVersion = stableLoader.loader.version;
     const installerVersion = stableInstaller.version;
     return {
       downloadUrl: `${FABRIC_META_API}/versions/loader/${encodeURIComponent(targetVersion)}/${encodeURIComponent(loaderVersion)}/${encodeURIComponent(installerVersion)}/server/jar`,
@@ -1311,14 +1472,9 @@ function createServerManager(store) {
     };
   }
 
-  async function resolveForgeRuntime(version) {
+  async function resolveForgeRuntime(version, loaderVersionRequest) {
     const targetVersion = await resolveRequestedReleaseVersion(version);
-    const promotions = await fetchJson(FORGE_PROMOTIONS_URL);
-    const promos = promotions.promos || {};
-    const forgeVersion = promos[`${targetVersion}-recommended`] || promos[`${targetVersion}-latest`];
-    if (!forgeVersion) {
-      throw new Error(`Forge has no build for Minecraft ${targetVersion}.`);
-    }
+    const forgeVersion = await selectLoaderVersion("forge", targetVersion, loaderVersionRequest, "Forge");
 
     const artifact = `${targetVersion}-${forgeVersion}`;
     return {
@@ -1330,20 +1486,18 @@ function createServerManager(store) {
     };
   }
 
-  async function resolveNeoforgeRuntime(version) {
+  async function resolveNeoforgeRuntime(version, loaderVersionRequest) {
     const targetVersion = await resolveRequestedReleaseVersion(version);
-    const payload = await fetchJson(NEOFORGE_VERSIONS_API);
-    // NeoForge encodes the Minecraft version in its own: 1.21.1 -> 21.1.x.
-    const [, minor, patch = "0"] = targetVersion.split(".");
-    const prefix = minor === undefined ? "" : `${String(Number(minor))}.${String(Number(patch))}.`;
-    const candidates = (payload.versions || []).filter(
-      (entry) => entry.startsWith(prefix) && !entry.includes("beta")
-    );
-    const neoforgeVersion = candidates[candidates.length - 1];
-    if (!prefix || !neoforgeVersion) {
-      throw new Error(
-        `NeoForge has no stable build for Minecraft ${targetVersion}. NeoForge starts at Minecraft 1.20.2.`
-      );
+    let neoforgeVersion;
+    try {
+      neoforgeVersion = await selectLoaderVersion("neoforge", targetVersion, loaderVersionRequest, "NeoForge");
+    } catch (error) {
+      if (String(error.message).includes("has no build")) {
+        throw new Error(
+          `NeoForge has no stable build for Minecraft ${targetVersion}. NeoForge starts at Minecraft 1.20.2.`
+        );
+      }
+      throw error;
     }
 
     return {
@@ -1395,7 +1549,7 @@ function createServerManager(store) {
       }
     }
 
-    add(String(process.env.RIPPERMOONSTASH_JAVA_BIN || "").trim(), "environment", 1);
+    add(readEnv("JAVA_BIN").trim(), "environment", 1);
     if (String(process.env.JAVA_HOME || "").trim()) {
       add(path.join(process.env.JAVA_HOME.trim(), "bin", "java"), "environment", 1);
     }
@@ -1496,8 +1650,8 @@ function createServerManager(store) {
     if (explicit) {
       return explicit;
     }
-    if (String(process.env.RIPPERMOONSTASH_JAVA_BIN || "").trim()) {
-      return process.env.RIPPERMOONSTASH_JAVA_BIN.trim();
+    if (readEnv("JAVA_BIN").trim()) {
+      return readEnv("JAVA_BIN").trim();
     }
     if (String(process.env.JAVA_HOME || "").trim()) {
       return path.join(process.env.JAVA_HOME.trim(), "bin", "java");
@@ -1596,7 +1750,7 @@ function createServerManager(store) {
 
     if (normalizedLoader === "fabric") {
       report("resolving Fabric build");
-      const runtime = await resolveFabricRuntime(version);
+      const runtime = await resolveFabricRuntime(version, options.loaderVersion);
       report(`downloading Fabric ${runtime.loaderVersion} server launcher`);
       const bundlePath = path.join(serverDir, "server.jar");
       const buffer = await fetchBuffer(runtime.downloadUrl);
@@ -1615,8 +1769,8 @@ function createServerManager(store) {
       report(`resolving ${normalizedLoader} build`);
       const runtime =
         normalizedLoader === "forge"
-          ? await resolveForgeRuntime(version)
-          : await resolveNeoforgeRuntime(version);
+          ? await resolveForgeRuntime(version, options.loaderVersion)
+          : await resolveNeoforgeRuntime(version, options.loaderVersion);
       await runLoaderInstaller(runtime, serverDir, options.javaBin, report);
       return {
         kind: normalizedLoader,
@@ -1646,7 +1800,10 @@ MIN_MEMORY="${minMemory}"
 MAX_MEMORY="${maxMemory}"
 
 JAVA_BIN=""
-if [ -n "\${RIPPERMOONSTASH_JAVA_BIN:-}" ]; then
+if [ -n "\${RIPPERCRAFT_JAVA_BIN:-}" ]; then
+  JAVA_BIN="\${RIPPERCRAFT_JAVA_BIN}"
+elif [ -n "\${RIPPERMOONSTASH_JAVA_BIN:-}" ]; then
+  # Pre-rename variable, still honoured so an existing deployment keeps working.
   JAVA_BIN="\${RIPPERMOONSTASH_JAVA_BIN}"
 elif [ -n "\${JAVA_HOME:-}" ] && [ -x "\${JAVA_HOME}/bin/java" ]; then
   JAVA_BIN="\${JAVA_HOME}/bin/java"
@@ -1657,7 +1814,7 @@ elif command -v /usr/libexec/java_home >/dev/null 2>&1; then
 elif command -v java >/dev/null 2>&1; then
   JAVA_BIN="$(command -v java)"
 else
-  echo "Java was not found. Install Java or set JAVA_HOME or RIPPERMOONSTASH_JAVA_BIN." >&2
+  echo "Java was not found. Install Java or set JAVA_HOME or RIPPERCRAFT_JAVA_BIN." >&2
   exit 1
 fi
 
@@ -1762,7 +1919,13 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
           server.loader,
           server.minecraftVersion,
           paths.serverDir,
-          { javaBin: server.javaBin }
+          {
+            javaBin: server.javaBin,
+            // Repair must reinstall the build the server was pinned to. Letting
+            // it drift to "latest" would turn a missing-file repair into a
+            // silent loader upgrade.
+            loaderVersion: server.managedRuntime.loaderVersion || null
+          }
         );
         await setServerMetadata(serverId, {
           managedRuntime: { ...runtime, updatedAt: nowIso() }
@@ -1782,7 +1945,12 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
 
       let runtimePlan;
       try {
-        runtimePlan = await planServerRuntimeUpdate(serverId, server.minecraftVersion);
+        // Reinstall the build this server is pinned to. Repair restores what was
+        // lost; moving the loader is an update, and updates are the operator's
+        // call to make in the update panel.
+        runtimePlan = await planServerRuntimeUpdate(serverId, server.minecraftVersion, {
+          loaderVersion: server.managedRuntime.loaderVersion || ""
+        });
       } catch (error) {
         throw userFacingError(
           `Unable to repair the managed runtime for ${server.name}. ${error.message} Choose a valid Minecraft version in server settings or through the update panel first.`
@@ -1943,7 +2111,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
   }
 
   function resolveShellCommand() {
-    const configuredShell = String(process.env.RIPPERMOONSTASH_SHELL || process.env.SHELL || "").trim();
+    const configuredShell = (readEnv("SHELL") || String(process.env.SHELL || "")).trim();
     if (configuredShell) {
       return {
         args: ["-lc"],
@@ -1996,11 +2164,15 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     }
 
     const shellCommand = resolveShellCommand();
-    // The launch script already prefers RIPPERMOONSTASH_JAVA_BIN, so a per-server
+    // The launch script already prefers the JAVA_BIN override, so a per-server
     // override only needs to reach this child's environment.
     const childEnv = { ...process.env };
     if (server.javaBin) {
-      childEnv.RIPPERMOONSTASH_JAVA_BIN = server.javaBin;
+      childEnv[`${ENV_PREFIX}JAVA_BIN`] = server.javaBin;
+      // Hand-written launch scripts in existing server folders read the
+      // pre-rename variable, and this code cannot rewrite scripts it did not
+      // generate. Exporting both means a per-server JDK keeps reaching them.
+      childEnv[`${LEGACY_ENV_PREFIX}JAVA_BIN`] = server.javaBin;
       childEnv.JAVA_HOME = path.dirname(path.dirname(server.javaBin));
       runtimeLog.write(`[${nowIso()}] Using per-server Java: ${server.javaBin}\n`);
     }
@@ -2261,11 +2433,28 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
 
     const loader = String(server.loader || "vanilla").toLowerCase();
     const paths = resolveRecordPaths(server);
+    const loaderVersioned = LOADER_VERSIONED_LOADERS.has(loader);
 
     if (!COMBINED_UPDATE_LOADERS.has(loader)) {
       return {
+        adoptable: false,
+        loaderVersioned: false,
         reason:
-          "Combined safe updates currently support vanilla, Paper, and Purpur runtimes only. Fabric, Forge, NeoForge, Quilt, and custom loaders still require manual runtime updates.",
+          "Automatic runtime updates support vanilla, Paper, Purpur, Fabric, Forge, and NeoForge. Quilt and custom loaders still require manual runtime updates.",
+        runtimeKind: loader,
+        supported: false
+      };
+    }
+
+    // A registered-existing server has no managed runtime, so the dashboard does
+    // not know how it launches and must not overwrite its jar. Adoption is the
+    // way in, and it is offered rather than performed silently.
+    if (!server.managedRuntime && !shouldUseManagedLaunchCommand(server)) {
+      return {
+        adoptable: true,
+        loaderVersioned,
+        reason:
+          "This server was registered from an existing folder and still uses its own launch script, so the dashboard does not manage its runtime yet. Adopt the runtime to enable version and loader updates.",
         runtimeKind: loader,
         supported: false
       };
@@ -2277,6 +2466,8 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       !shouldUseManagedLaunchCommand(server)
     ) {
       return {
+        adoptable: true,
+        loaderVersioned,
         reason: "This server does not expose a managed server.jar runtime file yet, so automatic runtime replacement is not safe with its current launch setup.",
         runtimeKind: loader,
         supported: false
@@ -2284,72 +2475,250 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     }
 
     return {
+      adoptable: false,
+      loaderVersioned,
       reason: null,
       runtimeKind: loader,
       supported: true
     };
   }
 
-  async function planServerRuntimeUpdate(serverId, targetVersion) {
+  // The installed mod set is the real authority on which loader builds are
+  // usable. Both answers - the floor and the per-candidate verdict - come from
+  // metadata inside the jars already on disk.
+  async function scanServerLoaderRequirements(serverId) {
     const server = await getServer(serverId);
     if (!server) {
       throw new Error("Server not found.");
     }
 
+    const paths = resolveRecordPaths(server);
+    return await scanLoaderRequirements(paths.modsDir, String(server.loader || "").toLowerCase());
+  }
+
+  // Builds the annotated loader catalog once and hands back the raw jar scan
+  // alongside it, so a caller that also needs the per-mod detail - the update
+  // planner - does not re-read every jar on disk to get it.
+  async function buildLoaderCatalog(serverId, requestedGameVersion) {
+    const server = await getServer(serverId);
+    if (!server) {
+      throw new Error("Server not found.");
+    }
+
+    const loader = String(server.loader || "vanilla").toLowerCase();
+    const currentLoaderVersion = (server.managedRuntime && server.managedRuntime.loaderVersion) || null;
+
+    if (!LOADER_VERSIONED_LOADERS.has(loader)) {
+      return {
+        options: {
+          currentLoaderVersion,
+          gameVersion: requestedGameVersion || server.minecraftVersion || "",
+          loader,
+          loaderVersioned: false,
+          modScan: { floor: null, supported: false, unreadable: [] },
+          versions: []
+        },
+        scan: { floor: null, mods: [], supported: false, unreadable: [] }
+      };
+    }
+
+    const gameVersion = await resolveRequestedReleaseVersion(requestedGameVersion || server.minecraftVersion);
+    const [catalog, scan] = await Promise.all([
+      listLoaderVersionsFor(loader, gameVersion),
+      scanServerLoaderRequirements(serverId)
+    ]);
+
+    // Annotate every build with the verdict from the installed mods, so the
+    // picker can show *why* an option is unavailable instead of hiding it.
+    const versions = catalog.versions.map((entry) => {
+      const verdict = evaluateLoaderCandidate(scan, entry.version);
+      return {
+        ...entry,
+        conflicts: verdict.conflicts,
+        current: entry.version === currentLoaderVersion,
+        satisfiesInstalledMods: verdict.compatible
+      };
+    });
+
+    const recommended =
+      versions.find((entry) => entry.satisfiesInstalledMods && entry.recommended) ||
+      versions.find((entry) => entry.satisfiesInstalledMods && entry.stable) ||
+      versions.find((entry) => entry.satisfiesInstalledMods) ||
+      null;
+
+    return {
+      options: {
+        currentLoaderVersion,
+        gameVersion,
+        loader,
+        loaderVersioned: true,
+        // The per-mod metadata stays out of the response: the picker needs the
+        // floor and the conflicts, not every mod's full manifest.
+        modScan: {
+          floor: scan.floor,
+          scannedMods: scan.mods.length,
+          supported: scan.supported,
+          unreadable: scan.unreadable
+        },
+        recommendedLoaderVersion: recommended ? recommended.version : null,
+        versions
+      },
+      scan
+    };
+  }
+
+  async function getLoaderVersionOptions(serverId, requestedGameVersion) {
+    return (await buildLoaderCatalog(serverId, requestedGameVersion)).options;
+  }
+
+  function describeVersionDirection(fromVersion, toVersion) {
+    if (!fromVersion || !toVersion || fromVersion === toVersion) {
+      return "unchanged";
+    }
+    return compareVersions(toVersion, fromVersion) > 0 ? "upgrade" : "downgrade";
+  }
+
+  async function planServerRuntimeUpdate(serverId, targetVersion, options = {}) {
+    const server = await getServer(serverId);
+    if (!server) {
+      throw new Error("Server not found.");
+    }
+
+    const currentVersion = server.minecraftVersion || "";
+    const currentLoaderVersion = (server.managedRuntime && server.managedRuntime.loaderVersion) || null;
     const support = await getServerUpdateSupport(serverId);
     if (!support.supported) {
       return {
-        currentVersion: server.minecraftVersion || "",
+        adoptable: support.adoptable === true,
+        currentLoaderVersion,
+        currentVersion,
         reason: support.reason,
         runtimeKind: support.runtimeKind,
         supported: false,
-        targetVersion: targetVersion || server.minecraftVersion || ""
+        targetVersion: targetVersion || currentVersion
       };
     }
 
-    if (support.runtimeKind === "vanilla") {
-      const runtime = await resolveVanillaRuntime(targetVersion || server.minecraftVersion || "latest");
+    const requestedLoaderVersion = String(options.loaderVersion || "").trim();
+
+    if (support.runtimeKind === "vanilla" || support.runtimeKind === "paper" || support.runtimeKind === "purpur") {
+      const runtime =
+        support.runtimeKind === "vanilla"
+          ? await resolveVanillaRuntime(targetVersion || currentVersion || "latest")
+          : support.runtimeKind === "paper"
+            ? await resolvePaperRuntime("paper", targetVersion || currentVersion)
+            : await resolvePurpurRuntime(targetVersion || currentVersion);
+
       return {
-        currentVersion: server.minecraftVersion || "",
+        currentLoaderVersion,
+        currentVersion,
         downloadUrl: runtime.downloadUrl,
-        runtimeKind: "vanilla",
-        sha1: runtime.sha1,
-        source: "mojang",
+        loaderVersion: null,
+        loaderVersioned: false,
+        mode: "version",
+        runtimeKind: support.runtimeKind,
+        sha1: runtime.sha1 || null,
+        source: runtime.source || "mojang",
         supported: true,
-        targetVersion: runtime.targetVersion
+        targetVersion: runtime.targetVersion,
+        versionDirection: describeVersionDirection(currentVersion, runtime.targetVersion)
       };
     }
 
-    if (support.runtimeKind === "paper") {
-      const runtime = await resolvePaperRuntime("paper", targetVersion || server.minecraftVersion);
+    // Fabric, Forge and NeoForge: the loader build is a separate axis from the
+    // game version, so both are resolved here and either may move on its own.
+    const resolvedGameVersion = await resolveRequestedReleaseVersion(targetVersion || currentVersion);
+    let catalog;
+    let scan;
+    try {
+      ({ options: catalog, scan } = await buildLoaderCatalog(serverId, resolvedGameVersion));
+    } catch (error) {
       return {
-        currentVersion: server.minecraftVersion || "",
-        downloadUrl: runtime.downloadUrl,
-        runtimeKind: "paper",
-        source: runtime.source,
-        supported: true,
-        targetVersion: runtime.targetVersion
+        currentLoaderVersion,
+        currentVersion,
+        reason: `Unable to list ${displayNameFromSlug(support.runtimeKind)} builds for Minecraft ${resolvedGameVersion}. ${error.message}`,
+        runtimeKind: support.runtimeKind,
+        supported: false,
+        targetVersion: resolvedGameVersion
       };
     }
 
-    if (support.runtimeKind === "purpur") {
-      const runtime = await resolvePurpurRuntime(targetVersion || server.minecraftVersion);
+    if (!catalog.versions.length) {
       return {
-        currentVersion: server.minecraftVersion || "",
-        downloadUrl: runtime.downloadUrl,
-        runtimeKind: "purpur",
-        source: runtime.source,
-        supported: true,
-        targetVersion: runtime.targetVersion
+        currentLoaderVersion,
+        currentVersion,
+        reason: `${displayNameFromSlug(support.runtimeKind)} has no published build for Minecraft ${resolvedGameVersion}.`,
+        runtimeKind: support.runtimeKind,
+        supported: false,
+        targetVersion: resolvedGameVersion
       };
+    }
+
+    // With no explicit pick, take the newest build the installed mods accept -
+    // "the right one" rather than merely the newest.
+    const chosenLoaderVersion =
+      requestedLoaderVersion || catalog.recommendedLoaderVersion || catalog.versions[0].version;
+    const selected = catalog.versions.find((entry) => entry.version === chosenLoaderVersion);
+    if (!selected) {
+      return {
+        currentLoaderVersion,
+        currentVersion,
+        loaderVersions: catalog.versions,
+        reason: `${displayNameFromSlug(support.runtimeKind)} ${chosenLoaderVersion} is not published for Minecraft ${resolvedGameVersion}.`,
+        runtimeKind: support.runtimeKind,
+        supported: false,
+        targetVersion: resolvedGameVersion
+      };
+    }
+
+    // Fabric is applied by swapping the launcher jar, so the plan has to carry
+    // the download for the build that was selected. Forge and NeoForge re-run
+    // their installer at apply time and need no URL here.
+    let downloadUrl = null;
+    if (support.runtimeKind === "fabric") {
+      downloadUrl = (await resolveFabricRuntime(resolvedGameVersion, selected.version)).downloadUrl;
+    }
+
+    const gameVersionChanged = Boolean(resolvedGameVersion) && resolvedGameVersion !== currentVersion;
+    // Reuses the scan the catalog already performed rather than re-reading every
+    // jar. Only meaningful when the game version moves - mods keep running on
+    // the version they were installed for.
+    const minecraftVerdict = gameVersionChanged
+      ? evaluateMinecraftCandidate(scan, resolvedGameVersion)
+      : { compatible: true, conflicts: [] };
+
+    const blockedReasons = [];
+    if (!selected.satisfiesInstalledMods) {
+      blockedReasons.push(
+        `${displayNameFromSlug(support.runtimeKind)} ${selected.version} is rejected by ${selected.conflicts.length} installed mod(s): ${selected.conflicts
+          .map((conflict) => `${conflict.name} needs ${conflict.range}`)
+          .join("; ")}.`
+      );
     }
 
     return {
-      currentVersion: server.minecraftVersion || "",
-      reason: "This runtime type cannot be updated automatically.",
+      blockedReasons,
+      currentLoaderVersion,
+      currentVersion,
+      downloadUrl,
+      loaderConflicts: selected.conflicts,
+      loaderDirection: describeVersionDirection(currentLoaderVersion, selected.version),
+      loaderFloor: scan.floor,
+      loaderVersion: selected.version,
+      loaderVersioned: true,
+      loaderVersions: catalog.versions,
+      minecraftConflicts: minecraftVerdict.conflicts,
+      // A loader-only change leaves every mod file untouched, so it does not
+      // need the add-on re-resolution a game version change does.
+      mode: gameVersionChanged ? "version" : "loader-only",
+      modScan: catalog.modScan,
       runtimeKind: support.runtimeKind,
-      supported: false,
-      targetVersion: targetVersion || server.minecraftVersion || ""
+      source: `${support.runtimeKind} ${selected.version}`,
+      supported: blockedReasons.length === 0,
+      targetVersion: resolvedGameVersion,
+      unsatisfiedByMods: !selected.satisfiesInstalledMods,
+      versionDirection: describeVersionDirection(currentVersion, resolvedGameVersion),
+      ...(blockedReasons.length ? { reason: blockedReasons[0] } : {})
     };
   }
 
@@ -2382,12 +2751,55 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       };
     }
 
+    const previousLoaderVersion = (server.managedRuntime && server.managedRuntime.loaderVersion) || null;
+
+    // Forge and NeoForge ship no runnable jar - their installer lays down a
+    // library tree and an argfile - so a build change means re-running it.
+    if (INSTALLER_LOADERS.has(runtimePlan.runtimeKind)) {
+      const runtime = await createJarManagedRuntime(
+        runtimePlan.runtimeKind,
+        runtimePlan.targetVersion,
+        paths.serverDir,
+        { javaBin: server.javaBin, loaderVersion: runtimePlan.loaderVersion || null }
+      );
+      await setServerMetadata(serverId, {
+        managedRuntime: {
+          kind: runtime.kind,
+          launch: runtime.launch,
+          loaderVersion: runtime.loaderVersion || null,
+          previousLoaderVersion,
+          source: runtime.source,
+          updatedAt: nowIso()
+        },
+        minecraftVersion: runtime.targetVersion,
+        startCommand: DEFAULT_MANAGED_START_COMMAND
+      });
+      // The argfile path embeds the loader version, so the launch script has to
+      // be rewritten alongside the runtime it points at.
+      await fsp.writeFile(
+        paths.managedLaunchScript,
+        buildLaunchScript(server.minMemory, server.maxMemory, runtime.launch),
+        "utf8"
+      );
+      await fsp.chmod(paths.managedLaunchScript, 0o755);
+      await ensureManagedServerArtifacts(serverId, { repairRuntime: false });
+
+      return {
+        loaderVersion: runtime.loaderVersion || null,
+        previousLoaderVersion,
+        runtimeKind: runtimePlan.runtimeKind,
+        targetVersion: runtime.targetVersion
+      };
+    }
+
     await ensureDir(paths.runtimeBackupDir);
     if (await exists(paths.serverJarFile)) {
       const backupBuffer = await fsp.readFile(paths.serverJarFile);
       const backupPath = path.join(
         paths.runtimeBackupDir,
-        `server-${server.loader}-${server.minecraftVersion || "unknown"}-${Date.now()}.jar`
+        `server-${server.loader}-${server.minecraftVersion || "unknown"}${
+          previousLoaderVersion ? `-loader-${previousLoaderVersion}` : ""
+        }-${Date.now()}.jar`
       );
       await fsp.writeFile(backupPath, backupBuffer);
     }
@@ -2398,6 +2810,9 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     await setServerMetadata(serverId, {
       managedRuntime: {
         kind: runtimePlan.runtimeKind,
+        launch: { kind: "jar" },
+        loaderVersion: runtimePlan.loaderVersion || null,
+        previousLoaderVersion,
         source: runtimePlan.source || runtimePlan.runtimeKind,
         updatedAt: nowIso()
       },
@@ -2407,8 +2822,156 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     await ensureManagedServerArtifacts(serverId, { repairRuntime: false });
 
     return {
+      loaderVersion: runtimePlan.loaderVersion || null,
+      previousLoaderVersion,
       runtimeKind: runtimePlan.runtimeKind,
       targetVersion: runtimePlan.targetVersion
+    };
+  }
+
+  // Best-effort read of the loader build a hand-installed server is already
+  // running, so adoption can offer to keep it rather than forcing a move.
+  async function detectInstalledLoaderVersion(serverDir, loader) {
+    if (loader === "fabric") {
+      for (const jarName of ["fabric-server-launch.jar", "server.jar"]) {
+        try {
+          const properties = await readJarTextEntry(path.join(serverDir, jarName), "install.properties");
+          const match = properties && properties.match(/fabric-loader-version\s*=\s*([^\s]+)/);
+          if (match) {
+            return match[1].trim();
+          }
+        } catch {
+          // Not a Fabric launcher jar, or unreadable. Try the library tree.
+        }
+      }
+
+      try {
+        const entries = await fsp.readdir(path.join(serverDir, "libraries", "net", "fabricmc", "fabric-loader"));
+        const versions = entries.filter((entry) => /^\d/.test(entry)).sort(compareVersions);
+        return versions.length ? versions[versions.length - 1] : null;
+      } catch {
+        return null;
+      }
+    }
+
+    if (INSTALLER_LOADERS.has(loader)) {
+      const vendorPath =
+        loader === "forge"
+          ? path.join(serverDir, "libraries", "net", "minecraftforge", "forge")
+          : path.join(serverDir, "libraries", "net", "neoforged", "neoforge");
+      try {
+        const entries = await fsp.readdir(vendorPath);
+        const artifacts = [];
+        for (const entry of entries) {
+          if (await exists(path.join(vendorPath, entry, "unix_args.txt"))) {
+            // Forge artifacts are "<mc>-<forge>"; NeoForge uses its version bare.
+            artifacts.push(loader === "forge" ? entry.split("-").slice(1).join("-") : entry);
+          }
+        }
+        artifacts.sort(compareVersions);
+        return artifacts.length ? artifacts[artifacts.length - 1] : null;
+      } catch {
+        return null;
+      }
+    }
+
+    return null;
+  }
+
+  async function getRuntimeAdoptionPreview(serverId) {
+    const server = await getServer(serverId);
+    if (!server) {
+      throw new Error("Server not found.");
+    }
+
+    const loader = String(server.loader || "vanilla").toLowerCase();
+    const paths = resolveRecordPaths(server);
+    const detectedLoaderVersion = await detectInstalledLoaderVersion(paths.serverDir, loader);
+
+    return {
+      alreadyManaged: Boolean(server.managedRuntime),
+      currentStartCommand: server.startCommand || DEFAULT_EXISTING_START_COMMAND,
+      detectedLoaderVersion,
+      installable: INSTALLABLE_LOADERS.has(loader),
+      loader,
+      minecraftVersion: server.minecraftVersion || ""
+    };
+  }
+
+  /**
+   * Bring a registered-existing server under managed runtime control.
+   *
+   * The server keeps its world, mods and configuration; what changes is that the
+   * dashboard provisions the runtime and owns the launch script from here on.
+   * The original launch script is kept next to the runtime backups, because a
+   * hand-written one may carry flags worth recovering.
+   */
+  async function adoptManagedRuntime(serverId, options = {}) {
+    const server = await getServer(serverId);
+    if (!server) {
+      throw new Error("Server not found.");
+    }
+
+    await ensureServerStopped(serverId);
+
+    const loader = String(server.loader || "vanilla").toLowerCase();
+    if (!INSTALLABLE_LOADERS.has(loader)) {
+      throw userFacingError(
+        `The dashboard cannot provision a ${displayNameFromSlug(loader)} runtime, so this server cannot be adopted. Supported loaders are ${[...INSTALLABLE_LOADERS].join(", ")}.`
+      );
+    }
+
+    const paths = resolveRecordPaths(server);
+    const targetVersion = String(options.minecraftVersion || server.minecraftVersion || "").trim();
+    if (!targetVersion || targetVersion === "unknown") {
+      throw userFacingError(
+        `Set the Minecraft version for ${server.name} in server settings before adopting its runtime - the dashboard needs to know which build to install.`
+      );
+    }
+
+    const detectedLoaderVersion = await detectInstalledLoaderVersion(paths.serverDir, loader);
+    const requestedLoaderVersion = String(options.loaderVersion || "").trim() || detectedLoaderVersion || "";
+
+    // Preserve whatever the operator was launching with before the dashboard
+    // takes over, so nothing about the previous setup is lost.
+    await ensureDir(paths.runtimeBackupDir);
+    const existingScript = path.join(paths.serverDir, "launch-server.sh");
+    if (await exists(existingScript)) {
+      await fsp.copyFile(
+        existingScript,
+        path.join(paths.runtimeBackupDir, `launch-server.adopted-${Date.now()}.sh`)
+      );
+    }
+
+    const runtime = await createJarManagedRuntime(loader, targetVersion, paths.serverDir, {
+      javaBin: server.javaBin,
+      loaderVersion: requestedLoaderVersion || undefined,
+      onProgress: typeof options.onProgress === "function" ? options.onProgress : () => {}
+    });
+
+    await setServerMetadata(serverId, {
+      managedRuntime: {
+        adoptedAt: nowIso(),
+        adoptedFromStartCommand: server.startCommand || DEFAULT_EXISTING_START_COMMAND,
+        kind: runtime.kind,
+        launch: runtime.launch || { kind: "jar" },
+        loaderVersion: runtime.loaderVersion || null,
+        source: runtime.source,
+        updatedAt: nowIso()
+      },
+      minecraftVersion: runtime.targetVersion,
+      startCommand: DEFAULT_MANAGED_START_COMMAND
+    });
+
+    await ensureManagedServerArtifacts(serverId, { repairRuntime: false });
+
+    return {
+      adopted: true,
+      detectedLoaderVersion,
+      loader,
+      loaderVersion: runtime.loaderVersion || null,
+      minecraftVersion: runtime.targetVersion,
+      startCommand: DEFAULT_MANAGED_START_COMMAND
     };
   }
 
@@ -2453,6 +3016,11 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     const worldRules = lockedForUser ? null : await readWorldRules(serverId);
     const logs = lockedForUser ? null : await getServerLog(serverId);
     const updateSupport = user.role === "owner" ? await getServerUpdateSupport(serverId) : null;
+    // Only computed when adoption is actually on offer: it touches the disk, and
+    // the loader build catalog behind the update panel needs the network, so
+    // that stays behind its own route rather than loading on every render.
+    const runtimeAdoption =
+      updateSupport && updateSupport.adoptable ? await getRuntimeAdoptionPreview(serverId) : null;
     const eulaAccepted = await readEulaStatus(serverId);
 
     return {
@@ -2465,6 +3033,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
         permissions: {
           canAccessDangerousSettings: user.role === "owner",
           canManageAddonSettings: !lockedForUser && userCanManageAddons(user, server),
+          canAdoptRuntime: user.role === "owner" && !lockedForUser && Boolean(runtimeAdoption && runtimeAdoption.installable),
           canApplyCombinedUpdates: user.role === "owner" && !lockedForUser && Boolean(updateSupport && updateSupport.supported),
           canCreateWorlds: !lockedForUser && userCanCreateWorld(user, serverId),
           canControlRuntime: !lockedForUser,
@@ -2474,6 +3043,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
           requiresUnlock: lockedForUser,
           unlocked: user.role === "owner" ? true : unlocked
         },
+        runtimeAdoption,
         updateSupport
       },
       logs,
@@ -2503,7 +3073,11 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
   return {
     PAPER_LIKE_LOADERS,
     SAFE_ADMIN_SETTING_DEFINITIONS,
+    adoptManagedRuntime,
     createServer,
+    getLoaderVersionOptions,
+    getRuntimeAdoptionPreview,
+    scanServerLoaderRequirements,
     addServerOperator,
     deleteServer,
     downloadAndInstallFile,

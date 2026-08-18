@@ -3,7 +3,7 @@ import { getApp } from "./dom.js";
 import { LOG_POLL_INTERVAL_MS } from "./logs-config.js";
 import { setNotice } from "./notice.js";
 import { render } from "./render.js";
-import { state } from "./state.js";
+import { state, writeStored } from "./state.js";
 
 let logPollTimer = null;
 let logPollInFlight = false;
@@ -70,7 +70,7 @@ export async function pollLogsOnce() {
     // session expired). Stop hammering it and say so once.
     if (logPollFailures >= 3) {
       state.logAutoRefresh = false;
-      localStorage.setItem("rippermoonstash-log-auto", "off");
+      writeStored("log-auto", "off");
       syncLogPolling();
       setNotice("error", `log auto refresh stopped: ${error.message}`);
     }

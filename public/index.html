@@ -3,15 +3,22 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>RipperMoonStash | Minecraft Server Dashboard</title>
+    <title>RipperCraft | Minecraft Server Dashboard</title>
     <!-- This panel sits behind a login on a LAN box. There is nothing here for a
          crawler to index, so it carries no social or search metadata. -->
     <meta name="robots" content="noindex, nofollow" />
-    <meta name="application-name" content="RipperMoonStash" />
-    <meta name="apple-mobile-web-app-title" content="RipperMoonStash" />
+    <meta name="application-name" content="RipperCraft" />
+    <meta name="apple-mobile-web-app-title" content="RipperCraft" />
     <meta name="theme-color" content="#0f1317" />
     <meta name="format-detection" content="telephone=no" />
-    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <!-- Sized PNGs rather than one large image: browsers pick per context, and
+         the 16/32 variants are cropped tighter so the mark stays readable in a
+         tab strip. favicon.ico covers clients that ask for it by convention. -->
+    <link rel="icon" href="/favicon.ico" sizes="32x32" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
     <link rel="manifest" href="/site.webmanifest" />
     <link rel="stylesheet" href="/styles.css?v=20260810-ui-overhaul" />
   </head>
@@ -30,7 +37,10 @@
     <noscript>
       <main class="auth-shell">
         <section class="auth-panel">
-          <p class="brand-line">RipperMoonStash</p>
+          <p class="brand-line brand-inline brand-line--stacked">
+            <img class="brand-mark brand-mark--auth" src="/logo.png" alt="" width="512" height="404" />
+            <span>RipperCraft</span>
+          </p>
           <h1>JavaScript required</h1>
           <p class="muted copy">Enable JavaScript to use the Minecraft server dashboard.</p>
         </section>

@@ -1,3 +1,28 @@
+// Browser-stored preferences moved from the "rippermoonstash-" prefix when the
+// project was renamed to RipperCraft. Reads fall back to the old key so a
+// returning user keeps their theme and log settings instead of silently being
+// reset; writes only ever use the new key, so the old ones age out on their own.
+const STORAGE_PREFIX = "rippercraft-";
+const LEGACY_STORAGE_PREFIX = "rippermoonstash-";
+
+export function readStored(key) {
+  try {
+    const current = localStorage.getItem(`${STORAGE_PREFIX}${key}`);
+    return current === null ? localStorage.getItem(`${LEGACY_STORAGE_PREFIX}${key}`) : current;
+  } catch {
+    // Private browsing and blocked storage both throw here; defaults are fine.
+    return null;
+  }
+}
+
+export function writeStored(key, value) {
+  try {
+    localStorage.setItem(`${STORAGE_PREFIX}${key}`, value);
+  } catch {
+    // A preference that cannot be persisted still applies for this session.
+  }
+}
+
 export const state = {
   bootstrap: null,
   selectedServerId: null,
@@ -12,17 +37,18 @@ export const state = {
   editingUserId: null,
   createJob: null,
   integrations: null,
-  logAutoRefresh: localStorage.getItem("rippermoonstash-log-auto") !== "off",
+  logAutoRefresh: readStored("log-auto") !== "off",
   modUpdates: null,
-  logOrder: localStorage.getItem("rippermoonstash-log-order") === "newest" ? "newest" : "oldest",
+  logOrder: readStored("log-order") === "newest" ? "newest" : "oldest",
   javaRuntimes: [],
+  loaderOptions: null,
   manualDownload: null,
   modProvider: "modrinth",
   modQuery: "",
   modResults: [],
   navOpen: false,
   notice: null,
-  theme: localStorage.getItem("rippermoonstash-theme") || "dark",
+  theme: readStored("theme") || "dark",
   updatePlan: null,
   versionCatalog: null,
   resettingUserId: null
@@ -34,6 +60,7 @@ export const state = {
 // itself to server B, and clicking "update" on B's list posts A's filename to
 // B. Switching servers has to clear the lot.
 export function resetServerScopedState() {
+  state.loaderOptions = null;
   state.manualDownload = null;
   state.modQuery = "";
   state.modResults = [];

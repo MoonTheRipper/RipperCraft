@@ -1,6 +1,6 @@
 {
-  "name": "RipperMoonStash",
-  "short_name": "RipperMoonStash",
+  "name": "RipperCraft",
+  "short_name": "RipperCraft",
   "description": "A minimal Minecraft server dashboard for managing servers, worlds, mods, logs, and admin access.",
   "start_url": "/",
   "display": "standalone",
@@ -8,10 +8,22 @@
   "theme_color": "#0f1317",
   "icons": [
     {
-      "src": "/icon.svg",
-      "sizes": "any",
-      "type": "image/svg+xml",
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
       "purpose": "any"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
     }
   ]
 }

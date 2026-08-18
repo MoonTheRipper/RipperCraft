@@ -4,11 +4,15 @@ const path = require("node:path");
 const CONTENT_TYPES = {
   ".css": "text/css; charset=utf-8",
   ".html": "text/html; charset=utf-8",
+  ".ico": "image/x-icon",
   ".js": "text/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
   ".png": "image/png",
   ".svg": "image/svg+xml",
-  ".txt": "text/plain; charset=utf-8"
+  ".txt": "text/plain; charset=utf-8",
+  // Without this the manifest went out as application/octet-stream, which some
+  // browsers refuse to parse - taking the installable-app metadata with it.
+  ".webmanifest": "application/manifest+json; charset=utf-8"
 };
 
 async function readBody(req) {

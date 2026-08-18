@@ -8,7 +8,7 @@ async function main() {
   const host = process.env.HOST || "0.0.0.0";
   const logger = createLogger(rootDir);
   let shuttingDown = false;
-  logger.info("Starting RipperMoonStash web server", {
+  logger.info("Starting RipperCraft web server", {
     cwd: rootDir,
     node: process.version,
     pid: process.pid
@@ -20,7 +20,7 @@ async function main() {
     process.exitCode = 1;
   });
   server.listen(port, host, () => {
-    logger.info("RipperMoonStash web server listening", {
+    logger.info("RipperCraft web server listening", {
       logFile: path.relative(rootDir, logger.logFile),
       url: `http://${host}:${port}`
     });
@@ -31,9 +31,9 @@ async function main() {
       return;
     }
     shuttingDown = true;
-    logger.info("Shutting down RipperMoonStash web server", { signal });
+    logger.info("Shutting down RipperCraft web server", { signal });
     server.close(() => {
-      logger.info("RipperMoonStash web server stopped");
+      logger.info("RipperCraft web server stopped");
       logger.close();
       process.exit(0);
     });
@@ -48,12 +48,12 @@ async function main() {
   });
 
   process.on("uncaughtException", (error) => {
-    logger.error("Uncaught exception in RipperMoonStash web server", error);
+    logger.error("Uncaught exception in RipperCraft web server", error);
   });
 
   process.on("unhandledRejection", (reason) => {
     logger.error(
-      "Unhandled promise rejection in RipperMoonStash web server",
+      "Unhandled promise rejection in RipperCraft web server",
       reason instanceof Error ? reason : { reason: String(reason) }
     );
   });
@@ -61,7 +61,7 @@ async function main() {
 
 main().catch((error) => {
   const fallbackLogger = createLogger(process.cwd());
-  fallbackLogger.error("Failed to start RipperMoonStash web server", error);
+  fallbackLogger.error("Failed to start RipperCraft web server", error);
   fallbackLogger.close();
   process.exitCode = 1;
 });
