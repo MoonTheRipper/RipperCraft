@@ -9,9 +9,10 @@ const { createWorldManager } = require("./lib/worlds");
 const { createModManager } = require("./lib/mod-sources");
 const { createJobRegistry } = require("./lib/jobs");
 const { clientAddress } = require("./lib/peer");
+const { generateSetupCode, setupCodeBanner, setupCodeMatches } = require("./lib/setup-code");
 const { createAttemptThrottle, createLoginThrottle, describeWait } = require("./lib/throttle");
 const { receiveUpload, resolveUploadLimitBytes } = require("./lib/upload");
-const { exists, withinParent } = require("./lib/utils");
+const { createMutex, exists, withinParent } = require("./lib/utils");
 
 function sanitizeUser(user) {
   if (!user) {
@@ -96,6 +97,36 @@ async function createApp(rootDir = process.cwd(), options = {}) {
   const unlockThrottle = createAttemptThrottle({ now: options.now });
   const uploadLimitBytes = options.uploadLimitBytes || resolveUploadLimitBytes(logger);
 
+  // Creating the owner takes a code that is only ever shown on this process's
+  // standard output. It exists exactly while no owner does: made at start, or
+  // on first need if the accounts file disappears while running, and dropped
+  // the moment an owner is created.
+  let setupCode = null;
+  const createOwnerExclusively = createMutex();
+  const announceSetupCode =
+    options.onSetupCode ||
+    ((code) => {
+      // Straight to stdout, not through the logger: the log file is readable
+      // by other local users, and this code is all it takes to become owner.
+      console.log(setupCodeBanner(code));
+    });
+
+  async function currentSetupCode() {
+    if (await store.hasOwner()) {
+      setupCode = null;
+      return null;
+    }
+    if (!setupCode) {
+      setupCode = generateSetupCode();
+      announceSetupCode(setupCode);
+      logger.info(
+        "No owner account exists. A setup code was printed to standard output (the terminal, or the service journal); the first-run screen asks for it."
+      );
+    }
+    return setupCode;
+  }
+  await currentSetupCode();
+
   async function getContext(req) {
     const session = await sessionManager.getSessionFromRequest(req);
     if (!session) {
@@ -177,7 +208,9 @@ async function createApp(rootDir = process.cwd(), options = {}) {
       appName: appConfig.appName,
       installableLoaders: serverManager.getInstallableLoaders(),
       loggedIn: Boolean(context.user),
-      needsSetup: !(await store.hasUsers()),
+      // Setup is needed while there is no owner. Asking also makes sure a code
+      // has been issued for it; the code itself never leaves the server.
+      needsSetup: (await currentSetupCode()) !== null,
       passwordMinLength: PASSWORD_MIN_LENGTH,
       providers: await modManager.providerAvailability(),
       uploadLimitBytes,
@@ -340,12 +373,22 @@ async function createApp(rootDir = process.cwd(), options = {}) {
       }
 
       if (req.method === "POST" && url.pathname === "/api/setup-owner") {
-        if (await store.hasUsers()) {
+        const expectedCode = await currentSetupCode();
+        if (!expectedCode) {
           json(res, 409, { error: "Initial setup is already complete." });
           return;
         }
 
         const body = await parseJsonBody(req);
+        // Before anything else is looked at, and before any password is hashed.
+        if (!setupCodeMatches(expectedCode, body.setupCode)) {
+          logger.warn("Owner setup refused: missing or wrong setup code", { address: clientAddress(req).address });
+          json(res, 403, {
+            error:
+              "The setup code is missing or wrong. It is printed in the terminal, or the service journal, each time RipperCraft starts without an owner account."
+          });
+          return;
+        }
         if (isBlank(body.username) || isBlank(body.password)) {
           json(res, 400, { error: "Username and password are required." });
           return;
@@ -356,14 +399,36 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           return;
         }
 
-        const owner = await store.createUser({
-          username: String(body.username).trim(),
-          displayName: String(body.displayName || body.username).trim(),
-          passwordHash: await hashSecret(String(body.password)),
-          permissions: normalizeUserPermissions(body.permissions),
-          role: "owner",
-          servers: []
+        // One at a time: two requests that both passed the checks above must
+        // not both create an owner.
+        const ownerUsername = String(body.username).trim();
+        const outcome = await createOwnerExclusively(async () => {
+          const users = await store.getUsers();
+          if (users.some((user) => user.role === "owner")) {
+            return { error: "Initial setup is already complete." };
+          }
+          if (users.some((user) => user.username.toLowerCase() === ownerUsername.toLowerCase())) {
+            return { error: "That username already exists." };
+          }
+          const created = await store.createUser({
+            username: ownerUsername,
+            displayName: String(body.displayName || body.username).trim(),
+            passwordHash: await hashSecret(String(body.password)),
+            permissions: normalizeUserPermissions(body.permissions),
+            role: "owner",
+            servers: []
+          });
+          setupCode = null;
+          return { owner: created };
         });
+        if (!outcome.owner) {
+          json(res, 409, { error: outcome.error });
+          return;
+        }
+        const owner = outcome.owner;
+        logger.info("Owner account created; the setup code is no longer valid", { username: owner.username });
+        // This address has just signed in as the owner, in effect.
+        loginThrottle.remember({ address: clientAddress(req).address, username: owner.username });
 
         const session = await sessionManager.createSession(owner.id);
         json(

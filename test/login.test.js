@@ -529,3 +529,22 @@ test("wrong server passphrases are limited per account and per server", async (t
   }
   assert.equal((await unlock(lane, "lane-secret")).status, 200);
 });
+
+test("the address the owner was created from counts as one that has signed in", async (t) => {
+  const now = clock();
+  const app = await startApp(t, { app: { now } });
+  // First-run setup through the tunnel, from the owner's home address.
+  const created = await app.request({
+    headers: { "CF-Connecting-IP": "203.0.113.50" },
+    json: { password: OWNER_PASSWORD, setupCode: app.setupCodes[0], username: "owner" },
+    method: "POST",
+    path: "/api/setup-owner"
+  });
+  assert.equal(created.status, 201);
+
+  for (let index = 1; index <= 12; index += 1) {
+    await loginFrom(app, `198.51.100.${index}`, "owner", "from-a-list");
+  }
+  assert.equal((await loginFrom(app, "198.51.100.99", "owner", OWNER_PASSWORD)).status, 429);
+  assert.equal((await loginFrom(app, "203.0.113.50", "owner", OWNER_PASSWORD)).status, 200);
+});

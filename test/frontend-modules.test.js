@@ -712,3 +712,86 @@ test("the brand mark is decorative and sized so the rail cannot be stretched", a
   assert.match(markup, /width="512"/);
   assert.match(markup, /height="404"/);
 });
+
+test("the first-run screen asks for the setup code and the login screen does not", async (t) => {
+  const { state } = await load(path.join(jsRoot, "state.js"));
+  const { renderAuth } = await load(path.join(jsRoot, "views", "auth.js"));
+  const saved = { bootstrap: state.bootstrap, notice: state.notice };
+  t.after(() => Object.assign(state, saved));
+  state.notice = null;
+  state.bootstrap = { needsSetup: true, passwordMinLength: 12 };
+
+  const setup = renderAuth("Create the Owner Account", "setup");
+  assert.match(setup, /<form data-form="setup"/);
+  // The field the server reads, required, and not something to autofill or autocorrect.
+  const codeField = /<input\s+name="setupCode"[^>]*>/.exec(setup);
+  assert.ok(codeField, "no setup code field");
+  assert.match(codeField[0], /\brequired\b/);
+  assert.match(codeField[0], /autocomplete="off"/);
+  assert.match(codeField[0], /spellcheck="false"/);
+  assert.match(setup, /Printed in the terminal, or the service journal/);
+  // It comes before the account fields: nothing else matters without it.
+  assert.ok(setup.indexOf('name="setupCode"') < setup.indexOf('name="username"'));
+
+  const login = renderAuth("Are You Worthy", "login");
+  assert.match(login, /<form data-form="login"/);
+  assert.equal(login.includes("setupCode"), false);
+  assert.equal(login.includes("Setup Code"), false);
+});
+
+test("the password minimum is mirrored where a password is set, and only there", async (t) => {
+  const { state } = await load(path.join(jsRoot, "state.js"));
+  const { renderAuth } = await load(path.join(jsRoot, "views", "auth.js"));
+  const saved = { bootstrap: state.bootstrap, notice: state.notice };
+  t.after(() => Object.assign(state, saved));
+  state.notice = null;
+
+  state.bootstrap = { needsSetup: true, passwordMinLength: 12 };
+  const setup = renderAuth("Create the Owner Account", "setup");
+  assert.match(setup, /<input type="password" name="password" autocomplete="new-password" minlength="12" required \/>/);
+  assert.match(setup, /At least 12 characters\./);
+
+  // The number is the server's, not a second copy kept in the page.
+  state.bootstrap = { needsSetup: true, passwordMinLength: 16 };
+  assert.match(renderAuth("Create the Owner Account", "setup"), /minlength="16"/);
+  // An older server that does not say still gets the current rule.
+  state.bootstrap = { needsSetup: true };
+  assert.match(renderAuth("Create the Owner Account", "setup"), /minlength="12"/);
+
+  // Logging in must not be held to it: passwords set before the rule are shorter.
+  state.bootstrap = { needsSetup: false, passwordMinLength: 12 };
+  const login = renderAuth("Are You Worthy", "login");
+  assert.match(login, /<input type="password" name="password" autocomplete="current-password" required \/>/);
+  assert.equal(login.includes("minlength"), false);
+});
+
+test("the login and first-run screens show the notice, escaped", async (t) => {
+  const { state } = await load(path.join(jsRoot, "state.js"));
+  const { renderAuth } = await load(path.join(jsRoot, "views", "auth.js"));
+  const saved = { bootstrap: state.bootstrap, notice: state.notice };
+  t.after(() => Object.assign(state, saved));
+  state.bootstrap = { needsSetup: false, passwordMinLength: 12 };
+
+  state.notice = null;
+  assert.equal(renderAuth("Are You Worthy", "login").includes("notice"), false);
+
+  // A wrong password used to change nothing on screen: the banner only existed
+  // inside the logged-in shell.
+  state.notice = { message: "Too many failed login attempts. Try again in 15 minutes.", type: "error" };
+  for (const mode of ["login", "setup"]) {
+    const markup = renderAuth("title", mode);
+    assert.ok(
+      markup.includes(
+        '<div class="notice notice--error" aria-hidden="true">Too many failed login attempts. Try again in 15 minutes.</div>'
+      ),
+      mode
+    );
+  }
+
+  state.notice = { message: '<img src=x onerror="alert(1)">', type: 'error" onmouseover="alert(1)' };
+  const hostile = renderAuth("Are You Worthy", "login");
+  // (The page has an <img> of its own, the brand mark; this one must not join it.)
+  assert.equal(hostile.includes("<img src=x"), false);
+  assert.equal(hostile.includes('onmouseover="alert(1)"'), false);
+  assert.ok(hostile.includes("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;"));
+});
