@@ -49,3 +49,21 @@ On first launch:
 - For Fabric, Forge, NeoForge, Quilt, Paper, or Purpur servers that already exist on disk, register the existing folder and set the matching loader in Settings so search/install targets the right add-on directory.
 - Server records are stored relative to this project root, so the folder can be copied to another machine without keeping the old absolute paths.
 - Managed launchers work on macOS and Linux. If Java is not already on `PATH`, set `JAVA_HOME` or `RIPPERMOONSTASH_JAVA_BIN` before starting the dashboard.
+
+## Running it as a service
+
+`infra/systemd/rippercraft.service` is written for one particular machine: a checkout at
+`/home/ripper-moon/minecraft-server`, run by the user `ripper-moon` with Node from nvm.
+Change `User`, `Group`, `WorkingDirectory` and the Node paths to match yours before
+installing it. The same goes for the units under `infra/hosting/systemd/`.
+
+To reach the dashboard from outside your home network, see `infra/free-hosting/` (Cloudflare
+Tunnel and playit.gg, no server to rent) or `infra/hosting/` (a small VPS in front). Your own
+values go in the files those guides tell you to create; git ignores them.
+
+## Licence
+
+The code is under the [MIT licence](LICENSE). The RipperCraft logo is not: see
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
+NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.

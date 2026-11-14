@@ -4,8 +4,8 @@ This is the zero-server-rental version.
 
 It cannot do everything the VPS design can do, but it can meet the important parts:
 
-- Admin web GUI at `https://rippermoonstash.com` with no router port forwarding.
-- Minecraft Java servers at `servername.rippermoonstash.com` with no remembered ports.
+- Admin web GUI at `https://example.com` with no router port forwarding.
+- Minecraft Java servers at `servername.example.com` with no remembered ports.
 - No VPN for players.
 - No VPS.
 
@@ -18,12 +18,12 @@ Use two free tunnel systems:
 
 ```text
 Admin browser
-  -> https://rippermoonstash.com
+  -> https://example.com
   -> Cloudflare Tunnel
   -> this machine:4300
 
 Minecraft Java player
-  -> servername.rippermoonstash.com
+  -> servername.example.com
   -> Porkbun SRV record
   -> playit.gg tunnel host:port
   -> this machine:<local server port>
@@ -33,7 +33,7 @@ Minecraft Java player
 
 There is no fully free, clean way to make arbitrary raw TCP services on your own domain work exactly like a VPS edge.
 
-The workaround for Minecraft Java is DNS `SRV` records. Minecraft Java checks `_minecraft._tcp.<hostname>` and learns the real host and port from DNS. Players still type only `servername.rippermoonstash.com`.
+The workaround for Minecraft Java is DNS `SRV` records. Minecraft Java checks `_minecraft._tcp.<hostname>` and learns the real host and port from DNS. Players still type only `servername.example.com`.
 
 This is Java Edition only. Bedrock does not use this SRV setup.
 
@@ -41,19 +41,19 @@ This is Java Edition only. Bedrock does not use this SRV setup.
 
 Cloudflare Tunnel is free on all plans and uses outbound-only connections, so your router needs no port forwarding.
 
-You will need to use Cloudflare DNS for `rippermoonstash.com`. The domain can stay registered at Porkbun; just change the nameservers at Porkbun to Cloudflare's nameservers.
+You will need to use Cloudflare DNS for `example.com`. The domain can stay registered at Porkbun; just change the nameservers at Porkbun to Cloudflare's nameservers.
 
 High-level steps:
 
 1. Create a free Cloudflare account.
-2. Add `rippermoonstash.com` to Cloudflare.
+2. Add `example.com` to Cloudflare.
 3. In Porkbun, change the domain nameservers to the two Cloudflare nameservers.
 4. Install `cloudflared` on this machine.
 5. Create a tunnel and publish:
 
 ```text
-rippermoonstash.com -> http://localhost:4300
-www.rippermoonstash.com -> http://localhost:4300
+example.com -> http://localhost:4300
+www.example.com -> http://localhost:4300
 ```
 
 Use `infra/free-hosting/cloudflared.config.example.yml` as the local config shape.
@@ -66,8 +66,8 @@ Create one playit Minecraft Java tunnel per local server:
 
 | Server | Local port |
 | --- | --- |
-| CultOfTheRipper | 31001 |
-| AbsoluteChads | 31002 |
+| Survival | 31001 |
+| Creative | 31002 |
 
 After creating each tunnel, playit will give you a public host and port. Put those into:
 
@@ -84,26 +84,26 @@ node infra/free-hosting/scripts/generate-porkbun-srv-plan.js
 Open:
 
 ```text
-infra/free-hosting/generated/PORKBUN_SRV_RECORDS.md
+infra/free-hosting/generated/MINECRAFT_SRV_RECORDS.md
 ```
 
 and create those SRV records in Porkbun DNS.
 
 ## Porkbun SRV Record Shape
 
-For `cultoftheripper.rippermoonstash.com`, create:
+For `survival.example.com`, create:
 
 ```text
 Type: SRV
-Host: _minecraft._tcp.cultoftheripper
+Host: _minecraft._tcp.survival
 Answer/Value: 1 1 PLAYIT_PORT PLAYIT_HOST
 ```
 
-For `absolutechads.rippermoonstash.com`, create:
+For `creative.example.com`, create:
 
 ```text
 Type: SRV
-Host: _minecraft._tcp.absolutechads
+Host: _minecraft._tcp.creative
 Answer/Value: 1 1 PLAYIT_PORT PLAYIT_HOST
 ```
 

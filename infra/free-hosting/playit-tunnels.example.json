@@ -1,13 +1,13 @@
 {
-  "domain": "rippermoonstash.com",
+  "domain": "example.com",
   "servers": {
-    "CultOfTheRipper": {
+    "Survival": {
       "publicHost": "replace-with-playit-host.example.playit.gg",
       "publicPort": 12345,
       "priority": 1,
       "weight": 1
     },
-    "AbsoluteChads": {
+    "Creative": {
       "publicHost": "replace-with-playit-host.example.playit.gg",
       "publicPort": 23456,
       "priority": 1,

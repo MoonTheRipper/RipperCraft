@@ -12,8 +12,8 @@ master lives at `src/RipperCraftLogo.png`; everything served from `public/`
 it by `scripts/generate-brand-assets.py`. Re-run that script after replacing the
 master and commit what it writes.
 
-The logo is not covered by whatever license this project ships under unless the
-owner says so — anyone forking should replace it with their own mark.
+The logo is not covered by the project's MIT licence: the code is free to reuse,
+the mark is not. Anyone forking should replace it with their own.
 
 ## Pixelarticons
 

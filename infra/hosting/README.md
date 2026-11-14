@@ -1,9 +1,9 @@
-# RipperMoonStash Hosting Plan
+# RipperCraft Hosting Plan
 
 This design gives you:
 
-- `rippermoonstash.com` for the admin web GUI.
-- `servername.rippermoonstash.com` for Minecraft Java servers.
+- `example.com` for the admin web GUI.
+- `servername.example.com` for Minecraft Java servers.
 - No router port forwarding to the home server.
 - No player VPN requirement.
 - Random/local Minecraft backend ports that do not matter to players.
@@ -14,14 +14,14 @@ Use a small public VPS as the edge:
 
 ```text
 Players
-  -> servername.rippermoonstash.com:25565
+  -> servername.example.com:25565
   -> VPS Velocity proxy
   -> VPS 127.0.0.1:26xxx
   -> frp outbound tunnel
   -> home game server 127.0.0.1:<actual Minecraft port>
 
 Admins
-  -> https://rippermoonstash.com
+  -> https://example.com
   -> VPS Caddy
   -> VPS 127.0.0.1:4300
   -> frp outbound tunnel
@@ -38,11 +38,11 @@ The home router needs no inbound port forwards.
 
 ## Why DNS Alone Is Not Enough
 
-DNS can point `server.rippermoonstash.com` to an IP, but Minecraft Java traffic is raw TCP. DNS cannot decide which local backend port should receive the connection. Velocity handles the Minecraft hostname routing, and frp carries private backend connections from the VPS to your home server.
+DNS can point `server.example.com` to an IP, but Minecraft Java traffic is raw TCP. DNS cannot decide which local backend port should receive the connection. Velocity handles the Minecraft hostname routing, and frp carries private backend connections from the VPS to your home server.
 
 ## Porkbun DNS
 
-Create records for `rippermoonstash.com`:
+Create records for `example.com`:
 
 | Type | Host | Answer |
 | --- | --- | --- |
