@@ -8,6 +8,8 @@ const { createServerManager } = require("./lib/servers");
 const { createWorldManager } = require("./lib/worlds");
 const { createModManager } = require("./lib/mod-sources");
 const { createJobRegistry } = require("./lib/jobs");
+const { clientAddress } = require("./lib/peer");
+const { createAttemptThrottle, createLoginThrottle, describeWait } = require("./lib/throttle");
 const { exists, withinParent } = require("./lib/utils");
 
 function sanitizeUser(user) {
@@ -88,6 +90,9 @@ async function createApp(rootDir = process.cwd(), options = {}) {
   });
   const jobs = createJobRegistry();
   const publicRoot = path.join(rootDir, "public");
+  // The numbers and the reasoning behind them are in lib/throttle.js.
+  const loginThrottle = createLoginThrottle({ now: options.now });
+  const unlockThrottle = createAttemptThrottle({ now: options.now });
 
   async function getContext(req) {
     const session = await sessionManager.getSessionFromRequest(req);
@@ -111,6 +116,18 @@ async function createApp(rootDir = process.cwd(), options = {}) {
     }
     json(res, 401, { error: "Login required." });
     return false;
+  }
+
+  function respondTooManyAttempts(res, attempt, what) {
+    json(
+      res,
+      429,
+      {
+        error: `${what} Try again in ${describeWait(attempt.retryAfterSeconds)}.`,
+        retryAfterSeconds: attempt.retryAfterSeconds
+      },
+      { "Retry-After": String(attempt.retryAfterSeconds) }
+    );
   }
 
   function ensureOwner(res, context) {
@@ -360,20 +377,47 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         const body = await parseJsonBody(req);
         const username = String(body.username || "").trim().toLowerCase();
         const password = String(body.password || "");
-        const users = await store.getUsers();
-        const user = users.find((item) => item.username.toLowerCase() === username);
 
-        // The same derivations run whether or not the account exists, so the
-        // answer and the time it takes say nothing about the username.
-        const verified = await verifyAccountSecret(
-          password,
-          user ? user.passwordHash : null,
-          users.map((item) => item.passwordHash)
-        );
+        // Counted against the address and the username exactly as typed, real
+        // account or not, so being refused says nothing about the username.
+        const visitor = clientAddress(req);
+        const attempt = loginThrottle.begin({ address: visitor.address, local: visitor.local, username });
+        if (!attempt.allowed) {
+          logger.warn("Login refused after too many failed attempts", {
+            address: visitor.address,
+            limit: attempt.scope,
+            retryAfterSeconds: attempt.retryAfterSeconds
+          });
+          respondTooManyAttempts(res, attempt, "Too many failed login attempts.");
+          return;
+        }
+
+        let user = null;
+        let verified = false;
+        try {
+          const users = await store.getUsers();
+          user = users.find((item) => item.username.toLowerCase() === username) || null;
+          // The same derivations run whether or not the account exists, so the
+          // answer and the time it takes say nothing about the username.
+          verified = await verifyAccountSecret(
+            password,
+            user ? user.passwordHash : null,
+            users.map((item) => item.passwordHash)
+          );
+        } catch (error) {
+          // The password was never checked, so this is not a failed guess.
+          attempt.cancelled();
+          throw error;
+        }
         if (!user || !verified) {
+          attempt.failed();
+          // Only a real account's name is logged: whatever else was typed into
+          // the username field may well be somebody's password.
+          logger.warn("Login failed", { address: visitor.address, ...(user ? { username: user.username } : {}) });
           json(res, 401, { error: "Invalid username or password." });
           return;
         }
+        attempt.succeeded();
 
         if (needsRehash(user.passwordHash)) {
           // The password is known to be right at this moment, which is the only
@@ -534,12 +578,33 @@ async function createApp(rootDir = process.cwd(), options = {}) {
             return;
           }
 
-          const body = await parseJsonBody(req);
-          const valid = await serverManager.verifyServerPassphrase(serverId, body.passphrase || "");
+          // The passphrase is one secret shared by every admin of the server,
+          // so it gets the same limit as a password: per account, per server.
+          const attempt = unlockThrottle.begin(`${context.user.id}|${serverId}`);
+          if (!attempt.allowed) {
+            logger.warn("Server unlock refused after too many wrong passphrases", {
+              actor: context.user.username,
+              retryAfterSeconds: attempt.retryAfterSeconds,
+              serverId
+            });
+            respondTooManyAttempts(res, attempt, "Too many wrong passphrases for this server.");
+            return;
+          }
+
+          let valid = false;
+          try {
+            const body = await parseJsonBody(req);
+            valid = await serverManager.verifyServerPassphrase(serverId, String(body.passphrase || ""));
+          } catch (error) {
+            attempt.cancelled();
+            throw error;
+          }
           if (!valid) {
+            attempt.failed();
             json(res, 403, { error: "Passphrase did not match." });
             return;
           }
+          attempt.succeeded();
           const unlockedUntil = await sessionManager.unlockServer(context.session, serverId);
           json(res, 200, { unlocked: true, unlockedUntil });
           return;
