@@ -6,3 +6,10 @@ servers/*
 *.log
 .DS_Store
 .codex
+
+# Your own hosting setup: real domain, server names and tunnel addresses.
+# The *.example.* files next to them show the shape.
+infra/free-hosting/playit-tunnels.json
+infra/hosting/hosting.config.json
+infra/*/generated/
+contex/

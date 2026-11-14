@@ -1,6 +1,6 @@
 {
-  "domain": "rippermoonstash.com",
-  "adminHost": "rippermoonstash.com",
+  "domain": "example.com",
+  "adminHost": "example.com",
   "frpServerAddr": "YOUR_VPS_PUBLIC_IP_OR_HOSTNAME",
   "frpServerPort": 7000,
   "dashboardLocalPort": 4300,
@@ -8,5 +8,5 @@
   "localMinecraftPortBase": 31000,
   "localRconPortBase": 32000,
   "minecraftRemotePortBase": 26000,
-  "defaultServer": "CultOfTheRipper"
+  "defaultServer": "Survival"
 }
