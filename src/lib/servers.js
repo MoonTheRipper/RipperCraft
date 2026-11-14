@@ -2453,7 +2453,8 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     const paths = resolveRecordPaths(server);
     const fullPath = path.join(paths.worldLibraryDir, safeFilename(archiveName));
     if (!withinParent(paths.worldLibraryDir, fullPath)) {
-      throw new Error("Invalid archive path.");
+      // A name such as ".." - the caller's mistake, not a server fault.
+      throw userFacingError("Invalid archive path.", 400);
     }
     return fullPath;
   }

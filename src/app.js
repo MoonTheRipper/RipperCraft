@@ -3,16 +3,25 @@ const path = require("node:path");
 const fs = require("node:fs/promises");
 const { createStore } = require("./lib/store");
 const { createSessionManager, hashSecret, needsRehash, verifyAccountSecret } = require("./lib/auth");
-const { closeAfterUnreadBody, json, noContent, parseJsonBody, sendFile, sendStream } = require("./lib/http");
+const {
+  HttpError,
+  applySecurityHeaders,
+  closeAfterUnreadBody,
+  json,
+  noContent,
+  parseJsonBody,
+  sendFile,
+  staticFileHeaders
+} = require("./lib/http");
 const { createServerManager } = require("./lib/servers");
 const { createWorldManager } = require("./lib/worlds");
 const { createModManager } = require("./lib/mod-sources");
 const { createJobRegistry } = require("./lib/jobs");
-const { clientAddress } = require("./lib/peer");
+const { clientAddress, isHttpsRequest } = require("./lib/peer");
 const { generateSetupCode, setupCodeBanner, setupCodeMatches } = require("./lib/setup-code");
 const { createAttemptThrottle, createLoginThrottle, describeWait } = require("./lib/throttle");
 const { receiveUpload, resolveUploadLimitBytes } = require("./lib/upload");
-const { createMutex, exists, withinParent } = require("./lib/utils");
+const { createMutex, exists, readEnv, withinParent } = require("./lib/utils");
 
 function sanitizeUser(user) {
   if (!user) {
@@ -62,6 +71,41 @@ function normalizeUserPermissions(rawPermissions) {
   };
 }
 
+// Methods that only read. Everything else can change something, and is held to
+// the cross-site checks below.
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+function requestMediaType(req) {
+  return String(req.headers["content-type"] || "")
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
+}
+
+// Origins to accept besides the one in the Host header, from
+// RIPPERCRAFT_TRUSTED_ORIGINS: a comma-separated list such as
+// "https://example.com,https://www.example.com". Only needed behind a reverse
+// proxy that rewrites the Host header on its way here.
+function parseTrustedOrigins(value, logger) {
+  const origins = new Set();
+  for (const entry of String(value || "").split(",")) {
+    const text = entry.trim();
+    if (!text) {
+      continue;
+    }
+    try {
+      const parsed = new URL(text);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        throw new Error("not http(s)");
+      }
+      origins.add(parsed.origin);
+    } catch {
+      logger.warn("Ignoring an entry in TRUSTED_ORIGINS that is not an http(s) origin", { entry: text });
+    }
+  }
+  return origins;
+}
+
 function normalizeServerList(value) {
   return Array.isArray(value) ? [...new Set(value.filter(Boolean).map(String))] : [];
 }
@@ -96,6 +140,10 @@ async function createApp(rootDir = process.cwd(), options = {}) {
   const loginThrottle = createLoginThrottle({ now: options.now });
   const unlockThrottle = createAttemptThrottle({ now: options.now });
   const uploadLimitBytes = options.uploadLimitBytes || resolveUploadLimitBytes(logger);
+  const trustedOrigins = parseTrustedOrigins(
+    options.trustedOrigins === undefined ? readEnv("TRUSTED_ORIGINS") : options.trustedOrigins,
+    logger
+  );
 
   // Creating the owner takes a code that is only ever shown on this process's
   // standard output. It exists exactly while no owner does: made at start, or
@@ -149,6 +197,60 @@ async function createApp(rootDir = process.cwd(), options = {}) {
     }
     json(res, 401, { error: "Login required." });
     return false;
+  }
+
+  // A browser attaches Origin to every cross-site request that can change
+  // anything, and it cannot be forged from a page. When it is present it has to
+  // name this dashboard: the host the request was addressed to, or an origin
+  // the operator listed. A request with no Origin did not come from another
+  // site's page - it is curl, a script, or this page on an old browser.
+  //
+  // Only hosts are compared, not schemes: behind a tunnel the dashboard is
+  // spoken to in plain HTTP and cannot know for certain what the visitor used.
+  function originIsOurs(req) {
+    const origin = req.headers.origin;
+    if (origin === undefined) {
+      return true;
+    }
+    let parsed;
+    try {
+      parsed = new URL(origin);
+    } catch {
+      // "null" (a sandboxed frame, a file) and anything unparseable.
+      return false;
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return false;
+    }
+    if (trustedOrigins.has(parsed.origin)) {
+      return true;
+    }
+    if (!req.headers.host) {
+      return false;
+    }
+    try {
+      // Parsed the same way, so case and default ports compare equal.
+      return new URL(`${parsed.protocol}//${req.headers.host}`).host === parsed.host;
+    } catch {
+      return false;
+    }
+  }
+
+  // The cookie is SameSite=Lax, which already keeps it off cross-site POSTs in
+  // current browsers. This is the second line: a form on another site can only
+  // send urlencoded, multipart or text/plain bodies, so insisting on JSON makes
+  // the request one a foreign page cannot produce without a CORS preflight,
+  // which is never granted here. Bodyless calls are held to it too.
+  function ensureJsonContentType(req, res) {
+    if (requestMediaType(req) === "application/json") {
+      return true;
+    }
+    json(res, 415, { error: "Send this request with Content-Type: application/json." });
+    return false;
+  }
+
+  function sessionCookieOptions(req) {
+    return { secure: isHttpsRequest(req) };
   }
 
   function respondTooManyAttempts(res, attempt, what) {
@@ -311,25 +413,32 @@ async function createApp(rootDir = process.cwd(), options = {}) {
     // directly.
     const requestedPath = pathname === "/" ? "/index.html" : pathname;
     const targetPath = path.resolve(publicRoot, `.${requestedPath}`);
-    if (withinParent(publicRoot, targetPath) && (await exists(targetPath))) {
-      sendFile(res, targetPath);
-      return true;
+    if (withinParent(publicRoot, targetPath)) {
+      if (await sendFile(res, targetPath, staticFileHeaders(targetPath))) {
+        return;
+      }
+      if (await exists(targetPath)) {
+        // Something is there, but not a file to serve: a directory such as
+        // /js. The page fallback below is for app routes, not for this.
+        logRouteMiss("static", { method: "GET" }, pathname);
+        json(res, 404, { error: "Not found." });
+        return;
+      }
     }
 
     const fallback = path.join(publicRoot, "index.html");
-    if (await exists(fallback) && !pathname.includes(".")) {
-      sendFile(res, fallback);
-      return true;
+    if (!pathname.includes(".") && (await sendFile(res, fallback, staticFileHeaders(fallback)))) {
+      return;
     }
 
     logRouteMiss("static", { method: "GET" }, pathname);
     json(res, 404, { error: "Not found." });
-    return true;
   }
 
   return http.createServer(async (req, res) => {
     const startedAt = Date.now();
     const requestPath = req.url || "/";
+    applySecurityHeaders(res);
     closeAfterUnreadBody(req, res);
     res.on("finish", () => {
       logger.info("HTTP request completed", {
@@ -341,8 +450,12 @@ async function createApp(rootDir = process.cwd(), options = {}) {
     });
 
     try {
-      const url = new URL(req.url || "/", "http://localhost");
-      const context = await getContext(req);
+      let url;
+      try {
+        url = new URL(req.url || "/", "http://localhost");
+      } catch {
+        throw new HttpError(400, "The request URL is not valid.");
+      }
       const segments = url.pathname.split("/").filter(Boolean);
 
       if (!url.pathname.startsWith("/api/")) {
@@ -354,6 +467,23 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         json(res, 404, { error: "Not found." });
         return;
       }
+
+      const changesState = !SAFE_METHODS.has(req.method);
+      if (changesState && !originIsOurs(req)) {
+        logger.warn("Cross-site request refused", {
+          host: req.headers.host,
+          method: req.method,
+          origin: req.headers.origin,
+          path: requestPath
+        });
+        json(res, 403, {
+          error:
+            "This request came from another site and was refused. If RipperCraft is behind a reverse proxy that changes the Host header, list the dashboard's address in RIPPERCRAFT_TRUSTED_ORIGINS."
+        });
+        return;
+      }
+
+      const context = await getContext(req);
 
       if (req.method === "GET" && url.pathname === "/api/bootstrap") {
         await respondBootstrap(res, context);
@@ -373,6 +503,9 @@ async function createApp(rootDir = process.cwd(), options = {}) {
       }
 
       if (req.method === "POST" && url.pathname === "/api/setup-owner") {
+        if (!ensureJsonContentType(req, res)) {
+          return;
+        }
         const expectedCode = await currentSetupCode();
         if (!expectedCode) {
           json(res, 409, { error: "Initial setup is already complete." });
@@ -437,12 +570,15 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           {
             user: sanitizeUser(owner)
           },
-          { "Set-Cookie": await sessionManager.serializeSessionCookie(session) }
+          { "Set-Cookie": await sessionManager.serializeSessionCookie(session, sessionCookieOptions(req)) }
         );
         return;
       }
 
       if (req.method === "POST" && url.pathname === "/api/login") {
+        if (!ensureJsonContentType(req, res)) {
+          return;
+        }
         const body = await parseJsonBody(req);
         const username = String(body.username || "").trim().toLowerCase();
         const password = String(body.password || "");
@@ -512,20 +648,34 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           {
             user: sanitizeUser(user)
           },
-          { "Set-Cookie": await sessionManager.serializeSessionCookie(session) }
+          { "Set-Cookie": await sessionManager.serializeSessionCookie(session, sessionCookieOptions(req)) }
         );
         return;
       }
 
       if (req.method === "POST" && url.pathname === "/api/logout") {
+        if (!ensureJsonContentType(req, res)) {
+          return;
+        }
         if (context.session) {
           sessionManager.destroySession(context.session.id);
         }
-        noContent(res, { "Set-Cookie": sessionManager.clearSessionCookie() });
+        noContent(res, { "Set-Cookie": sessionManager.clearSessionCookie(sessionCookieOptions(req)) });
         return;
       }
 
       if (!ensureAuthenticated(res, context)) {
+        return;
+      }
+
+      // The two upload routes take multipart form data and check for it
+      // themselves; every other call that changes something takes JSON.
+      const isUploadRoute =
+        req.method === "POST" &&
+        segments[1] === "servers" &&
+        segments.length === 5 &&
+        ((segments[3] === "worlds" && segments[4] === "import") || (segments[3] === "mods" && segments[4] === "upload"));
+      if (changesState && !isUploadRoute && !ensureJsonContentType(req, res)) {
         return;
       }
 
@@ -964,12 +1114,17 @@ async function createApp(rootDir = process.cwd(), options = {}) {
             }
             const archive = await worldManager.createExportArchive(serverId);
             const fileName = `${serverId}-active-world.zip`;
-            const stream = require("node:fs").createReadStream(archive.outputPath);
-            stream.on("close", archive.cleanup);
-            sendStream(res, 200, stream, {
-              "Content-Disposition": `attachment; filename="${fileName}"`,
-              "Content-Type": "application/zip"
-            });
+            try {
+              const sent = await sendFile(res, archive.outputPath, {
+                "Content-Disposition": `attachment; filename="${fileName}"`,
+                "Content-Type": "application/zip"
+              });
+              if (!sent) {
+                json(res, 500, { error: "The export archive could not be read." });
+              }
+            } finally {
+              await archive.cleanup();
+            }
             return;
           }
 
@@ -983,11 +1138,13 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               return;
             }
             const archivePath = await serverManager.readWorldArchivePath(serverId, archiveName);
-            const stream = require("node:fs").createReadStream(archivePath);
-            sendStream(res, 200, stream, {
+            const sent = await sendFile(res, archivePath, {
               "Content-Disposition": `attachment; filename="${path.basename(archivePath)}"`,
               "Content-Type": "application/zip"
             });
+            if (!sent) {
+              json(res, 404, { error: "That world archive does not exist." });
+            }
             return;
           }
         }
@@ -1046,20 +1203,21 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               return;
             }
             const pack = await modManager.buildModpackArchive(serverId);
-            const stream = require("node:fs").createReadStream(pack.filePath);
-            // Drop the staging directory once the response has drained.
-            const cleanup = () => {
-              fs.rm(pack.tmpDir, { force: true, recursive: true }).catch(() => {});
-            };
-            stream.on("close", cleanup);
-            stream.on("error", cleanup);
-            sendStream(res, 200, stream, {
-              "Cache-Control": "no-store, max-age=0",
-              "Content-Disposition": `attachment; filename="${path.basename(pack.filePath)}"`,
-              "Content-Type": "application/zip",
-              "X-Modpack-Bundled": String(pack.bundled),
-              "X-Modpack-Manual": String(pack.manual)
-            });
+            try {
+              const sent = await sendFile(res, pack.filePath, {
+                "Cache-Control": "no-store, max-age=0",
+                "Content-Disposition": `attachment; filename="${path.basename(pack.filePath)}"`,
+                "Content-Type": "application/zip",
+                "X-Modpack-Bundled": String(pack.bundled),
+                "X-Modpack-Manual": String(pack.manual)
+              });
+              if (!sent) {
+                json(res, 500, { error: "The modpack archive could not be read." });
+              }
+            } finally {
+              // Drop the staging directory once the response has drained.
+              await fs.rm(pack.tmpDir, { force: true, recursive: true }).catch(() => {});
+            }
             return;
           }
 
@@ -1406,6 +1564,11 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         const updated = await store.updateUser(userId, {
           passwordHash: await hashSecret(String(body.password))
         });
+        // Whoever was logged in with the old password - which may be the very
+        // reason for the reset - is logged out. The owner doing the reset
+        // keeps the session they are using.
+        const endedSessions = sessionManager.destroyUserSessions(userId, { exceptSessionId: context.session.id });
+        logger.info("Password reset", { actor: context.user.username, endedSessions, username: existing.username });
         json(res, 200, { user: sanitizeUser(updated) });
         return;
       }
@@ -1463,6 +1626,10 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         }
 
         const updated = await store.updateUser(userId, patch);
+        if (patch.passwordHash) {
+          const endedSessions = sessionManager.destroyUserSessions(userId, { exceptSessionId: context.session.id });
+          logger.info("Password changed", { actor: context.user.username, endedSessions, username: updated.username });
+        }
         json(res, 200, { user: sanitizeUser(updated) });
         return;
       }

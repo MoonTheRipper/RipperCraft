@@ -244,7 +244,13 @@ function parseCookieHeader(cookieHeader = "") {
     if (!rawName) {
       continue;
     }
-    cookies[rawName] = decodeURIComponent(rest.join("="));
+    try {
+      cookies[rawName] = decodeURIComponent(rest.join("="));
+    } catch {
+      // A stray "%" in any cookie - ours or another application's on the same
+      // host - used to fail the whole request with a 500. A cookie that cannot
+      // be decoded is simply not a cookie we can use.
+    }
   }
   return cookies;
 }
@@ -319,23 +325,40 @@ function createSessionManager(appConfigPromise) {
     return session;
   }
 
-  async function serializeSessionCookie(session) {
+  // `secure` is set when the visitor's own connection was HTTPS, so the browser
+  // never sends the cookie over plain HTTP. On the LAN, where the dashboard is
+  // plain HTTP, it has to be left off or the cookie would never come back.
+  async function serializeSessionCookie(session, options = {}) {
     const config = await getConfig();
     return [
       `rippermoon_session=${encodeURIComponent(createSignedCookie(session.id, config.cookieSecret))}`,
       "HttpOnly",
       "SameSite=Lax",
       "Path=/",
-      `Max-Age=${config.sessionTtlHours * 60 * 60}`
+      `Max-Age=${config.sessionTtlHours * 60 * 60}`,
+      ...(options.secure ? ["Secure"] : [])
     ].join("; ");
   }
 
-  function clearSessionCookie() {
-    return "rippermoon_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0";
+  function clearSessionCookie(options = {}) {
+    return `rippermoon_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${options.secure ? "; Secure" : ""}`;
   }
 
   function destroySession(sessionId) {
     sessions.delete(sessionId);
+  }
+
+  // Ends every session of one user, optionally sparing the one that asked.
+  // Returns how many were ended.
+  function destroyUserSessions(userId, options = {}) {
+    let ended = 0;
+    for (const [sessionId, session] of sessions) {
+      if (session.userId === userId && sessionId !== options.exceptSessionId) {
+        sessions.delete(sessionId);
+        ended += 1;
+      }
+    }
+    return ended;
   }
 
   async function unlockServer(session, serverId) {
@@ -363,6 +386,7 @@ function createSessionManager(appConfigPromise) {
     clearSessionCookie,
     createSession,
     destroySession,
+    destroyUserSessions,
     getSessionFromRequest,
     isServerUnlocked,
     serializeSessionCookie,

@@ -1,5 +1,7 @@
 const fs = require("node:fs");
+const fsp = require("node:fs/promises");
 const path = require("node:path");
+const { pipeline } = require("node:stream");
 
 const CONTENT_TYPES = {
   ".css": "text/css; charset=utf-8",
@@ -193,27 +195,95 @@ function redirect(res, location) {
   res.end();
 }
 
-function sendStream(res, statusCode, stream, headers = {}) {
-  res.writeHead(statusCode, headers);
-  stream.pipe(res);
+// Sent with every response, whatever it is.
+//
+// The Content-Security-Policy is deliberately only frame-ancestors: it stops
+// the dashboard being framed (as X-Frame-Options does for older browsers)
+// without yet restricting what the page itself may load. A full policy is a
+// change of its own.
+const SECURITY_HEADERS = Object.freeze({
+  "Content-Security-Policy": "frame-ancestors 'none'",
+  "Referrer-Policy": "same-origin",
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY"
+});
+
+function applySecurityHeaders(res) {
+  for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
+    res.setHeader(name, value);
+  }
 }
 
-function sendFile(res, filePath) {
-  const extension = path.extname(filePath);
-  const contentType = CONTENT_TYPES[extension] || "application/octet-stream";
-  const stream = fs.createReadStream(filePath);
-  stream.on("error", () => {
-    json(res, 404, { error: "Not found" });
-  });
-  sendStream(res, 200, stream, {
+function staticFileHeaders(filePath) {
+  return {
     "Cache-Control": "no-store, max-age=0",
-    "Content-Type": contentType
+    "Content-Type": CONTENT_TYPES[path.extname(filePath)] || "application/octet-stream"
+  };
+}
+
+// Streams a regular file as a 200 response and resolves to true once it has
+// been sent, or once there is nobody left to send it to. Resolves to false,
+// with nothing written, when the path is not a file that can be read: missing,
+// or a directory. The caller then answers. Rejects, also with nothing written,
+// if the headers it was given cannot be sent.
+//
+// The headers used to go out before the file had even been opened. Asking for
+// a directory (GET /js) or an archive that was not there therefore failed with
+// the status line already sent: the error handler threw trying to send a
+// second one, and the request hung until the client gave up.
+async function sendFile(res, filePath, headers = {}) {
+  let stats;
+  try {
+    stats = await fsp.stat(filePath);
+  } catch {
+    return false;
+  }
+  if (!stats.isFile()) {
+    return false;
+  }
+
+  return await new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(filePath);
+    stream.once("error", () => resolve(false));
+    stream.once("open", () => {
+      stream.removeAllListeners("error");
+      // Nothing in here may throw: this is an event handler, so an exception
+      // would be an uncaught one, the caller would wait for ever, and the file
+      // would stay open.
+      if (res.destroyed) {
+        // The client hung up while the file was being opened.
+        stream.destroy();
+        resolve(true);
+        return;
+      }
+      try {
+        res.writeHead(200, headers);
+      } catch (error) {
+        // A header the caller built cannot be sent. Nothing has gone out yet,
+        // so the caller can still answer with an error of its own.
+        stream.destroy();
+        reject(error);
+        return;
+      }
+      try {
+        // Ends the response when the file does, and closes the file if the
+        // client goes away or reading fails part-way. It also throws, at once,
+        // if the response was destroyed in the last few microseconds.
+        pipeline(stream, res, () => resolve(true));
+      } catch {
+        stream.destroy();
+        res.destroy();
+        resolve(true);
+      }
+    });
   });
 }
 
 module.exports = {
   HttpError,
   JSON_BODY_LIMIT_BYTES,
+  SECURITY_HEADERS,
+  applySecurityHeaders,
   closeAfterUnreadBody,
   describeBytes,
   json,
@@ -222,6 +292,6 @@ module.exports = {
   readBody,
   redirect,
   sendFile,
-  sendStream,
+  staticFileHeaders,
   text
 };
