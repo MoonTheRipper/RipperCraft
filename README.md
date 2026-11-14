@@ -6,7 +6,7 @@
 
 Current feature set:
 
-- First-run owner bootstrap in the browser
+- First-run owner bootstrap in the browser, gated by a one-time setup code
 - Owner and admin accounts with per-server access lists
 - Per-server passphrase unlocks before start, settings edits, world activation, and mod installs
 - Start and stop controls for managed servers
@@ -31,17 +31,64 @@ Open `http://localhost:4300`.
 
 On first launch:
 
-1. Create the owner account in the browser.
-2. Open the Owner view.
-3. Set passphrases on each server you want guarded.
-4. Create admin accounts and assign which servers they can access.
+1. Look at the output of the command you just ran. While there is no owner account, RipperCraft prints a setup code when it starts:
+
+   ```text
+   ==================================================================
+     RipperCraft has no owner account yet.
+
+         Owner setup code:   7KQ0-1ZXA-M4TV-9HBC
+   ...
+   ```
+
+   Running it as a service? The same banner is in the journal: `journalctl -u rippercraft -n 40`.
+2. Open the dashboard and create the owner account. The first-run screen asks for the setup code, a username and a password of at least 12 characters.
+3. Open the Owner view.
+4. Set passphrases on each server you want guarded.
+5. Create admin accounts and assign which servers they can access.
+
+The owner can run commands on this machine, so the first-run screen is not open to whoever finds it first: without the code it creates nothing. The code is new on every start, is only ever written to standard output (never to `data/logs/`), and stops working the moment the owner exists. If you lose it, restart RipperCraft to get another.
+
+## Sign-in and limits
+
+**Passwords.** Every password set from now on - the owner's, a new account's, a reset or a change - needs at least 12 characters. Passwords that already exist keep working whatever their length. They are stored as scrypt hashes (`N=2^15, r=8, p=3`); hashes written by earlier versions still verify, and each one is rewritten in the new format the next time that user signs in.
+
+**Failed sign-ins** are counted in memory, per 15 minutes:
+
+| What is counted | Limit | Then |
+| --- | --- | --- |
+| Failures from one address against one username | 5 | That address is refused (`429`, with `Retry-After`) until the oldest failure is 15 minutes old. |
+| Failures from one address, any usernames | 20 | That address is refused the same way. |
+| Failures for one username, from any addresses | 10 | Every further failure makes other addresses wait before the next attempt on that username is looked at: 1 second, doubling up to 5 minutes. It starts over after 15 minutes without a failure. |
+
+While an address is being refused its attempts are not checked at all, so the right password is refused too; wait out the time shown. Signing in successfully clears that address's count for that username.
+
+The third rule is the one that stops guessing spread across many addresses, and it must not let a stranger lock you out by failing under your name. So it never applies to an address that has already signed in to that account (remembered for 30 days, or until a restart), nor to a machine connecting directly from your own network. Those are still held to 5 failures per 15 minutes.
+
+A wrong **server passphrase** is limited the same way: 5 per account and server per 15 minutes.
+
+**Sessions.** Resetting or changing a password signs that user out everywhere else. Restarting RipperCraft signs everyone out and clears the counts above.
+
+**Behind a tunnel or reverse proxy.** The visitor's address is taken from the connection. `CF-Connecting-IP`, or failing that the first address in `X-Forwarded-For`, is believed only when the connection comes from this machine itself (`127.0.0.1` / `::1`), which is how `cloudflared` and a local reverse proxy connect. Behind Cloudflare that is always `CF-Connecting-IP`, which a visitor cannot set. Any other proxy has to *replace* `X-Forwarded-For` rather than append to what the visitor sent (Caddy does by default), or visitors can pick the address they are counted under. A proxy that passes no address at all makes every visitor share one count. In the same way the session cookie is marked `Secure` when a local proxy reports HTTPS through `X-Forwarded-Proto` or `CF-Visitor`; on plain HTTP over the LAN it is not.
+
+Requests that change anything must come from the dashboard's own page: the browser's `Origin` header has to match the `Host` header. Cloudflare Tunnel (unless its `httpHostHeader` option is set) and Caddy pass `Host` through unchanged. If your proxy rewrites it, sign-in fails with "This request came from another site"; either make the proxy pass the original `Host`, or set `RIPPERCRAFT_TRUSTED_ORIGINS`.
+
+**Settings** (environment variables):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RIPPERCRAFT_MAX_UPLOAD_MB` | `4096` | Largest world archive or add-on jar that can be uploaded, in megabytes. Uploads are written straight to the server's folder, not held in memory. Cloudflare's own limit (100 MB on the free plan) applies first to uploads made through a tunnel. |
+| `RIPPERCRAFT_TRUSTED_ORIGINS` | none | Comma-separated origins, such as `https://example.com,https://www.example.com`, to accept in addition to the one in the `Host` header. Only for a proxy that rewrites `Host`. |
+
+Other request bodies are limited to 1 MB.
 
 ## Notes
 
 - New vanilla servers are created with `eula=false`. Review Mojang's EULA before switching them to `true`.
 - Graceful stopping works best for servers started through `RipperCraft` itself.
 - CurseForge automation is disabled until a key is configured. Save one in Owner → Integrations (verified against CurseForge before it is stored, kept in `data/app.json`, never sent back to the browser), or set `CURSEFORGE_API_KEY`. The environment variable always wins, and the Owner page says so when it is in effect. `CURSEFORGE_GAME_ID` is optional and defaults to `432` (Minecraft).
-- `data/app.json`, `data/users.json`, and `data/servers.json` hold the cookie secret, password hashes, and server passphrase hashes. They are forced to mode `600` on startup.
+- `data/app.json`, `data/users.json`, and `data/servers.json` hold the cookie secret, password hashes, and server passphrase hashes. They are forced to mode `600` on startup, and are replaced in one step when they change (written to a temporary file beside them, then renamed), so a crash or two saves at once cannot leave one half-written.
+- Once someone has signed in on this version their password hash is in the new format, which earlier versions cannot read. Keep a copy of `data/users.json` from before the upgrade if you might need to go back.
 - Forge and NeoForge are installed by running their official installer, which needs a working Java. They produce argfiles rather than a `server.jar`, and the generated launch script handles both shapes. NeoForge has no builds before Minecraft 1.20.2.
 - Pick a per-server **java version** in Settings when one server needs a different JDK from the rest, for example Forge 1.20.1 on Java 17 alongside newer servers on Java 21+. `RIPPERMOONSTASH_JAVA_BIN` and `JAVA_HOME` apply to the whole service, so they cannot express that on their own. Installed JDKs are detected automatically from the usual locations (`/usr/lib/jvm`, `/usr/java`, `/opt/java`, SDKMAN, macOS `JavaVirtualMachines`), deduplicated across version symlinks, and offered as a dropdown; the list is cached for five minutes.
 - The loader dropdown is a label, not an installer. If it disagrees with the runtime actually on disk, Settings shows a mismatch warning: a server labelled `forge` but running a vanilla jar starts normally and loads no mods.
