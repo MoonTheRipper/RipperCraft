@@ -439,6 +439,39 @@ test("a mod jar is streamed into the add-on directory, with fields after the fil
   assert.deepEqual(await listing(mods), ["Example-Mod.jar"]);
 });
 
+test("form data built by a real client's FormData is understood", async (t) => {
+  // The bodies above are assembled by hand. This one is whatever fetch makes of
+  // a FormData - its own boundary, header spelling and field order.
+  const { app, library, mods, owner } = await appWithAdmin(t);
+  const post = (urlPath, form) =>
+    fetch(`${app.origin}${urlPath}`, { body: form, headers: { Cookie: owner.cookie() }, method: "POST" });
+
+  const jar = crypto.randomBytes(150_000);
+  const modForm = new FormData();
+  modForm.set("confirmManualCompatibility", "true");
+  modForm.set("file", new Blob([jar], { type: "application/java-archive" }), "From Fetch \u00e9\u4e16.jar");
+  const modResponse = await post("/api/servers/DemoServer/mods/upload", modForm);
+  assert.equal(modResponse.status, 201);
+  const [installed] = (await modResponse.json()).installed;
+  assert.match(installed.fileName, /^From-Fetch-.*\.jar$/);
+  assert.deepEqual(await listing(mods), [installed.fileName]);
+  assert.ok((await fsp.readFile(path.join(mods, installed.fileName))).equals(jar));
+
+  const archive = crypto.randomBytes(400_000);
+  const worldForm = new FormData();
+  worldForm.set("archive", new Blob([archive]), "fetched.zip");
+  const worldResponse = await post("/api/servers/DemoServer/worlds/import", worldForm);
+  assert.equal(worldResponse.status, 201);
+  const { archiveName } = await worldResponse.json();
+  assert.ok((await fsp.readFile(path.join(library, archiveName))).equals(archive));
+
+  // A file input left empty.
+  const emptyForm = new FormData();
+  emptyForm.set("archive", new Blob([]), "");
+  assert.equal((await post("/api/servers/DemoServer/worlds/import", emptyForm)).status, 400);
+  assert.deepEqual(await listing(library), [archiveName]);
+});
+
 test("an upload that is refused after it arrived still has its temporary file removed", async (t) => {
   const { mods, owner } = await appWithAdmin(t);
 

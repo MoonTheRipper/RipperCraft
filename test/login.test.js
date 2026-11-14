@@ -548,3 +548,36 @@ test("the address the owner was created from counts as one that has signed in", 
   assert.equal((await loginFrom(app, "198.51.100.99", "owner", OWNER_PASSWORD)).status, 429);
   assert.equal((await loginFrom(app, "203.0.113.50", "owner", OWNER_PASSWORD)).status, 200);
 });
+
+test("a server passphrase hashed by the previous version still unlocks the server", async (t) => {
+  const root = await createRoot(t);
+  const store = createStore(root);
+  await store.createUser({ passwordHash: await hashSecret(OWNER_PASSWORD), role: "owner", username: "owner" });
+  await store.createUser({
+    passwordHash: await hashSecret(ADMIN_PASSWORD),
+    role: "admin",
+    servers: ["DemoServer"],
+    username: "lane"
+  });
+  // The record as the previous version left it in data/servers.json.
+  const passphraseHash = legacyHash("lane-secret");
+  await store.updateServerRecord("DemoServer", { directory: "servers/DemoServer", name: "Demo", passphraseHash });
+
+  const app = await startApp(t, { root });
+  const lane = app.client();
+  assert.equal((await lane("POST", "/api/login", { json: { password: ADMIN_PASSWORD, username: "lane" } })).status, 200);
+  assert.equal((await lane("GET", "/api/servers/DemoServer")).json.unlocked, false);
+
+  const wrong = await lane("POST", "/api/servers/DemoServer/unlock", { json: { passphrase: "lane-secrets" } });
+  assert.equal(wrong.status, 403);
+  const right = await lane("POST", "/api/servers/DemoServer/unlock", { json: { passphrase: "lane-secret" } });
+  assert.equal(right.status, 200);
+  assert.equal((await lane("GET", "/api/servers/DemoServer")).json.unlocked, true);
+
+  // Unlocking does not rewrite the stored hash; setting the passphrase again does.
+  assert.equal((await store.getServerRecords()).DemoServer.passphraseHash, passphraseHash);
+  const owner = app.client();
+  await owner("POST", "/api/login", { json: { password: OWNER_PASSWORD, username: "owner" } });
+  assert.equal((await owner("PUT", "/api/servers/DemoServer/settings", { json: { passphrase: "a-new-secret" } })).status, 200);
+  assert.match((await store.getServerRecords()).DemoServer.passphraseHash, /^\$scrypt\$/);
+});
