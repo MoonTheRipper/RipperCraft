@@ -5,6 +5,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 const { hashSecret, verifySecret } = require("./auth");
+const { isUploadTempName } = require("./upload");
 const {
   compareVersions,
   evaluateLoaderCandidate,
@@ -690,7 +691,7 @@ function createServerManager(store) {
   async function countFiles(directoryPath) {
     try {
       const entries = await fsp.readdir(directoryPath, { withFileTypes: true });
-      return entries.filter((entry) => entry.isFile()).length;
+      return entries.filter((entry) => entry.isFile() && !isUploadTempName(entry.name)).length;
     } catch (error) {
       if (error.code === "ENOENT") {
         return 0;
@@ -1109,7 +1110,8 @@ function createServerManager(store) {
     const entries = await fsp.readdir(paths.modsDir, { withFileTypes: true });
     const disabledEntries = await fsp.readdir(paths.disabledModsDir, { withFileTypes: true });
     const active = entries
-      .filter((entry) => entry.isFile())
+      // An upload in progress writes its temporary file here; it is not an add-on.
+      .filter((entry) => entry.isFile() && !isUploadTempName(entry.name))
       .map((entry) => ({ enabled: true, fileName: entry.name }));
     const disabled = disabledEntries
       .filter((entry) => entry.isFile())
@@ -1254,6 +1256,20 @@ function createServerManager(store) {
     await ensureDir(paths.modsDir);
     const targetFile = path.join(paths.modsDir, safeFilename(fileName));
     await fsp.writeFile(targetFile, buffer);
+    return path.basename(targetFile);
+  }
+
+  // Moves a file that is already on disk into the add-on directory. An upload
+  // is received into that same directory, so this is a rename, not a copy.
+  async function installManagedFileFromPath(serverId, fileName, sourcePath) {
+    const server = await getServer(serverId);
+    if (!server) {
+      throw new Error("Server not found.");
+    }
+    const paths = resolveRecordPaths(server);
+    await ensureDir(paths.modsDir);
+    const targetFile = path.join(paths.modsDir, safeFilename(fileName));
+    await fsp.rename(sourcePath, targetFile);
     return path.basename(targetFile);
   }
 
@@ -3109,6 +3125,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     getServerSnapshot,
     getServerStatus,
     installManagedFile,
+    installManagedFileFromPath,
     listAvailableMinecraftVersions,
     listInstalledFiles,
     listServerOperators,

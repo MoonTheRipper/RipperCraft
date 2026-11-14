@@ -736,7 +736,9 @@ function createModManager(serverManager, options = {}) {
     return tracked.filter((entry) => fileNameSet.has(entry.fileName)).map(publicInstallRecord);
   }
 
-  async function installUpload(serverId, fileName, buffer, options = {}) {
+  // Installs an uploaded file from where it was received on disk. If any check
+  // fails the file is left where it is, for the caller to remove.
+  async function installUploadedFile(serverId, fileName, sourcePath, options = {}) {
     const server = await serverManager.getServer(serverId);
     if (!server) {
       throw new Error("Server not found.");
@@ -744,7 +746,7 @@ function createModManager(serverManager, options = {}) {
 
     assertManualInstallAllowed(server, options, options);
     assertJarLikeName(fileName);
-    const installedName = await serverManager.installManagedFile(serverId, safeFilename(fileName), buffer);
+    const installedName = await serverManager.installManagedFileFromPath(serverId, safeFilename(fileName), sourcePath);
     const tracked = await serverManager.recordAddonInstalls(serverId, [
       normalizeTrackedEntry(server, {
         direct: true,
@@ -1436,7 +1438,7 @@ function createModManager(serverManager, options = {}) {
     refreshAddonDetails,
     renderClientListText,
     install,
-    installUpload,
+    installUploadedFile,
     planCombinedAddonUpdate,
     providerAvailability,
     search,

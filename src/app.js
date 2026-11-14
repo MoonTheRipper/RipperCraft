@@ -3,13 +3,14 @@ const path = require("node:path");
 const fs = require("node:fs/promises");
 const { createStore } = require("./lib/store");
 const { createSessionManager, hashSecret, needsRehash, verifyAccountSecret } = require("./lib/auth");
-const { json, noContent, parseFormData, parseJsonBody, sendFile, sendStream } = require("./lib/http");
+const { closeAfterUnreadBody, json, noContent, parseJsonBody, sendFile, sendStream } = require("./lib/http");
 const { createServerManager } = require("./lib/servers");
 const { createWorldManager } = require("./lib/worlds");
 const { createModManager } = require("./lib/mod-sources");
 const { createJobRegistry } = require("./lib/jobs");
 const { clientAddress } = require("./lib/peer");
 const { createAttemptThrottle, createLoginThrottle, describeWait } = require("./lib/throttle");
+const { receiveUpload, resolveUploadLimitBytes } = require("./lib/upload");
 const { exists, withinParent } = require("./lib/utils");
 
 function sanitizeUser(user) {
@@ -93,6 +94,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
   // The numbers and the reasoning behind them are in lib/throttle.js.
   const loginThrottle = createLoginThrottle({ now: options.now });
   const unlockThrottle = createAttemptThrottle({ now: options.now });
+  const uploadLimitBytes = options.uploadLimitBytes || resolveUploadLimitBytes(logger);
 
   async function getContext(req) {
     const session = await sessionManager.getSessionFromRequest(req);
@@ -178,6 +180,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
       needsSetup: !(await store.hasUsers()),
       passwordMinLength: PASSWORD_MIN_LENGTH,
       providers: await modManager.providerAvailability(),
+      uploadLimitBytes,
       user: sanitizeUser(context.user)
     });
   }
@@ -294,6 +297,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
   return http.createServer(async (req, res) => {
     const startedAt = Date.now();
     const requestPath = req.url || "/";
+    closeAfterUnreadBody(req, res);
     res.on("finish", () => {
       logger.info("HTTP request completed", {
         durationMs: Date.now() - startedAt,
@@ -871,18 +875,21 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               json(res, 403, { error: "Unlock the server before importing a world." });
               return;
             }
-            const formData = await parseFormData(req);
-            const file = formData.get("archive");
-            if (!file) {
-              json(res, 400, { error: "A zip archive is required." });
-              return;
+            const upload = await receiveUpload(req, {
+              directory: serverManager.resolveRecordPaths(server).worldLibraryDir,
+              fileField: "archive",
+              maxFileBytes: uploadLimitBytes
+            });
+            try {
+              if (!upload.file) {
+                json(res, 400, { error: "A zip archive is required." });
+                return;
+              }
+              const result = await worldManager.importWorldArchiveFile(serverId, upload.file.fileName, upload.file.path);
+              json(res, 201, result);
+            } finally {
+              await upload.cleanup();
             }
-            const result = await worldManager.importWorldArchive(
-              serverId,
-              file.name,
-              Buffer.from(await file.arrayBuffer())
-            );
-            json(res, 201, result);
             return;
           }
 
@@ -1094,22 +1101,30 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               json(res, 403, { error: "Unlock the server before uploading files." });
               return;
             }
-            const formData = await parseFormData(req);
-            const file = formData.get("file");
-            if (!file) {
-              json(res, 400, { error: "A file upload is required." });
+            // Decided before any of the file is accepted, not after it has all
+            // been received.
+            if (!serverManager.userCanManageAddons(context.user, server)) {
+              json(res, 403, { error: "Manual add-on installs require add-on management permission for this server." });
               return;
             }
-            const installed = await modManager.installUpload(
-              serverId,
-              file.name,
-              Buffer.from(await file.arrayBuffer()),
-              {
-                manualAllowed: serverManager.userCanManageAddons(context.user, server),
-                confirmManualCompatibility: String(formData.get("confirmManualCompatibility") || "") === "true"
+            const upload = await receiveUpload(req, {
+              directory: serverManager.resolveRecordPaths(server).modsDir,
+              fileField: "file",
+              maxFileBytes: uploadLimitBytes
+            });
+            try {
+              if (!upload.file) {
+                json(res, 400, { error: "A file upload is required." });
+                return;
               }
-            );
-            json(res, 201, { installed });
+              const installed = await modManager.installUploadedFile(serverId, upload.file.fileName, upload.file.path, {
+                confirmManualCompatibility: String(upload.fields.confirmManualCompatibility || "") === "true",
+                manualAllowed: true
+              });
+              json(res, 201, { installed });
+            } finally {
+              await upload.cleanup();
+            }
             return;
           }
         }
@@ -1391,12 +1406,28 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         segments
       });
     } catch (error) {
-      logger.error("HTTP request failed", {
-        error: error.message || "Unexpected server error.",
-        method: req.method,
-        path: requestPath,
-        stack: error.stack
-      });
+      if (error.expose === true) {
+        // The client's doing - too large, malformed, gone - and already worded
+        // for them. Not a fault, so no stack trace.
+        logger.warn("HTTP request refused", {
+          error: error.message,
+          method: req.method,
+          path: requestPath,
+          statusCode: error.statusCode
+        });
+      } else {
+        logger.error("HTTP request failed", {
+          error: error.message || "Unexpected server error.",
+          method: req.method,
+          path: requestPath,
+          stack: error.stack
+        });
+      }
+      if (res.headersSent) {
+        // Part of a response is already on the wire; all that is left is to end it.
+        res.destroy();
+        return;
+      }
       json(
         res,
         typeof error.statusCode === "number" ? error.statusCode : 500,

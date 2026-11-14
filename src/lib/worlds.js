@@ -77,13 +77,16 @@ function createWorldManager(serverManager) {
     };
   }
 
-  async function importWorldArchive(serverId, fileName, buffer) {
+  // Files an uploaded archive in the world library. The upload was received
+  // into that directory, so the archive appears under its final name complete
+  // or not at all.
+  async function importWorldArchiveFile(serverId, fileName, sourcePath) {
     const server = await serverManager.getServer(serverId);
     const paths = serverManager.resolveRecordPaths(server);
     await ensureDir(paths.worldLibraryDir);
     const archiveName = `${new Date().toISOString().replace(/[:.]/g, "-")}-${safeFilename(fileName || "world.zip")}`;
     const targetFile = path.join(paths.worldLibraryDir, archiveName.endsWith(".zip") ? archiveName : `${archiveName}.zip`);
-    await fsp.writeFile(targetFile, buffer);
+    await fsp.rename(sourcePath, targetFile);
     return {
       archiveName: path.basename(targetFile)
     };
@@ -232,7 +235,7 @@ function createWorldManager(serverManager) {
     createNewWorld,
     createExportArchive,
     deleteWorldArchive,
-    importWorldArchive,
+    importWorldArchiveFile,
     listWorlds,
     updateWorldRules
   };
