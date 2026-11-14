@@ -2,7 +2,7 @@ const http = require("node:http");
 const path = require("node:path");
 const fs = require("node:fs/promises");
 const { createStore } = require("./lib/store");
-const { createSessionManager, hashSecret, verifySecret } = require("./lib/auth");
+const { createSessionManager, hashSecret, needsRehash, verifyAccountSecret } = require("./lib/auth");
 const { json, noContent, parseFormData, parseJsonBody, sendFile, sendStream } = require("./lib/http");
 const { createServerManager } = require("./lib/servers");
 const { createWorldManager } = require("./lib/worlds");
@@ -33,6 +33,20 @@ function sanitizeUser(user) {
 
 function isBlank(value) {
   return !value || !String(value).trim();
+}
+
+// Applies to every password that is set from now on: the owner's at setup, a
+// new account's, and any reset or change. Passwords that already exist are not
+// measured against it, so nobody is locked out by the upgrade.
+const PASSWORD_MIN_LENGTH = 12;
+
+// Returns the reason a new password is not acceptable, or "" when it is.
+// Length is counted in characters, not UTF-16 units, so an emoji counts once.
+function newPasswordProblem(password) {
+  if ([...String(password)].length < PASSWORD_MIN_LENGTH) {
+    return `Password must be at least ${PASSWORD_MIN_LENGTH} characters.`;
+  }
+  return "";
 }
 
 function normalizeUserPermissions(rawPermissions) {
@@ -145,6 +159,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
       installableLoaders: serverManager.getInstallableLoaders(),
       loggedIn: Boolean(context.user),
       needsSetup: !(await store.hasUsers()),
+      passwordMinLength: PASSWORD_MIN_LENGTH,
       providers: await modManager.providerAvailability(),
       user: sanitizeUser(context.user)
     });
@@ -314,11 +329,16 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           json(res, 400, { error: "Username and password are required." });
           return;
         }
+        const passwordProblem = newPasswordProblem(body.password);
+        if (passwordProblem) {
+          json(res, 400, { error: passwordProblem });
+          return;
+        }
 
         const owner = await store.createUser({
           username: String(body.username).trim(),
           displayName: String(body.displayName || body.username).trim(),
-          passwordHash: hashSecret(String(body.password)),
+          passwordHash: await hashSecret(String(body.password)),
           permissions: normalizeUserPermissions(body.permissions),
           role: "owner",
           servers: []
@@ -343,9 +363,33 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         const users = await store.getUsers();
         const user = users.find((item) => item.username.toLowerCase() === username);
 
-        if (!user || !verifySecret(password, user.passwordHash)) {
+        // The same derivations run whether or not the account exists, so the
+        // answer and the time it takes say nothing about the username.
+        const verified = await verifyAccountSecret(
+          password,
+          user ? user.passwordHash : null,
+          users.map((item) => item.passwordHash)
+        );
+        if (!user || !verified) {
           json(res, 401, { error: "Invalid username or password." });
           return;
+        }
+
+        if (needsRehash(user.passwordHash)) {
+          // The password is known to be right at this moment, which is the only
+          // time a stronger hash of it can be made. Failing to store it must
+          // not fail the login.
+          try {
+            const upgraded = await store.upgradePasswordHash(user.id, user.passwordHash, await hashSecret(password));
+            if (upgraded) {
+              logger.info("Password hash upgraded to the current format", { username: user.username });
+            }
+          } catch (error) {
+            logger.warn("Could not upgrade a stored password hash", {
+              error: error.message,
+              username: user.username
+            });
+          }
         }
 
         const session = await sessionManager.createSession(user.id);
@@ -1167,6 +1211,11 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           json(res, 400, { error: "Username and password are required." });
           return;
         }
+        const passwordProblem = newPasswordProblem(body.password);
+        if (passwordProblem) {
+          json(res, 400, { error: passwordProblem });
+          return;
+        }
         if (users.some((user) => user.username.toLowerCase() === username.toLowerCase())) {
           json(res, 409, { error: "That username already exists." });
           return;
@@ -1176,7 +1225,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         const user = await store.createUser({
           username,
           displayName: String(body.displayName || username).trim(),
-          passwordHash: hashSecret(String(body.password)),
+          passwordHash: await hashSecret(String(body.password)),
           permissions: access.permissions,
           role: body.role === "owner" ? "owner" : "admin",
           servers: access.servers
@@ -1196,6 +1245,11 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           json(res, 400, { error: "A new password is required." });
           return;
         }
+        const passwordProblem = newPasswordProblem(body.password);
+        if (passwordProblem) {
+          json(res, 400, { error: passwordProblem });
+          return;
+        }
 
         const users = await store.getUsers();
         const existing = users.find((user) => user.id === userId);
@@ -1205,7 +1259,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         }
 
         const updated = await store.updateUser(userId, {
-          passwordHash: hashSecret(String(body.password))
+          passwordHash: await hashSecret(String(body.password))
         });
         json(res, 200, { user: sanitizeUser(updated) });
         return;
@@ -1231,6 +1285,14 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           return;
         }
 
+        // A blank password means "keep the current one", so only a password
+        // that was actually typed is held to the minimum.
+        const passwordProblem = isBlank(body.password) ? "" : newPasswordProblem(body.password);
+        if (passwordProblem) {
+          json(res, 400, { error: passwordProblem });
+          return;
+        }
+
         const nextUsername = String(body.username || existing.username).trim();
         const duplicate = users.find(
           (user) => user.id !== userId && user.username.toLowerCase() === nextUsername.toLowerCase()
@@ -1252,7 +1314,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           username: nextUsername
         };
         if (!isBlank(body.password)) {
-          patch.passwordHash = hashSecret(String(body.password));
+          patch.passwordHash = await hashSecret(String(body.password));
         }
 
         const updated = await store.updateUser(userId, patch);
@@ -1270,11 +1332,16 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         path: requestPath,
         stack: error.stack
       });
-      json(res, typeof error.statusCode === "number" ? error.statusCode : 500, {
-        error: error.message || "Unexpected server error.",
-        ...(error.code ? { code: error.code } : {}),
-        ...(error.manualDownload ? { manualDownload: error.manualDownload } : {})
-      });
+      json(
+        res,
+        typeof error.statusCode === "number" ? error.statusCode : 500,
+        {
+          error: error.message || "Unexpected server error.",
+          ...(error.code ? { code: error.code } : {}),
+          ...(error.manualDownload ? { manualDownload: error.manualDownload } : {})
+        },
+        error.expose === true && error.headers ? error.headers : {}
+      );
     }
   });
 }

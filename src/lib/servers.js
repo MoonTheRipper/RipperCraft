@@ -4,7 +4,7 @@ const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
-const { hashSecret } = require("./auth");
+const { hashSecret, verifySecret } = require("./auth");
 const {
   compareVersions,
   evaluateLoaderCandidate,
@@ -812,7 +812,7 @@ function createServerManager(store) {
     }
     if (typeof nextPatch.passphrase === "string") {
       const trimmed = nextPatch.passphrase.trim();
-      nextPatch.passphraseHash = trimmed ? hashSecret(trimmed) : null;
+      nextPatch.passphraseHash = trimmed ? await hashSecret(trimmed) : null;
       delete nextPatch.passphrase;
     }
 
@@ -2079,7 +2079,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       minecraftVersion: spec.minecraftVersion || (await detectVersion(serverDir)),
       modsDir: spec.modsDir || "mods",
       name: spec.name || displayNameFromSlug(serverId),
-      passphraseHash: spec.passphrase ? hashSecret(spec.passphrase) : null,
+      passphraseHash: spec.passphrase ? await hashSecret(String(spec.passphrase)) : null,
       serverPropertiesFile: spec.serverPropertiesFile || "server.properties",
       startCommand: spec.startCommand || (mode === "existing" ? DEFAULT_EXISTING_START_COMMAND : DEFAULT_MANAGED_START_COMMAND),
       worldDir: spec.worldDir || "world"
@@ -2330,8 +2330,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     if (!server.passphraseHash) {
       return false;
     }
-    const { verifySecret } = require("./auth");
-    return verifySecret(passphrase, server.passphraseHash);
+    return await verifySecret(passphrase, server.passphraseHash);
   }
 
   async function listWorldArchives(serverId) {

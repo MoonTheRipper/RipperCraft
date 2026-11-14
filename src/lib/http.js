@@ -15,6 +15,18 @@ const CONTENT_TYPES = {
   ".webmanifest": "application/manifest+json; charset=utf-8"
 };
 
+// An error whose status and message are meant for the client. Anything else
+// that reaches the request handler is a fault and answers 500.
+class HttpError extends Error {
+  constructor(statusCode, message, options = {}) {
+    super(message);
+    this.name = "HttpError";
+    this.statusCode = statusCode;
+    this.expose = true;
+    this.headers = options.headers || {};
+  }
+}
+
 async function readBody(req) {
   const chunks = [];
   for await (const chunk of req) {
@@ -86,6 +98,7 @@ function sendFile(res, filePath) {
 }
 
 module.exports = {
+  HttpError,
   json,
   noContent,
   parseFormData,
