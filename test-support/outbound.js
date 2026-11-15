@@ -75,7 +75,7 @@ function scriptedOutbound(script = {}, overrides = {}) {
       return answer.map((address) => ({ address, family: address.includes(":") ? 6 : 4 }));
     },
     transport: async (request) => {
-      calls.push({ address: request.address, headers: request.headers, url: request.url.href });
+      calls.push({ address: request.address, connectTimeoutMs: request.connectTimeoutMs, headers: request.headers, url: request.url.href });
       const answer = await script.respond(request, calls.length);
       const body = answer.body === undefined ? "" : answer.body;
       return {

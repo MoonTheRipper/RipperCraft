@@ -43,6 +43,13 @@ const IDLE_TIMEOUT_MS = 30_000;
 const METADATA_TIMEOUT_MS = 30_000;
 const DOWNLOAD_TIMEOUT_MS = 15 * 60_000;
 const LOOKUP_TIMEOUT_MS = 10_000;
+// How long one address is given to make a connection - to answer, and to
+// finish the TLS handshake - before the next one is tried. A working one takes
+// a fraction of a second. Four of these fit inside the time a request has, so
+// an address that never answers costs a few seconds, not the request: left to
+// the idle limit above, a dead first address used up everything a version
+// list or a search was allowed, and the second was never tried.
+const CONNECT_TIMEOUT_MS = 5_000;
 
 // API answers and version lists are kilobytes; Forge's is the largest, at
 // under a megabyte.
@@ -188,7 +195,11 @@ function isPublicAddress(address) {
 // The name is used for the certificate and the Host header only; nothing is
 // resolved here. Resolves to { status, headers, body } as soon as the response
 // headers arrive, with `body` a stream the caller must read or destroy.
-function httpsTransport({ address, family, headers, idleTimeoutMs, signal, tls, url }) {
+//
+// Rejects with code ETIMEDOUT if the connection has not been made - TLS
+// handshake included - within connectTimeoutMs, or goes quiet for
+// idleTimeoutMs after that.
+function httpsTransport({ address, connectTimeoutMs, family, headers, idleTimeoutMs, signal, tls, url }) {
   return new Promise((resolve, reject) => {
     const hostname = url.hostname.replace(/^\[|\]$/g, "");
     const request = https.request(
@@ -214,9 +225,39 @@ function httpsTransport({ address, family, headers, idleTimeoutMs, signal, tls, 
     request.setTimeout(idleTimeoutMs, () => {
       request.destroy(Object.assign(new Error("The connection went quiet."), { code: "ETIMEDOUT" }));
     });
+    if (connectTimeoutMs) {
+      const connecting = setTimeout(() => {
+        request.destroy(Object.assign(new Error("The connection was not made in time."), { code: "ETIMEDOUT" }));
+      }, connectTimeoutMs);
+      const connected = () => clearTimeout(connecting);
+      request.once("socket", (socket) => socket.once("secureConnect", connected));
+      request.once("close", connected);
+    }
     request.once("error", reject);
     request.end();
   });
+}
+
+// The order addresses are tried in: the first as the resolver gave it, then
+// one of the other kind, and so on in turns. A name usually has several
+// addresses of each kind, IPv6 first, and on a machine whose IPv6 leads nowhere
+// every one of those fails the same way - so the second try is an IPv4 one.
+function inTurns(addresses) {
+  if (!addresses.length) {
+    return [];
+  }
+  const first = addresses.filter((entry) => entry.family === addresses[0].family);
+  const other = addresses.filter((entry) => entry.family !== addresses[0].family);
+  const ordered = [];
+  for (let index = 0; index < Math.max(first.length, other.length); index += 1) {
+    if (index < first.length) {
+      ordered.push(first[index]);
+    }
+    if (index < other.length) {
+      ordered.push(other[index]);
+    }
+  }
+  return ordered;
 }
 
 function systemLookup(hostname) {
@@ -247,6 +288,7 @@ function createOutbound(overrides = {}) {
   const userAgent = overrides.userAgent || DEFAULT_USER_AGENT;
   const downloadLimitBytes = overrides.downloadLimitBytes || DEFAULT_DOWNLOAD_LIMIT_MB * 1024 * 1024;
   const idleTimeoutMs = overrides.idleTimeoutMs || IDLE_TIMEOUT_MS;
+  const connectTimeoutMs = overrides.connectTimeoutMs || CONNECT_TIMEOUT_MS;
 
   // An address typed by somebody, or handed back by an API, as a URL this
   // module is willing to contact.
@@ -308,9 +350,9 @@ function createOutbound(overrides = {}) {
   // Connects to the first of the checked addresses that answers.
   async function connect(url, addresses, headers, signal) {
     let lastError = null;
-    for (const { address, family } of addresses.slice(0, MAX_ADDRESSES_TRIED)) {
+    for (const { address, family } of inTurns(addresses).slice(0, MAX_ADDRESSES_TRIED)) {
       try {
-        return await transport({ address, family, headers, idleTimeoutMs, signal, url });
+        return await transport({ address, connectTimeoutMs, family, headers, idleTimeoutMs, signal, url });
       } catch (error) {
         lastError = error;
         if (signal.aborted || !UNREACHABLE.has(error.code)) {

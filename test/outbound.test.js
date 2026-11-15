@@ -288,6 +288,81 @@ test("when the first address cannot be reached the next one is tried, and only c
   assert.equal(strict.calls.length, 1);
 });
 
+test("an address that never answers costs a few seconds, not the whole request", async () => {
+  // The first address takes the connection and says nothing: an IPv6 address
+  // on a machine whose IPv6 leads nowhere. A transport waits on it for as long
+  // as it has been told it may - which was the 30 seconds allowed between any
+  // two pieces of a response, the same 30 seconds a version list has in all.
+  const { calls, outbound } = scriptedOutbound(
+    {
+      addresses: { "two.example": ["2606:4700:4700::1111", PUBLIC_ADDRESS] },
+      respond: ({ address, connectTimeoutMs, idleTimeoutMs, signal }) => {
+        if (!address.includes(":")) {
+          return { body: '{"over":"IPv4"}' };
+        }
+        return new Promise((_resolve, reject) => {
+          const waiting = setTimeout(
+            () => reject(Object.assign(new Error("connect ETIMEDOUT"), { code: "ETIMEDOUT" })),
+            connectTimeoutMs || idleTimeoutMs
+          );
+          signal.addEventListener("abort", () => {
+            clearTimeout(waiting);
+            reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+          });
+        });
+      }
+    },
+    { connectTimeoutMs: 40, idleTimeoutMs: 20_000 }
+  );
+
+  const startedAt = Date.now();
+  assert.deepEqual(await outbound.fetchJson("https://two.example/versions.json", { timeoutMs: 4000 }), { over: "IPv4" });
+  assert.deepEqual(calls.map((call) => call.address), ["2606:4700:4700::1111", PUBLIC_ADDRESS]);
+  assert.ok(Date.now() - startedAt < 3000, `took ${Date.now() - startedAt} ms`);
+
+  // Left alone, the wait for one address is short enough for four of them to
+  // fit in the time the shortest request is given.
+  const defaults = scriptedOutbound({ addresses: () => [PUBLIC_ADDRESS], respond: () => ({ body: "{}" }) });
+  await defaults.outbound.fetchJson("https://one.example/versions.json");
+  assert.equal(defaults.calls[0].connectTimeoutMs, 5000);
+  assert.ok(defaults.calls[0].connectTimeoutMs * 4 < 30_000);
+});
+
+test("addresses are tried a kind at a time in turns, so the second try is the other kind", async () => {
+  const sixes = ["2606:4700:4700::1111", "2606:4700:4700::1001", "2620:fe::fe", "2620:fe::9", "2001:4860:4860::8888"];
+  const dead = (address) => address.includes(":");
+  const script = (addresses) =>
+    scriptedOutbound({
+      addresses: { "many.example": addresses },
+      respond: ({ address }) => {
+        if (dead(address)) {
+          throw Object.assign(new Error("connect ETIMEDOUT"), { code: "ETIMEDOUT" });
+        }
+        return { body: `from ${address}` };
+      }
+    });
+
+  // Five IPv6 addresses ahead of the one IPv4 address, and four tries in all.
+  const one = script([...sixes, PUBLIC_ADDRESS]);
+  assert.equal((await one.outbound.fetchBuffer("https://many.example/a.jar")).toString(), `from ${PUBLIC_ADDRESS}`);
+  assert.deepEqual(one.calls.map((call) => call.address), [sixes[0], PUBLIC_ADDRESS]);
+
+  // The resolver's own order is kept within a kind, and its first choice stays first.
+  const order = scriptedOutbound({
+    addresses: { "many.example": [PUBLIC_ADDRESS, sixes[0], OTHER_PUBLIC_ADDRESS, sixes[1], sixes[2]] },
+    respond: () => {
+      throw Object.assign(new Error("connect EHOSTUNREACH"), { code: "EHOSTUNREACH" });
+    }
+  });
+  await assert.rejects(order.outbound.fetchBuffer("https://many.example/a.jar"), { message: "Could not connect to many.example.", statusCode: 502 });
+  assert.deepEqual(order.calls.map((call) => call.address), [PUBLIC_ADDRESS, sixes[0], OTHER_PUBLIC_ADDRESS, sixes[1]]);
+
+  // One kind only: as before, the first four.
+  const same = script(sixes);
+  await assert.rejects(same.outbound.fetchBuffer("https://many.example/a.jar"), { statusCode: 502 });
+  assert.deepEqual(same.calls.map((call) => call.address), sixes.slice(0, 4));
+});
+
 // --- redirects ---------------------------------------------------------------------------------------
 
 test("redirects are followed by hand, and each new address is checked like the first", async () => {
@@ -651,6 +726,54 @@ test("a connection that goes quiet is dropped", async (t) => {
     { code: "ETIMEDOUT" }
   );
   assert.ok(Date.now() - startedAt < 3000);
+
+  // The same, with the limit on making the connection far below the limit on
+  // silence: that is the one that ends it.
+  const again = Date.now();
+  await assert.rejects(
+    httpsTransport({
+      address: "127.0.0.1",
+      connectTimeoutMs: 150,
+      family: 4,
+      headers: {},
+      idleTimeoutMs: 20_000,
+      signal: AbortSignal.timeout(4000),
+      url: new URL(`https://quiet.test:${server.address().port}/`)
+    }),
+    { code: "ETIMEDOUT", message: "The connection was not made in time." }
+  );
+  assert.ok(Date.now() - again < 3000, `took ${Date.now() - again} ms`);
+});
+
+test("the limit on making a connection is not a limit on the answer", async (t) => {
+  const certificate = makeCertificate(t);
+  if (!certificate) {
+    t.skip("openssl is not available to make a certificate");
+    return;
+  }
+  // Connects at once, then takes its time: longer than a connection may take
+  // to make, shorter than one may stay silent.
+  const server = https.createServer(certificate, (_request, response) => {
+    setTimeout(() => response.end("worth the wait"), 400);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const response = await httpsTransport({
+    address: "127.0.0.1",
+    connectTimeoutMs: 150,
+    family: 4,
+    headers: {},
+    idleTimeoutMs: 5000,
+    signal: AbortSignal.timeout(5000),
+    tls: { ca: certificate.cert },
+    url: new URL(`https://pinned.test:${server.address().port}/slow`)
+  });
+  const chunks = [];
+  for await (const chunk of response.body) {
+    chunks.push(chunk);
+  }
+  assert.equal(Buffer.concat(chunks).toString(), "worth the wait");
 });
 
 // --- settings ------------------------------------------------------------------------------------------------------
