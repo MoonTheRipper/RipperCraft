@@ -64,7 +64,6 @@ function parseEnvironment(text) {
 
 async function serverThatReportsItsEnvironment(t, startCommand = "./launch-server.sh") {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rippercraft-env-"));
-  t.after(() => fsp.rm(root, { force: true, recursive: true }));
   const serverDir = path.join(root, "servers", "DemoServer");
   await fsp.mkdir(path.join(serverDir, "logs"), { recursive: true });
   await fsp.writeFile(path.join(serverDir, "eula.txt"), "eula=true\n");
@@ -93,7 +92,12 @@ async function serverThatReportsItsEnvironment(t, startCommand = "./launch-serve
     await serverManager.stopServer("DemoServer");
     return environment;
   }
-  t.after(() => serverManager.stopServer("DemoServer").catch(() => {}));
+  // In this order: stopping a server writes to its record, and a folder that
+  // was removed first is made again to hold it.
+  t.after(async () => {
+    await serverManager.stopServer("DemoServer").catch(() => {});
+    await fsp.rm(root, { force: true, maxRetries: 10, recursive: true, retryDelay: 50 });
+  });
   return { root, serverManager, start };
 }
 

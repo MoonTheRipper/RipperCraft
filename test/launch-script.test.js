@@ -52,7 +52,6 @@ const FORGE_ARG_FILE = "libraries/net/minecraftforge/forge/1.20.1-47.4.10/unix_a
 // Java that writes down the arguments it was started with.
 async function managedServer(t, record) {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rippercraft-launch-"));
-  t.after(() => fsp.rm(root, { force: true, recursive: true }));
   const serverDir = path.join(root, "servers", "Managed");
   await fsp.mkdir(path.join(serverDir, ".rippermoon"), { recursive: true });
   await fsp.mkdir(path.join(serverDir, path.dirname(FORGE_ARG_FILE)), { recursive: true });
@@ -88,7 +87,12 @@ async function managedServer(t, record) {
   await store.ensureInitialized();
   const owner = await store.createUser({ passwordHash: await hashSecret("owner-password-1"), role: "owner", servers: [], username: "owner" });
   const serverManager = createServerManager(store);
-  t.after(() => serverManager.stopServer("Managed").catch(() => {}));
+  // In this order: stopping a server writes to its record, and a folder that
+  // was removed first is made again to hold it.
+  t.after(async () => {
+    await serverManager.stopServer("Managed").catch(() => {});
+    await fsp.rm(root, { force: true, maxRetries: 10, recursive: true, retryDelay: 50 });
+  });
   return {
     javaArguments: async () => {
       for (let attempt = 0; attempt < 100 && !fs.existsSync(javaLog); attempt += 1) {
@@ -273,11 +277,15 @@ test("a record whose argfile path is a command is not turned into a script eithe
   const marker = path.join(os.tmpdir(), `rippercraft-pwned-${process.pid}-argfile`);
   await fsp.rm(marker, { force: true });
   t.after(() => fsp.rm(marker, { force: true }));
-  for (const argFile of [`x"; touch ${marker}; echo "`, `libraries/$(touch ${marker})/unix_args.txt`, "../../../etc/passwd"]) {
+  // The last one leads out of the server folder - two levels up, which is
+  // still inside the folder this test made for itself.
+  for (const argFile of [`x"; touch ${marker}; echo "`, `libraries/$(touch ${marker})/unix_args.txt`, "../../outside/unix_args.txt"]) {
     const server = await managedServer(t, { managedRuntime: { kind: "forge", launch: { argFile, kind: "argfile" } } });
     // The file "exists" as far as the dashboard can tell, so it goes on to write the script.
-    await fsp.mkdir(path.dirname(path.join(server.serverDir, argFile)), { recursive: true }).catch(() => {});
-    await fsp.writeFile(path.join(server.serverDir, argFile), "").catch(() => {});
+    const target = path.resolve(server.serverDir, argFile);
+    assert.ok(target.startsWith(`${server.root}${path.sep}`), `${target} is outside the folder this test owns`);
+    await fsp.mkdir(path.dirname(target), { recursive: true }).catch(() => {});
+    await fsp.writeFile(target, "").catch(() => {});
 
     await assert.rejects(server.serverManager.startServer("Managed", server.owner), { statusCode: 409 }, argFile);
     assert.equal(fs.existsSync(marker), false, argFile);

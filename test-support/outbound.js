@@ -89,9 +89,28 @@ function scriptedOutbound(script = {}, overrides = {}) {
   return { calls, lookups, outbound };
 }
 
+// A fetcher that does everything the dashboard's does up to the point of
+// connecting, and then connects to nothing: each connection it would have made
+// is recorded in `dialled` and refused. For tests of what the dashboard will
+// not contact. Such a test probes with the addresses of real things - a home
+// router, a cloud metadata service - and if the check it is testing is ever
+// broken, it has to fail here, not go and knock on them.
+function unconnectedOutbound(overrides = {}) {
+  const dialled = [];
+  const outbound = createOutbound({
+    transport: async (request) => {
+      dialled.push({ address: request.address, url: request.url.href });
+      throw Object.assign(new Error("Tests do not connect to anything."), { code: "ECONNREFUSED" });
+    },
+    ...overrides
+  });
+  return { dialled, outbound };
+}
+
 module.exports = {
   PUBLIC_ADDRESS,
   fetchBackedOutbound,
   scriptedOutbound,
+  unconnectedOutbound,
   useFetchForOutbound
 };

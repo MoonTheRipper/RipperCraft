@@ -1,5 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const dns = require("node:dns");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const net = require("node:net");
@@ -11,7 +12,7 @@ const { createModManager } = require("../src/lib/mod-sources");
 const { createServerManager } = require("../src/lib/servers");
 const { createStore } = require("../src/lib/store");
 const { startWithAdmin } = require("../test-support/lane");
-const { PUBLIC_ADDRESS, scriptedOutbound } = require("../test-support/outbound");
+const { PUBLIC_ADDRESS, scriptedOutbound, unconnectedOutbound } = require("../test-support/outbound");
 
 setHashCostForTests({ ln: 10, r: 8, p: 1 });
 
@@ -48,8 +49,23 @@ async function internalService(t) {
 // --- an address typed by an admin -----------------------------------------------------------
 
 test("installing from this machine or a private network is refused, and nothing is contacted", async (t) => {
-  // No stand-in for the network here: this is the real fetcher, refusing.
-  const { admin, app } = await startWithAdmin(t);
+  // The dashboard's own fetcher, refusing - with the one step it must never get
+  // to taken out. The addresses below are those of real things, on this
+  // network and on others, and a test of a check has to survive the check
+  // being broken: if one of these is ever let through, it is recorded here and
+  // the test fails, and nothing is sent to it. The one name that is looked up
+  // is looked up for real, and it is this machine's.
+  const lookedUp = [];
+  const { dialled, outbound } = unconnectedOutbound({
+    lookup: async (hostname) => {
+      lookedUp.push(hostname);
+      if (hostname !== "localhost") {
+        throw Object.assign(new Error(`getaddrinfo ENOTFOUND ${hostname}`), { code: "ENOTFOUND" });
+      }
+      return await dns.promises.lookup(hostname, { all: true, verbatim: true });
+    }
+  });
+  const { admin, app } = await startWithAdmin(t, { app: { outbound } });
   const internal = await internalService(t);
   const port = internal.port;
 
@@ -93,6 +109,9 @@ test("installing from this machine or a private network is refused, and nothing 
     assert.ok(Date.now() - startedAt < 2000, `${label} took ${Date.now() - startedAt}ms`);
   }
 
+  // Refused before a connection was so much as attempted, to anything.
+  assert.deepEqual(dialled, []);
+  assert.deepEqual(lookedUp, ["localhost"]);
   assert.deepEqual(internal.connections, []);
   assert.deepEqual(fs.readdirSync(modsFolder(app)), []);
   assert.deepEqual(await manifestOf(app), []);
