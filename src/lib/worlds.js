@@ -4,6 +4,7 @@ const fsp = require("node:fs/promises");
 const os = require("node:os");
 const { HttpError, describeBytes } = require("./http");
 const { ensureDir, nowIso, readEnv, runCommand, safeFilename, withinParent } = require("./utils");
+const { invalid, normalizeLevelType, propertyValue, singleLine } = require("./validate");
 const { assertPlainTree, extractZip, inspectZip } = require("./zip-extract");
 
 // The largest world, measured unpacked, that an archive may hold. A zip can be
@@ -133,9 +134,15 @@ function createWorldManager(serverManager, options = {}) {
   }
 
   async function updateWorldRules(serverId, options = {}) {
+    // Checked before the file is read, let alone written: the world type goes
+    // into server.properties, and is one of a fixed list.
+    let levelType = null;
+    if (options.levelType !== undefined && options.levelType !== null && options.levelType !== "") {
+      levelType = normalizeLevelType(options.levelType);
+    }
     const properties = parseServerPropertiesText(await serverManager.readServerProperties(serverId));
-    if (typeof options.levelType === "string" && options.levelType.trim()) {
-      properties["level-type"] = String(options.levelType).trim();
+    if (levelType) {
+      properties["level-type"] = levelType;
     }
     if (typeof options.generateStructures === "boolean") {
       properties["generate-structures"] = options.generateStructures ? "true" : "false";
@@ -388,22 +395,30 @@ function createWorldManager(serverManager, options = {}) {
   async function createNewWorld(serverId, options = {}) {
     const server = await serverManager.getServer(serverId);
     const paths = serverManager.resolveRecordPaths(server);
+    // What was asked for is checked first. The seed and the world type are
+    // written into server.properties; the name is shown in the world list. A
+    // refusal here comes before the live world is archived or removed.
+    const blank = (value) => value === undefined || value === null || value === "";
+    const name = blank(options.name) ? "new world" : singleLine(options.name, "The world name", { maxLength: 80, required: true });
+    const seed = blank(options.seed) ? "" : propertyValue(options.seed, "The world seed", { maxLength: 128 });
+    const levelType = blank(options.levelType) ? "minecraft:normal" : normalizeLevelType(options.levelType);
+    const levelName = propertyValue(path.basename(paths.worldDir), "The world folder name");
+    if (!levelName) {
+      throw invalid("This server's world folder has no name to write into server.properties.");
+    }
+
     await serverManager.ensureServerStopped(serverId);
     await assertWorldFolderIsOurs(paths);
     // Nothing to archive if the current world has not been generated yet.
-    await backUpWorldBeforeReplacing(
-      serverId,
-      paths,
-      `pre-new-world-${typeof options.name === "string" && options.name ? options.name : "world"}`
-    );
+    await backUpWorldBeforeReplacing(serverId, paths, `pre-new-world-${name}`);
 
     const properties = parseServerPropertiesText(await serverManager.readServerProperties(serverId));
-    properties["level-name"] = path.basename(paths.worldDir);
-    properties["level-seed"] = String(options.seed || "");
-    properties["level-type"] = String(options.levelType || "minecraft:normal");
+    properties["level-name"] = levelName;
+    properties["level-seed"] = seed;
+    properties["level-type"] = levelType;
     properties["generate-structures"] = String(options.generateStructures === false ? "false" : "true");
     await serverManager.writeServerProperties(serverId, serializeServerProperties(properties));
-    await serverManager.setActiveWorldName(serverId, options.name || "new world");
+    await serverManager.setActiveWorldName(serverId, name);
 
     await fsp.rm(paths.worldDir, { recursive: true, force: true });
 
@@ -411,7 +426,7 @@ function createWorldManager(serverManager, options = {}) {
       nextWorld: {
         generateStructures: properties["generate-structures"],
         levelType: properties["level-type"],
-        name: String(options.name || "new world"),
+        name,
         seed: properties["level-seed"]
       }
     };

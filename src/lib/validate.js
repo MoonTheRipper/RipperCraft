@@ -113,6 +113,65 @@ function normalizeMinecraftVersion(value, label = "The Minecraft version") {
   return version;
 }
 
+// A value for server.properties.
+//
+// The file is one "key=value" per line, so a value with a line break in it is
+// two lines: an admin allowed to change the message of the day sent
+// "hello\nonline-mode=false" and had written a setting of their choosing. A
+// value must therefore be one line of text with no control characters in it.
+//
+// It must also not end in an unpaired backslash. Minecraft reads the file as
+// Java properties, where a backslash at the end of a line joins the next line
+// onto it - which would swallow whichever setting came next in the file.
+// Backslashes anywhere else are left alone: "\u00a7" colour codes and a "\n"
+// between the two lines of a message of the day are written exactly that way.
+function propertyValue(value, label, options = {}) {
+  const text = singleLine(value, label, { maxLength: options.maxLength || 256 });
+  const trailing = /\\+$/.exec(text);
+  if (trailing && trailing[0].length % 2 === 1) {
+    throw invalid(`${label} cannot end with a backslash.`);
+  }
+  return text;
+}
+
+// What level-type may be set to: the world presets Minecraft ships (1.19 and
+// later spell them with the minecraft: prefix) and the names older versions
+// used. A world preset added by a mod is the owner's to set, in the full
+// server.properties editor.
+const LEVEL_TYPES = Object.freeze([
+  "minecraft:normal",
+  "minecraft:flat",
+  "minecraft:large_biomes",
+  "minecraft:amplified",
+  "minecraft:single_biome_surface",
+  "minecraft:debug_all_block_states",
+  "normal",
+  "default",
+  "flat",
+  "largebiomes",
+  "large_biomes",
+  "amplified",
+  "single_biome_surface",
+  "buffet",
+  "customized",
+  "default_1_1",
+  "debug_all_block_states"
+]);
+const LEVEL_TYPE_SET = new Set(LEVEL_TYPES);
+
+function normalizeLevelType(value) {
+  const text = plainText(value);
+  // Minecraft writes the colon escaped ("minecraft\:normal") when it saves the
+  // file; a value read from there and sent back means the same thing.
+  const levelType = text === null ? "" : text.trim().toLowerCase().replace("\\:", ":");
+  if (!LEVEL_TYPE_SET.has(levelType)) {
+    throw invalid(
+      "The world type must be one of Minecraft's own: minecraft:normal, minecraft:flat, minecraft:large_biomes, minecraft:amplified or minecraft:single_biome_surface, or one of the older names (default, flat, largebiomes, amplified, buffet)."
+    );
+  }
+  return levelType;
+}
+
 // A whole number within a range, from a JSON number or its spelling as text.
 function integerInRange(value, label, minimum, maximum) {
   const text = plainText(value);
@@ -128,13 +187,16 @@ function integerInRange(value, label, minimum, maximum) {
 
 module.exports = {
   KNOWN_LOADERS,
+  LEVEL_TYPES,
   MINECRAFT_VERSION_MAX_LENGTH,
   hasControlCharacters,
   integerInRange,
   invalid,
   isMinecraftVersion,
+  normalizeLevelType,
   normalizeLoader,
   normalizeMinecraftVersion,
   plainText,
+  propertyValue,
   singleLine
 };

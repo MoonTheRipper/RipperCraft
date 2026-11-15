@@ -38,6 +38,7 @@ const {
   normalizeLoader,
   normalizeMinecraftVersion,
   plainText,
+  propertyValue,
   singleLine
 } = require("./validate");
 
@@ -227,7 +228,22 @@ function createServerManager(store, options = {}) {
       return definition.options.includes(text) ? text : definition.defaultValue;
     }
 
-    return String(value);
+    // Free text, which is what makes it the one to check: it goes into the
+    // file as typed, and a line break in it would start a line of its own.
+    return propertyValue(value, `The ${definition.key} setting`, { maxLength: 512 });
+  }
+
+  // The first lines of a new server.properties. The name is the owner's, and
+  // has been through the record's checks; it is held to the file's as well,
+  // and a name that cannot be a value there is replaced by the plain id.
+  function initialPropertiesText(name, fallbackName, port = 25565) {
+    let motd;
+    try {
+      motd = propertyValue(name, "The server name");
+    } catch {
+      motd = displayNameFromSlug(safeFilename(fallbackName));
+    }
+    return `motd=${motd}\nserver-port=${integerInRange(port, "The server port", 1, 65535)}\n`;
   }
 
   async function fetchMinecraftVersionManifest() {
@@ -957,12 +973,16 @@ function createServerManager(store, options = {}) {
   async function writeSafeAdminProperties(serverId, nextSafeProperties) {
     const propertyMap = parseServerPropertiesText(await readServerProperties(serverId));
 
+    // Every value is checked before the file is touched, so a refused one
+    // leaves all of them as they were.
+    const checked = {};
     for (const definition of SAFE_ADMIN_SETTING_DEFINITIONS) {
-      if (!(definition.key in nextSafeProperties)) {
+      if (!Object.hasOwn(nextSafeProperties, definition.key)) {
         continue;
       }
-      propertyMap[definition.key] = normalizeAdminSettingValue(definition, nextSafeProperties[definition.key]);
+      checked[definition.key] = normalizeAdminSettingValue(definition, nextSafeProperties[definition.key]);
     }
+    Object.assign(propertyMap, checked);
 
     await writeServerProperties(serverId, serializeServerProperties(propertyMap));
     return await readSafeAdminProperties(serverId);
@@ -2012,11 +2032,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     }
 
     if (!(await exists(paths.propertiesFile))) {
-      await fsp.writeFile(
-        paths.propertiesFile,
-        `motd=${server.name || displayNameFromSlug(server.id)}\nserver-port=25565\n`,
-        "utf8"
-      );
+      await fsp.writeFile(paths.propertiesFile, initialPropertiesText(server.name, server.id), "utf8");
     }
 
     await fsp.writeFile(paths.managedLaunchScript, getManagedLaunchScriptContents(server), "utf8");
@@ -2189,7 +2205,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       await ensureDir(path.join(serverDir, "plugins"));
       await ensureDir(path.join(serverDir, ".rippermoon"));
       await fsp.writeFile(path.join(serverDir, "eula.txt"), "eula=false\n", "utf8");
-      await fsp.writeFile(path.join(serverDir, "server.properties"), `motd=${details.name}\nserver-port=${port}\n`, "utf8");
+      await fsp.writeFile(path.join(serverDir, "server.properties"), initialPropertiesText(details.name, serverId, port), "utf8");
       // Provision first: the launch script shape depends on what the loader
       // produced (a server.jar, or Forge/NeoForge argfiles).
       const runtime = await createJarManagedRuntime(
