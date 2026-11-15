@@ -289,7 +289,12 @@ function createSessionManager(appConfigPromise) {
     return await appConfigPromise();
   }
 
-  async function createSession(userId) {
+  // options.credential is the stored password hash the session was opened
+  // with. The caller refuses a session whose credential is no longer the
+  // account's, which is what makes a password change final: it does not depend
+  // on finding every session at the moment of the change, so a login that was
+  // still being checked at that moment gains nothing by finishing afterwards.
+  async function createSession(userId, options = {}) {
     const config = await getConfig();
     const sessionId = randomId("sess");
     const expiresAt = Date.now() + config.sessionTtlHours * 60 * 60 * 1000;
@@ -298,10 +303,21 @@ function createSessionManager(appConfigPromise) {
       userId,
       unlockedServers: {},
       createdAt: nowIso(),
-      expiresAt
+      expiresAt,
+      ...(options.credential === undefined ? {} : { credential: options.credential })
     };
     sessions.set(sessionId, session);
     return session;
+  }
+
+  // Moves sessions from one stored hash to another that encodes the same
+  // password: the transparent upgrade at login, which must not log anyone out.
+  function rebindUserSessions(userId, fromCredential, toCredential) {
+    for (const session of sessions.values()) {
+      if (session.userId === userId && session.credential === fromCredential) {
+        session.credential = toCredential;
+      }
+    }
   }
 
   async function getSessionFromRequest(req) {
@@ -389,6 +405,7 @@ function createSessionManager(appConfigPromise) {
     destroyUserSessions,
     getSessionFromRequest,
     isServerUnlocked,
+    rebindUserSessions,
     serializeSessionCookie,
     unlockServer
   };

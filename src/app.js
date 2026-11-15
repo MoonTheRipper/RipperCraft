@@ -2,7 +2,7 @@ const http = require("node:http");
 const path = require("node:path");
 const fs = require("node:fs/promises");
 const { createStore } = require("./lib/store");
-const { createSessionManager, hashSecret, needsRehash, verifyAccountSecret } = require("./lib/auth");
+const { createSessionManager, hashSecret, needsRehash, verifyAccountSecret, verifySecret } = require("./lib/auth");
 const {
   HttpError,
   applySecurityHeaders,
@@ -195,7 +195,11 @@ async function createApp(rootDir = process.cwd(), options = {}) {
 
     const users = await store.getUsers();
     const user = users.find((item) => item.id === session.userId) || null;
-    if (!user) {
+    // A session ends with the password it was opened with. Revoking sessions
+    // when a password changes is not enough by itself: a login that had read
+    // the old hash and was still deriving would finish after the revocation
+    // and walk away with a fresh session.
+    if (!user || (session.credential !== undefined && session.credential !== user.passwordHash)) {
       sessionManager.destroySession(session.id);
       return { session: null, user: null };
     }
@@ -632,15 +636,19 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           json(res, 401, { error: "Invalid username or password." });
           return;
         }
-        attempt.succeeded();
 
-        if (needsRehash(user.passwordHash)) {
+        // The hash this login will stand on: the one just verified, or its
+        // stronger replacement.
+        let credential = user.passwordHash;
+        if (needsRehash(credential)) {
           // The password is known to be right at this moment, which is the only
           // time a stronger hash of it can be made. Failing to store it must
           // not fail the login.
           try {
-            const upgraded = await store.upgradePasswordHash(user.id, user.passwordHash, await hashSecret(password));
-            if (upgraded) {
+            const stronger = await hashSecret(password);
+            if (await store.upgradePasswordHash(user.id, credential, stronger)) {
+              sessionManager.rebindUserSessions(user.id, credential, stronger);
+              credential = stronger;
               logger.info("Password hash upgraded to the current format", { username: user.username });
             }
           } catch (error) {
@@ -651,7 +659,34 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           }
         }
 
-        const session = await sessionManager.createSession(user.id);
+        // Checking took a while, and the account may have changed meanwhile.
+        // If its hash is no longer the one this login stands on, the password
+        // has to be right for the hash that is there now: a reset made while
+        // the old password was being checked must not be outrun by that check.
+        let current = null;
+        let stillValid = false;
+        try {
+          current = (await store.getUsers()).find((item) => item.id === user.id) || null;
+          stillValid =
+            Boolean(current) &&
+            (current.passwordHash === credential || (await verifySecret(password, current.passwordHash)));
+        } catch (error) {
+          attempt.cancelled();
+          throw error;
+        }
+        if (!stillValid) {
+          attempt.failed();
+          logger.warn("Login failed: the password changed while it was being checked", {
+            address: visitor.address,
+            username: user.username
+          });
+          json(res, 401, { error: "Invalid username or password." });
+          return;
+        }
+        attempt.succeeded();
+        credential = current.passwordHash;
+
+        const session = await sessionManager.createSession(user.id, { credential });
         json(
           res,
           200,
@@ -1578,6 +1613,10 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         // reason for the reset - is logged out. The owner doing the reset
         // keeps the session they are using.
         const endedSessions = sessionManager.destroyUserSessions(userId, { exceptSessionId: context.session.id });
+        if (context.session.userId === userId) {
+          // Their own password: the session they are using moves to the new one.
+          context.session.credential = updated.passwordHash;
+        }
         logger.info("Password reset", { actor: context.user.username, endedSessions, username: existing.username });
         json(res, 200, { user: sanitizeUser(updated) });
         return;
@@ -1638,6 +1677,9 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         const updated = await store.updateUser(userId, patch);
         if (patch.passwordHash) {
           const endedSessions = sessionManager.destroyUserSessions(userId, { exceptSessionId: context.session.id });
+          if (context.session.userId === userId) {
+            context.session.credential = updated.passwordHash;
+          }
           logger.info("Password changed", { actor: context.user.username, endedSessions, username: updated.username });
         }
         json(res, 200, { user: sanitizeUser(updated) });

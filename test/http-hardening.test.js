@@ -7,7 +7,8 @@ const http = require("node:http");
 const net = require("node:net");
 const path = require("node:path");
 const { once } = require("node:events");
-const { createSessionManager, parseCookieHeader, setHashCostForTests } = require("../src/lib/auth");
+const { createSessionManager, hashSecret, parseCookieHeader, setHashCostForTests } = require("../src/lib/auth");
+const { createStore } = require("../src/lib/store");
 const { SECURITY_HEADERS, sendFile } = require("../src/lib/http");
 const { ADMIN_PASSWORD, OWNER_PASSWORD, request, sessionCookieFrom, startApp } = require("../test-support/app");
 
@@ -525,6 +526,130 @@ test("an owner changing their own password keeps this session and ends their oth
   );
   assert.equal((await owner("GET", "/api/users")).status, 200);
   assert.equal((await ownerElsewhere("GET", "/api/users")).status, 401);
+});
+
+test("a login that was already being checked when the password was reset gets no usable session", async (t) => {
+  // Someone holding the old password only has to keep logging in: one attempt
+  // is always part-way through its check, and it used to come out the other
+  // side of the reset with a brand new session.
+  const app = await startApp(t);
+  const owner = await app.setupOwner();
+  const lane = await loggedInAdmin(app, owner, "lane");
+
+  // Hold every password check open until told to continue.
+  const realScrypt = crypto.scrypt;
+  const held = [];
+  let holding = true;
+  t.mock.method(crypto, "scrypt", (...args) => {
+    if (holding) {
+      held.push(() => realScrypt(...args));
+    } else {
+      realScrypt(...args);
+    }
+  });
+  const release = () => {
+    holding = false;
+    while (held.length) {
+      held.shift()();
+    }
+  };
+
+  const intruder = app.client();
+  const inFlight = intruder("POST", "/api/login", { json: { password: ADMIN_PASSWORD, username: "lane" } });
+  const deadline = Date.now() + 3000;
+  while (held.length === 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(held.length, 1, "the login never reached its password check");
+
+  // The reset happens now, while that check is suspended. (It hashes the new
+  // password, so it has to be let through; the held login stays held.)
+  const resetting = owner("POST", `/api/users/${lane.id}/reset-password`, { json: { password: "after-the-reset-1" } });
+  while (held.length < 2 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  held.pop()();
+  assert.equal((await resetting).status, 200);
+
+  // Now the suspended login finishes checking the old password.
+  release();
+  const late = await inFlight;
+
+  // Whatever it was told, it must not be logged in.
+  assert.equal(late.status, 401);
+  assert.equal(late.headers["set-cookie"], undefined);
+  assert.equal((await intruder("GET", "/api/servers")).status, 401);
+  // The session lane had before the reset is gone as well, and the new password works.
+  assert.equal((await lane.client("GET", "/api/servers")).status, 401);
+  assert.equal(
+    (await app.request({ json: { password: "after-the-reset-1", username: "lane" }, method: "POST", path: "/api/login" })).status,
+    200
+  );
+});
+
+test("none of the logins racing a password change keeps a session", async (t) => {
+  // The same thing without holding anything open: sign in over and over on the
+  // old password while it is being changed, as someone who had stolen it might.
+  const app = await startApp(t);
+  const owner = await app.setupOwner();
+  const lane = await loggedInAdmin(app, owner, "lane");
+
+  for (const change of ["reset", "edit"]) {
+    const oldPassword = change === "reset" ? ADMIN_PASSWORD : "after-the-reset-1";
+    const newPassword = change === "reset" ? "after-the-reset-1" : "after-the-edit-22";
+    const attempts = [];
+    const signIn = async () => {
+      const client = app.client();
+      const response = await client("POST", "/api/login", { json: { password: oldPassword, username: "lane" } });
+      return { client, status: response.status };
+    };
+    for (let index = 0; index < 12; index += 1) {
+      attempts.push(signIn());
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    const changed =
+      change === "reset"
+        ? owner("POST", `/api/users/${lane.id}/reset-password`, { json: { password: newPassword } })
+        : owner("PUT", `/api/users/${lane.id}`, {
+            json: { displayName: "Lane", password: newPassword, role: "admin", servers: ["DemoServer"], username: "lane" }
+          });
+    for (let index = 0; index < 12; index += 1) {
+      attempts.push(signIn());
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    assert.equal((await changed).status, 200);
+    const settled = await Promise.all(attempts);
+
+    // Some were told 200 and some 401, depending on when they landed; what
+    // matters is that not one of those sessions works now.
+    assert.ok(settled.some((attempt) => attempt.status === 200), "no login got in before the change at all");
+    for (const attempt of settled) {
+      assert.equal((await attempt.client("GET", "/api/servers")).status, 401, `${change}: a session outlived the change`);
+    }
+    assert.equal(
+      (await app.request({ json: { password: newPassword, username: "lane" }, method: "POST", path: "/api/login" })).status,
+      200
+    );
+  }
+});
+
+test("a session stops working when the account's stored password is no longer the one it was opened with", async (t) => {
+  // Even a change that revoked nothing: the session is checked against the
+  // account every time it is used.
+  const app = await startApp(t);
+  const owner = await app.setupOwner();
+  const lane = await loggedInAdmin(app, owner, "lane");
+  assert.equal((await lane.client("GET", "/api/servers")).status, 200);
+
+  const store = createStore(app.root);
+  await store.updateUser(lane.id, { passwordHash: await hashSecret("changed-behind-the-app") });
+
+  assert.equal((await lane.client("GET", "/api/servers")).status, 401);
+  assert.deepEqual((await lane.client("GET", "/api/session")).json, { loggedIn: false, user: null });
+  // Other accounts' sessions are untouched, and edits that leave the password alone end nothing.
+  assert.equal((await owner("GET", "/api/users")).status, 200);
+  await store.updateUser((await owner("GET", "/api/session")).json.user.id, { displayName: "Renamed" });
+  assert.equal((await owner("GET", "/api/session")).json.user.displayName, "Renamed");
 });
 
 test("logging in again after a hash upgrade does not end other sessions", async (t) => {
