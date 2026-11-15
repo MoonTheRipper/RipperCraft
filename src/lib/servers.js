@@ -5,7 +5,8 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 const { hashSecret, verifySecret } = require("./auth");
-const { isUploadTempName } = require("./upload");
+const { getDefaultOutbound } = require("./outbound");
+const { isUploadTempName, newUploadTempPath } = require("./upload");
 const {
   compareVersions,
   evaluateLoaderCandidate,
@@ -59,7 +60,6 @@ const COMBINED_UPDATE_LOADERS = new Set(["vanilla", "paper", "purpur", "fabric",
 // back - without the game version changing at all.
 const LOADER_VERSIONED_LOADERS = new Set(["fabric", "forge", "neoforge"]);
 const FORGE_MAVEN_METADATA_URL = `${FORGE_MAVEN}/maven-metadata.xml`;
-const REMOTE_USER_AGENT = readEnv("USER_AGENT", "RipperCraft/0.1 (https://github.com/MoonTheRipper/RipperCraft)");
 const DEFAULT_EXISTING_START_COMMAND = "./launch-server.sh";
 const DEFAULT_MANAGED_START_COMMAND = "./.rippermoon/launch-server.sh";
 const SAFE_ADMIN_SETTING_DEFINITIONS = [
@@ -81,7 +81,10 @@ const SAFE_ADMIN_SETTING_DEFINITIONS = [
 ];
 const SAFE_ADMIN_SETTING_KEYS = new Set(SAFE_ADMIN_SETTING_DEFINITIONS.map((definition) => definition.key));
 
-function createServerManager(store) {
+function createServerManager(store, options = {}) {
+  // Everything this file fetches from another machine - version lists, server
+  // jars, installers, add-ons - goes through the one checked fetcher.
+  const outbound = options.outbound || getDefaultOutbound();
   const serversRoot = path.join(store.rootDir, "servers");
   const runningChildren = new Map();
   const versionCatalogCache = {
@@ -99,44 +102,16 @@ function createServerManager(store) {
   // that to one request.
   const loaderCatalogCache = new Map();
 
-  function withRemoteHeaders(headers = {}) {
-    return {
-      "User-Agent": REMOTE_USER_AGENT,
-      ...headers
-    };
+  async function fetchJson(url, requestOptions = {}) {
+    return await outbound.fetchJson(url, { headers: requestOptions.headers });
   }
 
-  async function fetchJson(url, options = {}) {
-    const response = await fetch(url, {
-      ...options,
-      headers: withRemoteHeaders(options.headers || {})
-    });
-    if (!response.ok) {
-      throw new Error(`Request failed with status ${response.status}.`);
-    }
-    return await response.json();
+  async function fetchText(url, requestOptions = {}) {
+    return await outbound.fetchText(url, { headers: requestOptions.headers });
   }
 
-  async function fetchText(url, options = {}) {
-    const response = await fetch(url, {
-      ...options,
-      headers: withRemoteHeaders(options.headers || {})
-    });
-    if (!response.ok) {
-      throw new Error(`Request failed with status ${response.status}.`);
-    }
-    return await response.text();
-  }
-
-  async function fetchBuffer(url, options = {}) {
-    const response = await fetch(url, {
-      ...options,
-      headers: withRemoteHeaders(options.headers || {})
-    });
-    if (!response.ok) {
-      throw new Error(`Download failed with status ${response.status}.`);
-    }
-    return Buffer.from(await response.arrayBuffer());
+  async function fetchBuffer(url, requestOptions = {}) {
+    return await outbound.fetchBuffer(url, { headers: requestOptions.headers });
   }
 
   function serializeManagedRuntime(managedRuntime) {
@@ -1025,19 +1000,22 @@ function createServerManager(store) {
   // On an online-mode server an offline UUID can never match a real player: the
   // operator silently has no powers. Resolve the real one from Mojang instead.
   async function resolveMojangUuid(name) {
-    const response = await fetch(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(name)}`, {
-      headers: withRemoteHeaders()
-    });
+    const response = await outbound.get(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(name)}`);
     if (response.status === 404 || response.status === 204) {
       throw userFacingError(`No Minecraft account named "${name}" exists. Check the spelling.`, 404);
     }
-    if (!response.ok) {
+    if (response.status < 200 || response.status > 299) {
       throw userFacingError(
         `Could not reach Mojang to look up "${name}" (HTTP ${response.status}). Try again in a moment.`,
         502
       );
     }
-    const payload = await response.json();
+    let payload = {};
+    try {
+      payload = JSON.parse(response.buffer.toString("utf8")) || {};
+    } catch {
+      // Falls through to the "unexpected id" answer below.
+    }
     const raw = String(payload.id || "").replace(/-/g, "");
     if (raw.length !== 32) {
       throw userFacingError(`Mojang returned an unexpected id for "${name}".`, 502);
@@ -1355,19 +1333,56 @@ function createServerManager(store) {
     return path.basename(targetFile);
   }
 
-  async function downloadAndInstallFile(serverId, url, fileNameHint) {
-    const response = await fetch(url, { redirect: "follow" });
-    if (!response.ok) {
-      throw new Error(`Download failed with status ${response.status}.`);
+  // Downloads a file into the server's add-on folder under a temporary name and
+  // resolves to { path, size }. The caller renames it into place, or removes it.
+  //
+  // It is written to disk as it arrives and never held in memory, stops at the
+  // download limit, and - like everything fetched from another machine - only
+  // comes from an https address on the public internet.
+  async function downloadAddonToTempFile(serverId, url) {
+    const server = await getServer(serverId);
+    if (!server) {
+      throw new Error("Server not found.");
     }
-    const buffer = Buffer.from(await response.arrayBuffer());
-    const parsedUrl = new URL(url);
+    const paths = resolveRecordPaths(server);
+    await ensureDir(paths.modsDir);
+    const tempPath = newUploadTempPath(paths.modsDir);
+    let sink = null;
+    try {
+      // The file is only created once there is a response to put in it.
+      const size = await outbound.download(url, () => {
+        sink = fs.createWriteStream(tempPath, { flags: "wx" });
+        return sink;
+      });
+      return { path: tempPath, size };
+    } catch (error) {
+      if (sink) {
+        // Removed after the stream has let go of it, not before it exists.
+        sink.destroy();
+        if (!sink.closed) {
+          await new Promise((resolve) => sink.once("close", resolve));
+        }
+        await fsp.rm(tempPath, { force: true });
+      }
+      throw error;
+    }
+  }
+
+  async function downloadAndInstallFile(serverId, url, fileNameHint) {
+    // Refused here, before anything is created, if it is not an https address.
+    const parsedUrl = outbound.parseAddress(url);
     const fallbackName = path.basename(parsedUrl.pathname) || "download.jar";
-    const installedName = await installManagedFile(serverId, fileNameHint || fallbackName, buffer);
-    return {
-      fileName: installedName,
-      size: buffer.length
-    };
+    const downloaded = await downloadAddonToTempFile(serverId, parsedUrl.href);
+    try {
+      const installedName = await installManagedFileFromPath(serverId, fileNameHint || fallbackName, downloaded.path);
+      return {
+        fileName: installedName,
+        size: downloaded.size
+      };
+    } catch (error) {
+      await fsp.rm(downloaded.path, { force: true });
+      throw error;
+    }
   }
 
   async function resolveVanillaRuntime(version) {
@@ -3247,6 +3262,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     scanServerLoaderRequirements,
     addServerOperator,
     deleteServer,
+    downloadAddonToTempFile,
     downloadAndInstallFile,
     ensureManagedServerArtifacts,
     ensureServerStopped,

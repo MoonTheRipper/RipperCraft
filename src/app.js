@@ -141,11 +141,14 @@ async function createApp(rootDir = process.cwd(), options = {}) {
   await store.ensureInitialized();
 
   const sessionManager = createSessionManager(() => store.getAppConfig());
-  const serverManager = createServerManager(store);
+  // options.outbound replaces the fetcher everything remote goes through; the
+  // default is the checked one in lib/outbound.js.
+  const serverManager = createServerManager(store, { outbound: options.outbound });
   const worldManager = createWorldManager(serverManager, {
     worldLimitBytes: options.worldLimitBytes || resolveWorldLimitBytes(logger)
   });
   const modManager = createModManager(serverManager, {
+    outbound: options.outbound,
     readIntegrations: () => store.getIntegrations()
   });
   const jobs = createJobRegistry();
