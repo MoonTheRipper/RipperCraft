@@ -791,13 +791,43 @@ test("a request from another site's page is refused; our own page and plain scri
   assert.equal(logout.status, 403);
   assert.equal((await owner("GET", "/api/session")).json.loggedIn, true);
 
+  // The two upload routes take multipart bodies, which is the one kind of
+  // request a plain form on another site can send. They have no JSON rule to
+  // fall back on, so the Origin check is what stands in the way.
+  const boundary = "----ForeignFormBoundary";
+  const form = (field, name) =>
+    `--${boundary}\r\nContent-Disposition: form-data; name="${field}"; filename="${name}"\r\n\r\nplanted\r\n` +
+    `--${boundary}\r\nContent-Disposition: form-data; name="confirmManualCompatibility"\r\n\r\ntrue\r\n--${boundary}--\r\n`;
+  assert.equal(
+    (await owner("PUT", "/api/servers/DemoServer/settings", { json: { loader: "fabric", passphrase: "lane-secret" } })).status,
+    200
+  );
+  for (const [urlPath, field, name] of [
+    ["/api/servers/DemoServer/mods/upload", "file", "planted.jar"],
+    ["/api/servers/DemoServer/worlds/import", "archive", "planted.zip"]
+  ]) {
+    const send = (headers) =>
+      app.request({
+        body: form(field, name),
+        headers: { "Content-Type": `multipart/form-data; boundary=${boundary}`, Cookie: owner.cookie(), ...headers },
+        method: "POST",
+        path: urlPath
+      });
+    assert.equal((await send({ Origin: "https://evil.example" })).status, 403, urlPath);
+    assert.equal((await send({ Origin: "null" })).status, 403, urlPath);
+    assert.equal((await send({ Origin: `http://${host}` })).status, 201, urlPath);
+  }
+  const serverDir = path.join(app.root, "servers", "DemoServer");
+  assert.deepEqual(await fsp.readdir(path.join(serverDir, "mods")), ["planted.jar"]);
+  assert.equal((await fsp.readdir(path.join(serverDir, ".rippermoon", "world-library"))).length, 1);
+
   // Reading is not blocked by Origin, and gets no permission to be read cross-site.
   const read = await app.request({ headers: { Origin: "https://evil.example" }, path: "/api/bootstrap" });
   assert.equal(read.status, 200);
   assert.equal(read.headers["access-control-allow-origin"], undefined);
 
   const refused = app.logs.filter((entry) => entry.message === "Cross-site request refused");
-  assert.equal(refused.length, 17);
+  assert.equal(refused.length, 21);
   assert.deepEqual(refused[0].meta, { host, method: "POST", origin: "https://evil.example", path: "/api/users" });
 });
 

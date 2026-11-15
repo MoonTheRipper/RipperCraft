@@ -494,34 +494,58 @@ test("many guesses sent at once are not all checked", async (t) => {
   assert.equal(derivations.count, 5);
 });
 
-test("a login that fails for another reason does not count as a wrong password", async (t) => {
+test("a login that could not be checked does not count as a wrong password", async (t) => {
   const app = await startApp(t, { app: { now: clock() } });
   await app.setupOwner();
-  const usersFile = path.join(app.root, "data", "users.json");
-  const saved = await fsp.readFile(usersFile, "utf8");
 
-  // The account list cannot be read, so no password is ever checked.
-  await fsp.writeFile(usersFile, "{ this is not json");
+  // The derivation itself fails, after the attempt has been let through and
+  // counted provisionally. Eight of those in a row, where five wrong passwords
+  // would have closed the door.
+  const realScrypt = crypto.scrypt;
+  let failing = true;
+  t.mock.method(crypto, "scrypt", (...args) => {
+    if (failing) {
+      args.pop()(new Error("the derivation failed"));
+    } else {
+      realScrypt(...args);
+    }
+  });
   for (let index = 0; index < 8; index += 1) {
-    assert.equal((await loginFrom(app, "198.51.100.60", "owner", OWNER_PASSWORD)).status, 500);
+    const response = await loginFrom(app, "198.51.100.60", "owner", OWNER_PASSWORD);
+    assert.equal(response.status, 500);
   }
-  await fsp.writeFile(usersFile, saved);
+  failing = false;
 
-  assert.equal((await loginFrom(app, "198.51.100.60", "owner", OWNER_PASSWORD)).status, 200);
+  // None of them was a guess: the address still has all five of its tries.
+  for (let index = 0; index < 5; index += 1) {
+    assert.equal((await loginFrom(app, "198.51.100.60", "owner", "a-real-wrong-guess")).status, 401);
+  }
+  assert.equal((await loginFrom(app, "198.51.100.60", "owner", OWNER_PASSWORD)).status, 429);
+  assert.equal((await loginFrom(app, "198.51.100.61", "owner", OWNER_PASSWORD)).status, 200);
 });
 
 test("wrong server passphrases are limited per account and per server", async (t) => {
   const now = clock();
-  const app = await startApp(t, { app: { now } });
+  // A second server, so that "per server" can be told from "per account".
+  const root = await createRoot(t);
+  const otherDir = path.join(root, "servers", "OtherServer");
+  await fsp.mkdir(path.join(otherDir, "world"), { recursive: true });
+  await fsp.writeFile(path.join(otherDir, "launch-server.sh"), "#!/usr/bin/env bash\nexit 0\n");
+  await fsp.writeFile(path.join(otherDir, "server.properties"), "motd=Other\n");
+  await fsp.writeFile(path.join(otherDir, "world", "level.dat"), "demo");
+  const app = await startApp(t, { app: { now }, root });
   const owner = await app.setupOwner();
 
-  assert.equal(
-    (await owner("PUT", "/api/servers/DemoServer/settings", { json: { loader: "fabric", passphrase: "lane-secret" } })).status,
-    200
-  );
+  for (const [serverId, passphrase] of [
+    ["DemoServer", "lane-secret"],
+    ["OtherServer", "other-secret"]
+  ]) {
+    const saved = await owner("PUT", `/api/servers/${serverId}/settings`, { json: { loader: "fabric", passphrase } });
+    assert.equal(saved.status, 200);
+  }
   for (const username of ["lane", "moss"]) {
     const created = await owner("POST", "/api/users", {
-      json: { password: ADMIN_PASSWORD, servers: ["DemoServer"], username }
+      json: { password: ADMIN_PASSWORD, servers: ["DemoServer", "OtherServer"], username }
     });
     assert.equal(created.status, 201);
   }
@@ -550,6 +574,13 @@ test("wrong server passphrases are limited per account and per server", async (t
   // Another admin of the same server is not affected, and neither is the owner.
   assert.equal((await unlock(moss, "lane-secret")).status, 200);
   assert.equal((await unlock(owner, "")).status, 200);
+
+  // Nor is the same admin on another server: a wrong guess there is a wrong
+  // guess, and the right passphrase unlocks it.
+  const elsewhere = (passphrase) => lane("POST", "/api/servers/OtherServer/unlock", { json: { passphrase } });
+  assert.equal((await elsewhere("not-it")).status, 403);
+  assert.equal((await elsewhere("other-secret")).status, 200);
+  assert.equal((await unlock(lane, "lane-secret")).status, 429);
 
   // A passphrase that is not text is simply wrong, not a server error.
   assert.equal((await unlock(moss, { $ne: null })).status, 403);

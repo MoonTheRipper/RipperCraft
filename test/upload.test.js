@@ -513,19 +513,33 @@ test("an upload over the limit gets 413 whether or not it declared its size, and
   assert.equal((await app.request({ path: "/api/bootstrap" })).json.uploadLimitBytes, limit);
   const tooBig = crypto.randomBytes(limit + 1);
 
-  // Content-Length gives it away before a byte of the file is taken.
+  // Whether a temporary file was ever opened tells the two refusals apart.
+  const realOpen = fsp.open;
+  let tempFilesOpened = 0;
+  t.mock.method(fsp, "open", (...args) => {
+    if (/\.upload-[0-9a-f]{16}\.part$/.test(String(args[0]))) {
+      tempFilesOpened += 1;
+    }
+    return realOpen(...args);
+  });
+
+  // Content-Length gives it away before a byte of the file is taken: nothing
+  // is opened, nothing is written.
   const declared = await upload(owner, "/api/servers/DemoServer/worlds/import", [
     filePart("archive", "huge.zip", crypto.randomBytes(3 * 1024 * 1024))
   ]);
   assert.equal(declared.status, 413);
   assert.deepEqual(declared.json, { error: "That file is larger than the 64 KB upload limit." });
+  assert.equal(tempFilesOpened, 0);
   assert.deepEqual(await listing(library), []);
 
   // Just over the limit, inside the allowance for the form's own overhead, so
-  // it is the byte count while streaming that catches it.
+  // it is the byte count while streaming that catches it - after the file was
+  // opened, which is why it then has to be removed.
   const counted = await upload(owner, "/api/servers/DemoServer/worlds/import", [filePart("archive", "over.zip", tooBig)]);
   assert.equal(counted.status, 413);
   assert.deepEqual(counted.json, { error: "That file is larger than the 64 KB upload limit." });
+  assert.equal(tempFilesOpened, 1);
   assert.deepEqual(await listing(library), []);
 
   // No Content-Length at all.
