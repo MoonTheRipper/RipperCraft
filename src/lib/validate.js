@@ -67,6 +67,19 @@ function hasControlCharacters(text) {
   return CONTROL_CHARACTERS.test(text);
 }
 
+const EVERY_CONTROL_CHARACTER = new RegExp(CONTROL_CHARACTERS.source, "g");
+
+// Text read back from a file that is not the dashboard's alone to write - one
+// in a server's folder, where the server and anything it runs can write too -
+// on its way to a page. Text comes back on one line, trimmed, and no longer
+// than maxLength. Anything that is not text comes back as "".
+function displayText(value, maxLength = 200) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  return value.replace(EVERY_CONTROL_CHARACTER, " ").trim().slice(0, maxLength);
+}
+
 // One line of text for a named field, trimmed. Refuses anything that is not
 // text, that holds a control character, or that is too long.
 function singleLine(value, label, options = {}) {
@@ -216,6 +229,7 @@ module.exports = {
   KNOWN_LOADERS,
   LEVEL_TYPES,
   MINECRAFT_VERSION_MAX_LENGTH,
+  displayText,
   hasControlCharacters,
   integerInRange,
   invalid,

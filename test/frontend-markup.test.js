@@ -106,6 +106,17 @@ test("escaping never throws, whatever it is handed", async () => {
   }
 });
 
+test("a time is shown as a time or as unknown, and never breaks the page", async () => {
+  const { formatDate } = await loadPublicModule("js/format.js");
+
+  assert.equal(formatDate("2026-11-15T12:00:00.000Z"), new Date("2026-11-15T12:00:00.000Z").toLocaleString());
+  assert.equal(formatDate(1_700_000_000_000), new Date(1_700_000_000_000).toLocaleString());
+  // Asking Date to read an object can throw; none of these is asked.
+  for (const value of [null, undefined, "", "not a date", MARKER, {}, [], { toString: 1, valueOf: 2 }, { toString: null }, ["2026-11-15"], true, Number.NaN]) {
+    assert.equal(formatDate(value), "unknown", JSON.stringify(value));
+  }
+});
+
 test("no text in a response is drawn as markup on any page", async (t) => {
   const responses = await realResponses(t);
 

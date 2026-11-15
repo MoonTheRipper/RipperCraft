@@ -1,10 +1,10 @@
 import { state } from "./state.js";
 
+// A time is text or a number. Anything else has no date in it, and asking
+// Date to make one of it can throw.
 export function formatDate(value) {
-  if (!value) {
-    return "unknown";
-  }
-  return new Date(value).toLocaleString();
+  const date = typeof value === "string" || typeof value === "number" ? new Date(value) : null;
+  return date && !Number.isNaN(date.getTime()) ? date.toLocaleString() : "unknown";
 }
 
 // "512 KB", "3.5 MB", "4 GB" - for telling someone how big a file is.

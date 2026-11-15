@@ -136,6 +136,15 @@ test("the add-on list is sent as text, whatever the manifest file holds", async 
       assert.equal(mods.find((entry) => entry.fileName === "untracked.jar").tracked, false);
     }
     assert.doesNotMatch(JSON.stringify(snapshot.mods), /onerror|javascript:/);
+
+    // The update check reads the same file and reports on every entry in it.
+    const updates = await client("GET", "/api/servers/DemoServer/mods/updates");
+    assert.equal(updates.status, 200, updates.text);
+    for (const [at, value] of leaves(updates.json)) {
+      assert.ok(value === null || ["string", "boolean", "number"].includes(typeof value), `updates${at} is ${JSON.stringify(value)}`);
+    }
+    assert.deepEqual(updates.json.entries.map((entry) => entry.fileName).sort(), ["honest.jar", "hostile.jar", "untracked.jar"]);
+    assert.doesNotMatch(updates.text, /onerror|javascript:/);
   }
 });
 
@@ -224,3 +233,160 @@ test("search results reach the page as text and numbers, whatever the provider s
     title: "A Mod"
   });
 });
+
+// --- files in the server's folder -----------------------------------------------------------
+//
+// The dashboard keeps a few JSON files in each server's folder, and so does the
+// game. The server runs there as the same user, and so does every mod an admin
+// installs, so those files can hold anything - and the pages draw what is in them.
+
+test("the world list is drawn from text and times, whatever the worlds file holds", async (t) => {
+  const { admin, app, owner } = await startWithAdmin(t);
+  const serverDir = path.join(app.root, "servers", "DemoServer");
+  const worldsFile = path.join(serverDir, ".rippermoon", "worlds.json");
+  await fsp.mkdir(path.dirname(worldsFile), { recursive: true });
+  // With no world folder, the name and the time shown are the file's.
+  await fsp.rm(path.join(serverDir, "world"), { force: true, recursive: true });
+  const long = "W".repeat(5000);
+
+  const cases = [
+    ["null", "null", null],
+    ["a list", "[1,2]", null],
+    ["text", '"just text"', null],
+    ["a number", "7", null],
+    ["not JSON at all", "{{{{", null],
+    ["an empty file", "", null],
+    ["objects for both", JSON.stringify({ activeWorldName: { toString: "x" }, updatedAt: { toString: "x" } }), null],
+    ["a list for the name", JSON.stringify({ activeWorldName: [MARKUP], updatedAt: 12345 }), null],
+    ["a name with no time", JSON.stringify({ activeWorldName: "Named" }), "Named"],
+    ["a time that is not one", JSON.stringify({ activeWorldName: "Named", updatedAt: MARKUP }), "Named"],
+    ["a name of several lines", JSON.stringify({ activeWorldName: "one\ntwo\u0000three", updatedAt: "2026-11-15T12:00:00.000Z" }), "one two three"],
+    ["a very long name", JSON.stringify({ activeWorldName: long, updatedAt: "2026-11-15T12:00:00.000Z" }), "W".repeat(200)],
+    ["what the dashboard writes", JSON.stringify({ activeWorldName: "Survival", updatedAt: "2026-11-15T12:00:00.000Z" }), "Survival"]
+  ];
+
+  for (const [label, contents, name] of cases) {
+    await fsp.writeFile(worldsFile, contents);
+    for (const client of [admin, owner]) {
+      const response = await client("GET", "/api/servers/DemoServer");
+      assert.equal(response.status, 200, `${label}: ${response.text}`);
+      const active = response.json.worlds.filter((world) => world.kind === "active");
+      if (name === null) {
+        assert.deepEqual(active, [], label);
+        continue;
+      }
+      assert.equal(active.length, 1, label);
+      assert.equal(active[0].name, name, label);
+      // A time the page can show: text that is a date.
+      assert.equal(typeof active[0].modifiedAt, "string", label);
+      assert.equal(new Date(active[0].modifiedAt).toISOString(), active[0].modifiedAt, label);
+    }
+  }
+
+  // The time in the file is used when it is one.
+  const shown = (await admin("GET", "/api/servers/DemoServer")).json.worlds[0];
+  assert.equal(shown.modifiedAt, "2026-11-15T12:00:00.000Z");
+});
+
+test("the operator list is drawn from text and numbers, whatever ops.json holds", async (t) => {
+  const { app, owner } = await startWithAdmin(t);
+  const serverDir = path.join(app.root, "servers", "DemoServer");
+  // An offline-mode server works a player's id out from the name, so adding
+  // an operator below asks nobody.
+  await fsp.appendFile(path.join(serverDir, "server.properties"), "online-mode=false\n");
+  const steve = "8667ba71-b85a-4004-af54-457a9734eed7";
+  await fsp.writeFile(
+    path.join(serverDir, "ops.json"),
+    JSON.stringify([
+      null,
+      7,
+      "Steve",
+      [{ name: "InAList" }],
+      { name: { toString: "x" }, uuid: steve },
+      { name: [MARKUP] },
+      { name: "   " },
+      { level: 2, name: "N".repeat(500), uuid: "069a79f4-44e9-4726-a5be-fca90e38aaf5" },
+      { bypassesPlayerLimit: "yes", level: { toString: "x" }, name: "Alex\nline two", uuid: { toString: "x" } },
+      { bypassesPlayerLimit: true, level: 2, name: "Steve", uuid: steve.toUpperCase() }
+    ])
+  );
+
+  const response = await owner("GET", "/api/servers/DemoServer");
+  assert.equal(response.status, 200, response.text);
+  const operators = response.json.operators;
+  for (const [at, value] of leaves(operators)) {
+    assert.ok(["string", "boolean", "number"].includes(typeof value), `${at} is ${JSON.stringify(value)}`);
+  }
+  assert.deepEqual(operators.map((operator) => [operator.name, operator.level, operator.bypassesPlayerLimit]), [
+    ["Alex line two", 4, false],
+    ["N".repeat(64), 2, false],
+    ["Steve", 2, true]
+  ]);
+  assert.equal(operators.find((operator) => operator.name === "Steve").uuid, steve);
+  // No uuid that is text: the one an offline server would give that name.
+  assert.match(operators[0].uuid, /^[0-9a-f]{8}-[0-9a-f]{4}-3[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+
+  // And the list can still be changed from there.
+  const added = await owner("POST", "/api/servers/DemoServer/operators", { json: { level: 1, name: "Moon" } });
+  assert.ok([200, 201].includes(added.status), added.text);
+  const kept = JSON.parse(await fsp.readFile(path.join(serverDir, "ops.json"), "utf8"));
+  assert.deepEqual(kept.map((operator) => operator.name).sort(), ["Alex line two", "Moon", "N".repeat(64), "Steve"]);
+});
+
+test("an add-on manifest that is not a manifest lists nothing as tracked and breaks nothing", async (t) => {
+  const { admin, app } = await startWithAdmin(t);
+  const serverDir = path.join(app.root, "servers", "DemoServer");
+  await fsp.writeFile(path.join(serverDir, "mods", "untracked.jar"), "jar");
+  await fsp.mkdir(path.join(serverDir, ".rippermoon"), { recursive: true });
+
+  for (const contents of ["null", "7", '"text"', "[]", '{"addons":null}', '{"addons":{"0":{"fileName":"untracked.jar"}}}', '{"addons":[null,7,"untracked.jar",["untracked.jar"],{"fileName":{"toString":"x"}},{"title":"no file"}]}']) {
+    await fsp.writeFile(path.join(serverDir, ".rippermoon", "addons.json"), contents);
+    const snapshot = await admin("GET", "/api/servers/DemoServer");
+    assert.equal(snapshot.status, 200, `${contents}: ${snapshot.text}`);
+    assert.deepEqual(snapshot.json.mods, [{ enabled: true, fileName: "untracked.jar", tracked: false }], contents);
+    // The routes that read the manifest to act on it get through it too.
+    const disabled = await admin("POST", "/api/servers/DemoServer/mods/toggle", { json: { enabled: false, fileName: "untracked.jar" } });
+    assert.equal(disabled.status, 200, `${contents}: ${disabled.text}`);
+    const enabled = await admin("POST", "/api/servers/DemoServer/mods/toggle", { json: { enabled: true, fileName: "untracked.jar" } });
+    assert.equal(enabled.status, 200, `${contents}: ${enabled.text}`);
+  }
+});
+
+test("a safe setting sent as something that is not text or a number is not saved, and is not a fault", async (t) => {
+  const { admin, app } = await startWithAdmin(t);
+  const propertiesFile = path.join(app.root, "servers", "DemoServer", "server.properties");
+  const save = (safeProperties) => admin("PUT", "/api/servers/DemoServer/settings", { json: safeProperties === undefined ? {} : { safeProperties } });
+  const faults = () => app.logs.filter((entry) => entry.level === "error").length;
+
+  assert.equal((await save({ difficulty: "hard", "max-players": 12, "view-distance": "9" })).status, 200);
+  const before = await fsp.readFile(propertiesFile, "utf8");
+  assert.match(before, /^max-players=12$/m);
+  assert.match(before, /^difficulty=hard$/m);
+  const faultsBefore = faults();
+
+  // A list nested deeply enough that turning it into text runs out of stack.
+  // Written out as text: building it as a value would run this test out too.
+  const deep = `${"[".repeat(100_000)}${"]".repeat(100_000)}`;
+  for (const value of ['{"toString":"x"}', '{"valueOf":"x","toString":"x"}', "[12]", '["hard"]', JSON.stringify({ __html: MARKUP }), "true", deep]) {
+    for (const key of ["max-players", "view-distance", "difficulty", "gamemode"]) {
+      const response = await admin("PUT", "/api/servers/DemoServer/settings", {
+        body: `{"safeProperties":{"${key}":${value}}}`,
+        headers: { "Content-Type": "application/json" }
+      });
+      // Taken as "not a number" or "not one of the words": the default, as for
+      // any other value that is neither.
+      assert.equal(response.status, 200, `${key}=${value.slice(0, 40)}: ${response.text.slice(0, 200)}`);
+      assert.match(String(response.json.safeProperties[key]), /^[a-z0-9-]+$/, key);
+    }
+  }
+  assert.equal(faults(), faultsBefore);
+  // What was written each time was the setting's default: a number or a word.
+  const after = await fsp.readFile(propertiesFile, "utf8");
+  assert.doesNotMatch(after, /object Object|onerror|toString|\[|\{/);
+  for (const line of after.split("\n").filter(Boolean)) {
+    assert.match(line, /^[a-z-]+=[A-Za-z0-9 ]*$/, line);
+  }
+  assert.match(after, /^max-players=\d+$/m);
+  assert.match(after, /^difficulty=(peaceful|easy|normal|hard)$/m);
+});
+

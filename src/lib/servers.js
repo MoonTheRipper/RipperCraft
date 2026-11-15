@@ -36,6 +36,7 @@ const {
   integerInRange,
   invalid,
   isArgFilePath,
+  displayText,
   isMemorySetting,
   isMinecraftVersion,
   normalizeLoader,
@@ -222,13 +223,16 @@ function createServerManager(store, options = {}) {
       return coerceBoolean(value) ? "true" : "false";
     }
 
+    // A number or one of a few words, sent as text or as a number. An object
+    // or a list is neither, and is not asked to turn itself into text: one
+    // that could not answered the request with a server fault.
     if (definition.type === "number") {
-      const text = String(value).trim();
+      const text = (plainText(value) ?? "").trim();
       return /^-?\d+$/.test(text) ? text : definition.defaultValue;
     }
 
     if (definition.type === "enum") {
-      const text = String(value).trim().toLowerCase();
+      const text = (plainText(value) ?? "").trim().toLowerCase();
       return definition.options.includes(text) ? text : definition.defaultValue;
     }
 
@@ -1056,16 +1060,24 @@ function createServerManager(store, options = {}) {
     return offlinePlayerUuid(name);
   }
 
+  // One operator out of ops.json. That file is the server's as much as the
+  // dashboard's - the game writes it, and so can anything else the server
+  // runs - and the owner's page draws what is in it. An entry is a record with
+  // a name that is text; anything else in the list is not an operator.
   function normalizeOperator(entry) {
-    const name = String(entry && entry.name ? entry.name : "").trim();
-    const uuid = String(entry && entry.uuid ? entry.uuid : "").trim().toLowerCase();
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return null;
+    }
+    const name = displayText(entry.name, 64);
+    const uuid = displayText(entry.uuid, 64).toLowerCase();
     if (!name) {
       return null;
     }
+    const level = typeof entry.level === "number" || typeof entry.level === "string" ? Number.parseInt(entry.level, 10) : NaN;
     return {
       uuid: uuid || offlinePlayerUuid(name),
       name,
-      level: Math.min(4, Math.max(1, Number.parseInt(entry.level, 10) || 4)),
+      level: Math.min(4, Math.max(1, level || 4)),
       bypassesPlayerLimit: entry.bypassesPlayerLimit === true
     };
   }
@@ -1240,8 +1252,18 @@ function createServerManager(store, options = {}) {
       throw new Error("Server not found.");
     }
     const paths = resolveRecordPaths(server);
-    const payload = await readJson(paths.addonManifestFile, { addons: [] });
-    return Array.isArray(payload.addons) ? payload.addons : [];
+    const payload = await readJson(paths.addonManifestFile, null);
+    const addons = payload && typeof payload === "object" && Array.isArray(payload.addons) ? payload.addons : [];
+    // An entry is the record of one file, and each field of it is a word, a
+    // number or a yes/no. The manifest sits in the server's folder, so it can
+    // hold anything. What is not a record with a file name is not an entry,
+    // and a field holding anything else is left out - here, once, so that no
+    // reader of the manifest (the add-on list, the update check, the update
+    // plan) passes an object on to a page that expects text.
+    const plain = (value) => value === null || typeof value === "string" || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value));
+    return addons
+      .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry) && typeof entry.fileName === "string")
+      .map((entry) => Object.fromEntries(Object.entries(entry).filter(([, value]) => plain(value))));
   }
 
   async function writeAddonManifest(serverId, addons) {
@@ -2586,7 +2608,24 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       throw new Error("Server not found.");
     }
     const paths = resolveRecordPaths(server);
-    return await readJson(paths.worldMetadataFile, { activeWorldName: null });
+    // What the dashboard remembers about a server's worlds: what the live one
+    // is called and when that was set. The file is in the server's folder,
+    // where the server - and any mod it runs - can write, and both fields are
+    // drawn on the page. So a name comes back as a short piece of text or as
+    // nothing, a time as a time or as nothing, and a file that cannot be read
+    // counts as one that is not there.
+    let stored = null;
+    try {
+      stored = await readJson(paths.worldMetadataFile, null);
+    } catch {
+      stored = null;
+    }
+    const fields = stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {};
+    const updatedAt = typeof fields.updatedAt === "string" ? Date.parse(fields.updatedAt) : Number.NaN;
+    return {
+      activeWorldName: displayText(fields.activeWorldName) || null,
+      updatedAt: Number.isFinite(updatedAt) ? new Date(updatedAt).toISOString() : null
+    };
   }
 
   async function writeWorldMetadata(serverId, metadata) {
