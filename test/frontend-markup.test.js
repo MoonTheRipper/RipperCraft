@@ -1,0 +1,201 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const { setHashCostForTests } = require("../src/lib/auth");
+const { PUBLIC_ROOT, installBrowserStubs, loadPublicModule } = require("../test-support/browser");
+const { startWithAdmin } = require("../test-support/lane");
+
+setHashCostForTests({ ln: 10, r: 8, p: 1 });
+installBrowserStubs();
+
+// Markup that would be unmistakable if it ever reached the page unescaped.
+const MARKER = '<b data-marker="x" onclick=\'alert(1)\'>unescaped</b>';
+
+function listFiles(directory) {
+  const found = [];
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const full = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      found.push(...listFiles(full));
+    } else {
+      found.push(full);
+    }
+  }
+  return found;
+}
+
+// A copy of a response with every piece of text in it replaced.
+function replaceEveryString(value, replacement) {
+  if (typeof value === "string") {
+    return replacement(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => replaceEveryString(item, replacement));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, replaceEveryString(item, replacement)]));
+  }
+  return value;
+}
+
+// Everything the server sends for one server, as the owner and as the admin,
+// with enough in it that every list on the page has a row to draw.
+async function realResponses(t) {
+  const { admin, app, owner } = await startWithAdmin(t);
+  const serverDir = path.join(app.root, "servers", "DemoServer");
+  fs.writeFileSync(path.join(serverDir, "mods", "example-mod.jar"), "jar");
+  fs.writeFileSync(path.join(serverDir, "ops.json"), JSON.stringify([{ level: 4, name: "Moon", uuid: "0-0" }]));
+  assert.equal((await admin("POST", "/api/servers/DemoServer/worlds/capture", { json: { label: "first" } })).status, 200);
+
+  return {
+    adminSnapshot: (await admin("GET", "/api/servers/DemoServer")).json,
+    bootstrap: (await owner("GET", "/api/bootstrap")).json,
+    ownerSnapshot: (await owner("GET", "/api/servers/DemoServer")).json,
+    servers: (await owner("GET", "/api/servers")).json.servers,
+    users: (await owner("GET", "/api/users")).json.users
+  };
+}
+
+// Draws every server section and every owner page from the given responses.
+async function renderEverything(responses, role) {
+  const { state } = await loadPublicModule("js/state.js");
+  const { renderServerContent } = await loadPublicModule("js/views/server.js");
+  const { renderOwnerContent } = await loadPublicModule("js/views/owner.js");
+  const { renderSidebar } = await loadPublicModule("js/views/nav.js");
+
+  const saved = { ...state };
+  const pages = [];
+  try {
+    state.bootstrap = { ...responses.bootstrap, user: { ...responses.bootstrap.user, role } };
+    state.servers = responses.servers;
+    state.users = responses.users;
+    state.selectedServerId = "DemoServer";
+    state.serverSnapshot = role === "owner" ? responses.ownerSnapshot : responses.adminSnapshot;
+    state.view = "server";
+    for (const section of ["overview", "settings", "worlds", "mods", "logs"]) {
+      state.serverSection = section;
+      pages.push(renderServerContent());
+    }
+    pages.push(renderSidebar("light"));
+    if (role === "owner") {
+      state.view = "owner";
+      for (const section of ["servers", "admins", "integrations"]) {
+        state.ownerSection = section;
+        pages.push(renderOwnerContent());
+      }
+    }
+  } finally {
+    Object.assign(state, saved);
+  }
+  return pages.join("\n");
+}
+
+test("a value that only looks like trusted markup is shown as nothing", async () => {
+  const { renderMetaRows } = await loadPublicModule("js/components.js");
+  const { rawHtml, renderValue } = await loadPublicModule("js/html.js");
+
+  // What an admin could save as a loader, exactly as a response carries it.
+  const forged = JSON.parse(JSON.stringify({ __html: MARKER }));
+  assert.equal(renderValue(forged), "");
+  assert.doesNotMatch(renderMetaRows([["loader", forged]]), /data-marker/);
+
+  // The real thing still works, and only for markup made by calling rawHtml().
+  assert.equal(renderValue(rawHtml("<code>/srv</code>")), "<code>/srv</code>");
+  assert.ok(renderMetaRows([["directory", rawHtml("<code>/srv</code>")]]).includes("<strong><code>/srv</code></strong>"));
+  assert.equal(renderValue(MARKER).includes("<b"), false);
+});
+
+test("trusted markup does not survive being sent anywhere", async () => {
+  const { rawHtml, renderValue } = await loadPublicModule("js/html.js");
+  const trusted = rawHtml(MARKER);
+
+  // JSON has no way to write the marker down, so a round trip through a
+  // request or a response leaves an empty object.
+  assert.equal(JSON.stringify(trusted), "{}");
+  assert.equal(renderValue(JSON.parse(JSON.stringify(trusted))), "");
+  assert.equal(renderValue(structuredClone({ ...trusted })), "");
+  // Nothing about it can be read or changed by its name.
+  assert.deepEqual(Object.keys(trusted), []);
+  assert.equal(trusted.__html, undefined);
+  assert.equal(Object.isFrozen(trusted), true);
+});
+
+test("nothing under public/ spells the old marker any more", () => {
+  const offenders = listFiles(PUBLIC_ROOT)
+    .filter((file) => /\.(js|html)$/.test(file))
+    .filter((file) => fs.readFileSync(file, "utf8").includes("__html"))
+    .map((file) => path.relative(PUBLIC_ROOT, file));
+  // html.js explains what the marker used to be, in a comment; nothing else
+  // mentions it, and no code does.
+  assert.deepEqual(offenders, ["js/html.js"]);
+  const mentions = fs
+    .readFileSync(path.join(PUBLIC_ROOT, "js", "html.js"), "utf8")
+    .split("\n")
+    .filter((line) => line.includes("__html"));
+  assert.ok(mentions.length > 0);
+  for (const line of mentions) {
+    assert.match(line, /^\s*\/\//, line);
+  }
+});
+
+test("escaping never throws, whatever it is handed", async () => {
+  const { escapeHtml, renderSelectOptions, renderValue, safeUrl } = await loadPublicModule("js/html.js");
+
+  assert.equal(escapeHtml(0), "0");
+  assert.equal(escapeHtml(false), "false");
+  assert.equal(escapeHtml(null), "");
+  assert.equal(escapeHtml(undefined), "");
+  assert.equal(escapeHtml(MARKER).includes("<"), false);
+
+  // A response is JSON, so these are all shapes a field can take.
+  const awkward = [{}, [], [MARKER], { __html: MARKER }, { toString: 1, valueOf: 2 }, { toString: null }, { length: 3 }];
+  for (const value of awkward) {
+    assert.equal(escapeHtml(value), "", JSON.stringify(value));
+    assert.equal(renderValue(value), "", JSON.stringify(value));
+    assert.equal(safeUrl(value), "", JSON.stringify(value));
+    assert.equal(renderSelectOptions(["a"], value), '<option value="a" >a</option>');
+  }
+});
+
+test("no text in a response is drawn as markup on any page", async (t) => {
+  const responses = await realResponses(t);
+
+  for (const role of ["owner", "admin"]) {
+    // Every string the server sent, swapped for markup.
+    const hostile = replaceEveryString(responses, () => MARKER);
+    hostile.bootstrap.user.role = role;
+    const page = await renderEverything(hostile, role);
+
+    assert.doesNotMatch(page, /<b data-marker/, role);
+    assert.doesNotMatch(page, /onclick='alert/, role);
+    // It was drawn, as text.
+    assert.match(page, /&lt;b data-marker=&quot;x&quot;/, role);
+  }
+});
+
+test("no object in a response is drawn as markup, and none of them breaks a page", async (t) => {
+  const responses = await realResponses(t);
+
+  for (const role of ["owner", "admin"]) {
+    // The same, with an object of the old trusted shape where each string was.
+    const hostile = replaceEveryString(responses, () => ({ __html: MARKER }));
+    hostile.bootstrap.user.role = role;
+    const page = await renderEverything(hostile, role);
+
+    assert.doesNotMatch(page, /data-marker/, role);
+    // And the page was drawn: an object where text belonged did not throw.
+    assert.match(page, /<h2>/, role);
+  }
+});
+
+test("the pages still draw what the server really sends", async (t) => {
+  const responses = await realResponses(t);
+  const page = await renderEverything(responses, "owner");
+
+  assert.match(page, /<strong>fabric<\/strong>/);
+  assert.match(page, /<strong>1\.21\.1<\/strong>/);
+  assert.match(page, /<strong><code>servers\/DemoServer<\/code><\/strong>/);
+  assert.match(page, /example-mod\.jar/);
+  assert.match(page, /first\.zip/);
+});
