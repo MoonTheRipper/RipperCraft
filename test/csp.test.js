@@ -229,4 +229,8 @@ test("the progress bar is drawn without a style attribute, and filled from scrip
   // And an unfilled bar is empty, not full.
   const css = fs.readFileSync(path.join(PUBLIC_ROOT, "styles.css"), "utf8");
   assert.match(css, /\.progress-track__fill\s*\{\s*width:\s*0;/);
+  // Each redraw makes a new bar, empty until the script has run. Animating the
+  // width made it sweep up from nothing on every redraw.
+  const rule = /\.progress-track__fill\s*\{([^}]*)\}/.exec(css)[1];
+  assert.doesNotMatch(rule, /transition|animation/);
 });
