@@ -345,10 +345,11 @@ test("backups, restores and new worlds asked for together all happen, one after 
     world.worldManager.createNewWorld("DemoServer", { name: "fresh" }),
     world.worldManager.captureActiveWorld("DemoServer", "three")
   ]);
+  // The export is a file in the temp folder; it goes whatever happens below.
+  t.after(() => outcomes[3].status === "fulfilled" && outcomes[3].value.cleanup());
   // In the order they were asked for: the last backup finds no world left.
   assert.deepEqual(outcomes.map((outcome) => outcome.status), ["fulfilled", "fulfilled", "fulfilled", "fulfilled", "fulfilled", "rejected"]);
   assert.match(outcomes[5].reason.message, /no world to back up/);
-  await outcomes[3].value.cleanup();
 
   const levels = world.names().filter((name) => name !== "incoming.zip").map((name) => [name.replace(/^[^Z]*Z-/, ""), world.levelIn(name)]);
   assert.deepEqual(levels.map(([, level]) => level).sort(), ["incoming", "incoming", "original", "original"]);
