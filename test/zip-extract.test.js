@@ -324,7 +324,7 @@ test("folders count against the limit, listed or only passed through", async (t)
   }
 });
 
-test("a path may only go so deep", async (t) => {
+test("a path may only be so many names long", async (t) => {
   const path64 = `${Array.from({ length: 63 }, (_unused, index) => `d${index}`).join("/")}/level.dat`;
   const path65 = `d/${path64}`;
 
@@ -334,7 +334,7 @@ test("a path may only go so deep", async (t) => {
   for (const name of [path65, `${"a/".repeat(200)}f`, `${"a/".repeat(65)}`]) {
     const space = await workspace(t);
     await refused(space, [{ data: "level", name: "world/level.dat" }, { data: "x", name }], undefined, {
-      error: { message: /more than 64 folders deep/, statusCode: 400 }
+      error: { message: /more than 64 names long/, statusCode: 400 }
     });
   }
 });

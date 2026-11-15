@@ -31,7 +31,7 @@ const { HttpError, describeBytes } = require("./http");
 //     the disk, and a path may name hundreds of them: a hundred kilobytes of
 //     archive made fifty thousand folders under a limit of nothing. Each folder
 //     is charged to the limit and counted with the files, and a path may only
-//     go so deep.
+//     be so many names long.
 //   * Each file's checksum is verified, so a damaged archive is refused rather
 //     than restored.
 //
@@ -57,8 +57,8 @@ const DEFAULT_MAX_ENTRIES = 200_000;
 // little enough to hold in memory.
 const MAX_DIRECTORY_BYTES = 64 * 1024 * 1024;
 const MAX_NAME_BYTES = 1024;
-// How deep a path may go. Minecraft's own go a handful of levels down, a data
-// pack's a dozen.
+// How many names long a path may be, the file's own included. Minecraft's own
+// are a handful, a data pack's a dozen.
 const MAX_DEPTH = 64;
 // What a folder is charged against the size limit: the block it takes on disk.
 const FOLDER_COST_BYTES = 4096;
@@ -216,7 +216,7 @@ function safeSegments(name) {
   // and tar-like tools write a path - is "world/level.dat".
   const segments = normalized.split("/").filter((segment) => segment !== "" && segment !== ".");
   if (segments.length > MAX_DEPTH) {
-    throw archiveError(`The archive holds a path more than ${MAX_DEPTH} folders deep (${quoted(name)}), which is not allowed.`);
+    throw archiveError(`The archive holds a path more than ${MAX_DEPTH} names long (${quoted(name)}), which is not allowed.`);
   }
   for (const segment of segments) {
     if (segment === ".." || (segment.length === 2 && /^[A-Za-z]:$/.test(segment))) {
