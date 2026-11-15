@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { setHashCostForTests } = require("../src/lib/auth");
 const { PUBLIC_ROOT, installBrowserStubs, loadPublicModule } = require("../test-support/browser");
-const { startWithAdmin } = require("../test-support/lane");
+const { realResponses, renderEverything } = require("../test-support/pages");
 
 setHashCostForTests({ ln: 10, r: 8, p: 1 });
 installBrowserStubs();
@@ -37,58 +37,6 @@ function replaceEveryString(value, replacement) {
     return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, replaceEveryString(item, replacement)]));
   }
   return value;
-}
-
-// Everything the server sends for one server, as the owner and as the admin,
-// with enough in it that every list on the page has a row to draw.
-async function realResponses(t) {
-  const { admin, app, owner } = await startWithAdmin(t);
-  const serverDir = path.join(app.root, "servers", "DemoServer");
-  fs.writeFileSync(path.join(serverDir, "mods", "example-mod.jar"), "jar");
-  fs.writeFileSync(path.join(serverDir, "ops.json"), JSON.stringify([{ level: 4, name: "Moon", uuid: "0-0" }]));
-  assert.equal((await admin("POST", "/api/servers/DemoServer/worlds/capture", { json: { label: "first" } })).status, 200);
-
-  return {
-    adminSnapshot: (await admin("GET", "/api/servers/DemoServer")).json,
-    bootstrap: (await owner("GET", "/api/bootstrap")).json,
-    ownerSnapshot: (await owner("GET", "/api/servers/DemoServer")).json,
-    servers: (await owner("GET", "/api/servers")).json.servers,
-    users: (await owner("GET", "/api/users")).json.users
-  };
-}
-
-// Draws every server section and every owner page from the given responses.
-async function renderEverything(responses, role) {
-  const { state } = await loadPublicModule("js/state.js");
-  const { renderServerContent } = await loadPublicModule("js/views/server.js");
-  const { renderOwnerContent } = await loadPublicModule("js/views/owner.js");
-  const { renderSidebar } = await loadPublicModule("js/views/nav.js");
-
-  const saved = { ...state };
-  const pages = [];
-  try {
-    state.bootstrap = { ...responses.bootstrap, user: { ...responses.bootstrap.user, role } };
-    state.servers = responses.servers;
-    state.users = responses.users;
-    state.selectedServerId = "DemoServer";
-    state.serverSnapshot = role === "owner" ? responses.ownerSnapshot : responses.adminSnapshot;
-    state.view = "server";
-    for (const section of ["overview", "settings", "worlds", "mods", "logs"]) {
-      state.serverSection = section;
-      pages.push(renderServerContent());
-    }
-    pages.push(renderSidebar("light"));
-    if (role === "owner") {
-      state.view = "owner";
-      for (const section of ["servers", "admins", "integrations"]) {
-        state.ownerSection = section;
-        pages.push(renderOwnerContent());
-      }
-    }
-  } finally {
-    Object.assign(state, saved);
-  }
-  return pages.join("\n");
 }
 
 test("a value that only looks like trusted markup is shown as nothing", async () => {

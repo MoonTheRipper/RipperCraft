@@ -145,8 +145,10 @@ export function renderAddonSideBadge(clientSide, serverSide) {
 //
 // The glyph is always present and the image is stacked over it in the same grid
 // cell, so a missing icon and one whose CDN fails both land on the placeholder
-// rather than an empty bordered box. `onerror` only has to remove the image;
-// what shows through is already there.
+// rather than an empty bordered box. A failed image only has to be removed;
+// what shows through is already there. removeFailedAddonIcon() in
+// actions/media.js does that - it used to be an onerror attribute here, which
+// is inline script and is not allowed by the Content-Security-Policy.
 //
 // The alt is empty on purpose: the add-on's name sits next to it as real text,
 // so describing the artwork again would just be read out twice.
@@ -164,7 +166,6 @@ export function renderAddonIcon(iconUrl, title) {
         loading="lazy"
         decoding="async"
         referrerpolicy="no-referrer"
-        onerror="this.remove()"
       />
     </span>
   `;

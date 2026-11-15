@@ -15,7 +15,9 @@ const { ADMIN_PASSWORD, OWNER_PASSWORD, request, sessionCookieFrom, startApp } =
 setHashCostForTests({ ln: 10, r: 8, p: 1 });
 
 const EXPECTED_SECURITY_HEADERS = {
-  "content-security-policy": "frame-ancestors 'none'",
+  "content-security-policy":
+    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https:; connect-src 'self'; " +
+    "font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
   "referrer-policy": "same-origin",
   "x-content-type-options": "nosniff",
   "x-frame-options": "DENY"
@@ -49,7 +51,7 @@ async function loggedInAdmin(app, owner, username = "lane", servers = ["DemoServ
 
 // --- security headers --------------------------------------------------------
 
-test("the security headers are exactly the four agreed, with a frame-ancestors-only policy", () => {
+test("the security headers are exactly the four agreed, with the full content security policy", () => {
   assert.deepEqual(
     Object.fromEntries(Object.entries(SECURITY_HEADERS).map(([name, value]) => [name.toLowerCase(), value])),
     EXPECTED_SECURITY_HEADERS

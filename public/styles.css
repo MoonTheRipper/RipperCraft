@@ -1086,7 +1086,10 @@ textarea {
   background: var(--c-surface-2);
 }
 
+/* The width is set from script, from the element's data-progress (see
+   js/progress.js). Until that has run the bar is empty, not full. */
 .progress-track__fill {
+  width: 0;
   height: 100%;
   background: var(--c-accent-fill);
   transition: width var(--motion-base) var(--ease);

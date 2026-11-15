@@ -24,15 +24,11 @@
   </head>
   <body>
     <!-- Lives outside #app so it survives every re-render: a live region that is
-         inserted together with its text is not reliably announced. Hidden with
-         inline styles rather than a class so it cannot be un-hidden by a
-         stylesheet change. -->
-    <div
-      id="notice-live"
-      role="status"
-      aria-live="polite"
-      style="position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0,0,0,0);clip-path:inset(50%);border:0;white-space:nowrap"
-    ></div>
+         inserted together with its text is not reliably announced. Hidden by
+         the stylesheet's visually-hidden class, which holds the same rules an
+         inline style used to: the Content-Security-Policy allows no inline
+         styles anywhere on the page. -->
+    <div id="notice-live" class="visually-hidden" role="status" aria-live="polite"></div>
     <div id="app"></div>
     <noscript>
       <main class="auth-shell">
