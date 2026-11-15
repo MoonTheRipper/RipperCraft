@@ -30,6 +30,15 @@ const {
   withinParent,
   writeJson
 } = require("./utils");
+const {
+  integerInRange,
+  invalid,
+  isMinecraftVersion,
+  normalizeLoader,
+  normalizeMinecraftVersion,
+  plainText,
+  singleLine
+} = require("./validate");
 
 const MOJANG_MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 const PAPER_DOWNLOADS_API = "https://fill.papermc.io/v3";
@@ -395,6 +404,16 @@ function createServerManager(store) {
 
     return {
       ...withDirectory,
+      // These four are shown in the browser and read all over this file as
+      // text. A record written before they were checked on the way in could
+      // hold anything JSON can, so one that is not text is replaced here.
+      description: typeof withDirectory.description === "string" ? withDirectory.description : "",
+      loader: typeof withDirectory.loader === "string" ? withDirectory.loader : "vanilla",
+      minecraftVersion: typeof withDirectory.minecraftVersion === "string" ? withDirectory.minecraftVersion : "unknown",
+      name:
+        typeof withDirectory.name === "string" && withDirectory.name
+          ? withDirectory.name
+          : displayNameFromSlug(recordId),
       javaBin: String(withDirectory.javaBin || "").trim(),
       logFile: normalizeServerRelativePath(withDirectory, withDirectory.logFile, "logs/latest.log"),
       modsDir: normalizeServerRelativePath(withDirectory, withDirectory.modsDir, "mods"),
@@ -599,7 +618,9 @@ function createServerManager(store) {
       }
 
       const relativeDirectory = path.join("servers", directoryName);
-      const version = await detectVersion(path.join(store.rootDir, relativeDirectory));
+      // Read from the server's own log or jar link, which a mod can write.
+      const detected = await detectVersion(path.join(store.rootDir, relativeDirectory));
+      const version = isMinecraftVersion(detected) ? detected : "unknown";
       records[directoryName] = {
         id: directoryName,
         name: displayNameFromSlug(directoryName),
@@ -801,13 +822,74 @@ function createServerManager(store) {
     return trimmed;
   }
 
+  // Checks a change to a server record, field by field, and returns it ready to
+  // store. Every caller goes through here - the settings route for owners and
+  // admins alike, and this file's own runtime updates - so no route can hand a
+  // record something that was never looked at.
+  //
+  // A field that is absent or undefined is left out of the result, and so
+  // keeps the value the record already has. It used to be written as
+  // undefined, which dropped it from the record: saving only a Minecraft
+  // version erased the loader.
+  function checkMetadataPatch(patch) {
+    const checked = {};
+    for (const [field, value] of Object.entries(patch || {})) {
+      if (value === undefined) {
+        continue;
+      }
+      switch (field) {
+        case "name":
+          checked.name = singleLine(value, "The server name", { maxLength: 80, required: true });
+          break;
+        case "description":
+          checked.description = singleLine(value, "The description", { maxLength: 500 });
+          break;
+        case "loader":
+          checked.loader = normalizeLoader(value);
+          break;
+        case "minecraftVersion":
+          checked.minecraftVersion = normalizeMinecraftVersion(value);
+          break;
+        case "startCommand":
+          checked.startCommand = singleLine(value, "The start command", { maxLength: 1000 });
+          break;
+        case "javaBin":
+          if (plainText(value) === null) {
+            throw invalid("The Java binary must be a path, written as text.");
+          }
+          checked.javaBin = plainText(value);
+          break;
+        case "passphrase":
+          if (typeof value !== "string") {
+            throw invalid("The passphrase must be text.");
+          }
+          checked.passphrase = value;
+          break;
+        case "maxMemory":
+          checked.maxMemory = singleLine(value, "Max memory", { maxLength: 16 });
+          break;
+        case "minMemory":
+          checked.minMemory = singleLine(value, "Min memory", { maxLength: 16 });
+          break;
+        // Written by this file after it has provisioned a runtime, never taken
+        // from a request body.
+        case "managedRuntime":
+          checked.managedRuntime = value;
+          break;
+        default:
+          throw new Error(`Server records have no "${field}" field that can be changed here.`);
+      }
+    }
+    return checked;
+  }
+
   async function setServerMetadata(serverId, patch) {
     const server = await getServer(serverId);
     if (!server) {
       throw new Error("Server not found.");
     }
 
-    const nextPatch = { ...patch };
+    const nextPatch = checkMetadataPatch(patch);
     if (nextPatch.javaBin !== undefined) {
       nextPatch.javaBin = await validateJavaBin(nextPatch.javaBin);
     }
@@ -2007,9 +2089,26 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     };
   }
 
+  // A field of the create-server form read as text. Left blank it is "", and
+  // the caller supplies the default; given as anything but text it is refused.
+  function optionalText(value, label) {
+    if (value === undefined || value === null || value === "") {
+      return "";
+    }
+    const text = plainText(value);
+    if (text === null) {
+      throw invalid(`${label} must be text.`);
+    }
+    return text.trim();
+  }
+
   async function createServer(spec, actor, options = {}) {
     const reportProgress = typeof options.onProgress === "function" ? options.onProgress : () => {};
-    const serverId = safeFilename(spec.serverId || spec.directoryName || spec.name);
+    const serverId = safeFilename(
+      optionalText(spec.serverId, "The server id") ||
+        optionalText(spec.directoryName, "The directory name") ||
+        optionalText(spec.name, "The server name")
+    );
     if (!serverId) {
       throw new Error("A server name is required.");
     }
@@ -2017,7 +2116,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       throw new Error("A server with that id already exists.");
     }
 
-    const directoryName = safeFilename(spec.directoryName || serverId);
+    const directoryName = safeFilename(optionalText(spec.directoryName, "The directory name") || serverId);
     const relativeDirectory = path.join("servers", directoryName);
     const serverDir = path.resolve(store.rootDir, relativeDirectory);
     if (!withinParent(serversRoot, serverDir)) {
@@ -2025,11 +2124,39 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     }
 
     const mode = spec.mode === "existing" ? "existing" : "managed";
-    const requestedLoader = String(spec.loader || "vanilla").trim().toLowerCase() || "vanilla";
+    // The whole request body arrives here as `spec`. Everything in it that is
+    // stored in the record or written into a file is checked now, before any
+    // folder is created or anything is downloaded.
+    const details = checkMetadataPatch({
+      description: optionalText(spec.description, "The description"),
+      loader: optionalText(spec.loader, "The loader") || "vanilla",
+      maxMemory: optionalText(spec.maxMemory, "Max memory") || "4G",
+      minMemory: optionalText(spec.minMemory, "Min memory") || "2G",
+      minecraftVersion: optionalText(spec.minecraftVersion, "The Minecraft version"),
+      name: optionalText(spec.name, "The server name") || displayNameFromSlug(serverId),
+      startCommand: optionalText(spec.startCommand, "The start command")
+    });
+    const requestedLoader = details.loader;
+    const port = optionalText(spec.port, "The server port")
+      ? integerInRange(spec.port, "The server port", 1, 65535)
+      : 25565;
+    const filePaths = {
+      logFile: optionalText(spec.logFile, "The log file") || "logs/latest.log",
+      modsDir: optionalText(spec.modsDir, "The add-on folder") || "mods",
+      serverPropertiesFile: optionalText(spec.serverPropertiesFile, "The properties file") || "server.properties",
+      worldDir: optionalText(spec.worldDir, "The world folder") || "world"
+    };
+    for (const [field, value] of Object.entries(filePaths)) {
+      filePaths[field] = singleLine(value, `The ${field} path`, { maxLength: 200 });
+    }
+    if (spec.passphrase !== undefined && spec.passphrase !== null && typeof spec.passphrase !== "string") {
+      throw invalid("The passphrase must be text.");
+    }
     // Validate before provisioning: Forge and NeoForge run their installer with
     // this JDK, so a bad path should fail before anything is downloaded.
-    const javaBin = await validateJavaBin(spec.javaBin);
-    const effectiveLoader = mode === "existing" ? requestedLoader : requestedLoader;
+    const javaBin = await validateJavaBin(optionalText(spec.javaBin, "The Java binary"));
+    let minecraftVersion = details.minecraftVersion;
+    let managedRuntime = null;
     if (mode === "existing") {
       if (!(await exists(serverDir))) {
         throw new Error(`Existing server directory not found: ${relativeDirectory}`);
@@ -2047,25 +2174,30 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       await ensureDir(path.join(serverDir, "plugins"));
       await ensureDir(path.join(serverDir, ".rippermoon"));
       await fsp.writeFile(path.join(serverDir, "eula.txt"), "eula=false\n", "utf8");
-      await fsp.writeFile(path.join(serverDir, "server.properties"), `motd=${spec.name || displayNameFromSlug(serverId)}\nserver-port=${spec.port || 25565}\n`, "utf8");
+      await fsp.writeFile(path.join(serverDir, "server.properties"), `motd=${details.name}\nserver-port=${port}\n`, "utf8");
       // Provision first: the launch script shape depends on what the loader
       // produced (a server.jar, or Forge/NeoForge argfiles).
       const runtime = await createJarManagedRuntime(
         requestedLoader,
-        spec.minecraftVersion || "latest",
+        minecraftVersion || "latest",
         serverDir,
         { javaBin, onProgress: reportProgress }
       );
-      spec.minecraftVersion = runtime.targetVersion;
-      spec.managedRuntime = runtime;
+      minecraftVersion = runtime.targetVersion;
+      managedRuntime = runtime;
       reportProgress("writing launch script");
       const launchScriptPath = path.join(serverDir, ".rippermoon", "launch-server.sh");
       await fsp.writeFile(
         launchScriptPath,
-        buildLaunchScript(spec.minMemory, spec.maxMemory, runtime.launch),
+        buildLaunchScript(details.minMemory, details.maxMemory, runtime.launch),
         "utf8"
       );
       await fsp.chmod(launchScriptPath, 0o755);
+    }
+
+    if (!minecraftVersion) {
+      const detected = await detectVersion(serverDir);
+      minecraftVersion = isMinecraftVersion(detected) ? detected : "unknown";
     }
 
     reportProgress("registering the server");
@@ -2073,32 +2205,33 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       id: serverId,
       createdAt: nowIso(),
       createdBy: actor.username,
-      description: spec.description || "",
+      description: details.description,
       directory: relativeDirectory,
       javaBin,
-      loader: effectiveLoader,
-      logFile: spec.logFile || "logs/latest.log",
-      maxMemory: spec.maxMemory || "4G",
+      loader: requestedLoader,
+      logFile: filePaths.logFile,
+      maxMemory: details.maxMemory,
       managedRuntime:
         mode === "existing"
           ? null
           : {
-              kind: spec.managedRuntime?.kind || requestedLoader,
+              kind: managedRuntime.kind || requestedLoader,
               // The launch shape must survive into the record; the managed
               // launch script is regenerated from it on every start.
-              launch: spec.managedRuntime?.launch || { kind: "jar" },
-              loaderVersion: spec.managedRuntime?.loaderVersion || null,
-              source: spec.managedRuntime?.source || requestedLoader,
+              launch: managedRuntime.launch || { kind: "jar" },
+              loaderVersion: managedRuntime.loaderVersion || null,
+              source: managedRuntime.source || requestedLoader,
               updatedAt: nowIso()
             },
-      minMemory: spec.minMemory || "2G",
-      minecraftVersion: spec.minecraftVersion || (await detectVersion(serverDir)),
-      modsDir: spec.modsDir || "mods",
-      name: spec.name || displayNameFromSlug(serverId),
-      passphraseHash: spec.passphrase ? await hashSecret(String(spec.passphrase)) : null,
-      serverPropertiesFile: spec.serverPropertiesFile || "server.properties",
-      startCommand: spec.startCommand || (mode === "existing" ? DEFAULT_EXISTING_START_COMMAND : DEFAULT_MANAGED_START_COMMAND),
-      worldDir: spec.worldDir || "world"
+      minMemory: details.minMemory,
+      minecraftVersion,
+      modsDir: filePaths.modsDir,
+      name: details.name,
+      passphraseHash: spec.passphrase ? await hashSecret(spec.passphrase) : null,
+      serverPropertiesFile: filePaths.serverPropertiesFile,
+      startCommand:
+        details.startCommand || (mode === "existing" ? DEFAULT_EXISTING_START_COMMAND : DEFAULT_MANAGED_START_COMMAND),
+      worldDir: filePaths.worldDir
     }));
 
     return record;

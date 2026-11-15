@@ -954,19 +954,8 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               await serverManager.writeServerProperties(serverId, body.propertiesText);
             }
           } else {
-            const addonSettings =
-              body.addonSettings && typeof body.addonSettings === "object" ? body.addonSettings : null;
-            if (addonSettings) {
-              if (!serverManager.userCanManageAddons(context.user, server)) {
-                json(res, 403, { error: "You do not have permission to change add-on settings for this server." });
-                return;
-              }
-              await serverManager.setServerMetadata(serverId, {
-                loader: addonSettings.loader,
-                minecraftVersion: addonSettings.minecraftVersion
-              });
-            }
-
+            // Refused before anything is saved: a request that also carried
+            // add-on settings used to have those applied first.
             if (
               typeof body.propertiesText === "string" ||
               typeof body.passphrase === "string" ||
@@ -983,13 +972,27 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               return;
             }
 
+            const addonSettings =
+              body.addonSettings && typeof body.addonSettings === "object" ? body.addonSettings : null;
             const safeProperties =
               body.safeProperties && typeof body.safeProperties === "object" ? body.safeProperties : null;
             if (!safeProperties && !addonSettings) {
               json(res, 400, { error: "Safe server settings are required." });
               return;
             }
+            if (addonSettings && !serverManager.userCanManageAddons(context.user, server)) {
+              json(res, 403, { error: "You do not have permission to change add-on settings for this server." });
+              return;
+            }
 
+            if (addonSettings) {
+              // The loader and version are checked inside setServerMetadata,
+              // like every other change to a server record.
+              await serverManager.setServerMetadata(serverId, {
+                loader: addonSettings.loader,
+                minecraftVersion: addonSettings.minecraftVersion
+              });
+            }
             if (safeProperties) {
               await serverManager.writeSafeAdminProperties(serverId, safeProperties);
             }
