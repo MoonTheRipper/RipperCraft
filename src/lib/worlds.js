@@ -271,10 +271,7 @@ function createWorldManager(serverManager, options = {}) {
   // Deletes an archived world zip. The live world is never touched here - it is
   // not an archive, and removing it is what "create new world" is for.
   async function deleteWorldArchive(serverId, archiveName) {
-    const requested = String(archiveName || "").trim();
-    if (!requested) {
-      throw worldError("An archive name is required.", 400);
-    }
+    const requested = archiveNameFrom(archiveName);
 
     const server = await serverManager.getServer(serverId);
     if (!server) {

@@ -46,6 +46,19 @@ function modrinthProjectId(value) {
   return id.trim();
 }
 
+// A field of a provider's answer, as text. The page draws what a search finds;
+// a field that is missing, or is not text, is drawn as nothing.
+function providerText(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  return typeof value === "string" ? value.slice(0, 2000) : "";
+}
+
+function listOf(value) {
+  return Array.isArray(value) ? value.filter((item) => item && typeof item === "object") : [];
+}
+
 function curseforgeModId(value) {
   const id = plainText(value);
   if (id === null || !CURSEFORGE_MOD_ID.test(id.trim())) {
@@ -185,21 +198,21 @@ function createModManager(serverManager, options = {}) {
     }
 
     const payload = await fetchJson(url.toString());
-    return payload.hits.map((result) => ({
-      author: result.author,
+    return listOf(payload && payload.hits).map((result) => ({
+      author: providerText(result.author),
       // Search hits already carry the client/server split, so where an add-on
       // belongs is visible before it is installed rather than after.
       clientSide: normalizeSide(result.client_side),
       compatibilityLabel: `${profile.loader} • ${profile.gameVersion} • ${profile.projectType}`,
-      description: result.description,
-      downloads: result.downloads,
-      iconUrl: result.icon_url,
-      id: result.project_id,
-      pageUrl: result.slug ? `https://modrinth.com/mod/${result.slug}` : "",
+      description: providerText(result.description),
+      downloads: Number(result.downloads) || 0,
+      iconUrl: providerText(result.icon_url),
+      id: providerText(result.project_id),
+      pageUrl: providerText(result.slug) ? `https://modrinth.com/mod/${encodeURIComponent(providerText(result.slug))}` : "",
       provider: "modrinth",
       serverSide: normalizeSide(result.server_side),
-      slug: result.slug,
-      title: result.title
+      slug: providerText(result.slug),
+      title: providerText(result.title)
     }));
   }
 
@@ -293,25 +306,28 @@ function createModManager(serverManager, options = {}) {
       headers: await curseforgeHeaders()
     });
 
-    return payload.data.map((result) => ({
-      author: (result.authors || []).map((author) => author.name).join(", "),
+    return listOf(payload && payload.data).map((result) => ({
+      author: listOf(result.authors)
+        .map((author) => providerText(author && author.name))
+        .filter(Boolean)
+        .join(", "),
       // CurseForge publishes no client/server split, so this stays unknown
       // instead of implying a certainty the API does not provide.
       clientSide: "unknown",
       compatibilityLabel: `${profile.loader} • ${profile.gameVersion} • mod`,
-      description: result.summary,
-      downloads: result.downloadCount,
-      iconUrl: result.logo && result.logo.thumbnailUrl,
-      id: String(result.id),
+      description: providerText(result.summary),
+      downloads: Number(result.downloadCount) || 0,
+      iconUrl: providerText(result.logo && result.logo.thumbnailUrl),
+      id: providerText(result.id),
       serverSide: "unknown",
       // Authors can disable third-party downloads; flag it here so the UI can
       // point at CurseForge instead of offering an install that cannot succeed.
       manualDownloadOnly: result.allowModDistribution === false,
       pageUrl:
-        result.links && /^https?:\/\//i.test(result.links.websiteUrl || "") ? result.links.websiteUrl : "",
+        result.links && /^https?:\/\//i.test(providerText(result.links.websiteUrl)) ? result.links.websiteUrl : "",
       provider: "curseforge",
-      slug: result.slug,
-      title: result.name
+      slug: providerText(result.slug),
+      title: providerText(result.name)
     }));
   }
 

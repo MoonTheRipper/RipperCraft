@@ -60,6 +60,16 @@ function isBlank(value) {
   return !textOf(value).trim();
 }
 
+// The name of an add-on file, as the browser sends it back from the list it
+// was shown. Text, or the request is refused: anything else would be turned
+// into some name or other further in, and acted on.
+function addonFileName(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new HttpError(400, "An add-on file name is required.");
+  }
+  return value;
+}
+
 // Applies to every password that is set from now on: the owner's at setup, a
 // new account's, and any reset or change. Passwords that already exist are not
 // measured against it, so nobody is locked out by the upgrade.
@@ -1318,15 +1328,20 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               return;
             }
             const body = await parseJsonBody(req);
-            const names = Array.isArray(body.fileNames)
+            const requested = Array.isArray(body.fileNames)
               ? body.fileNames
               : body.fileName
                 ? [body.fileName]
                 : [];
-            if (!names.length) {
+            if (!requested.length) {
               json(res, 400, { error: "At least one add-on file name is required." });
               return;
             }
+            if (requested.length > 500) {
+              json(res, 400, { error: "That is more add-ons than can be updated in one request." });
+              return;
+            }
+            const names = requested.map(addonFileName);
 
             // Update each independently so one failure does not abandon the rest.
             const results = [];
@@ -1359,7 +1374,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               return;
             }
             const body = await parseJsonBody(req);
-            const removed = await serverManager.removeAddonFiles(serverId, [body.fileName]);
+            const removed = await serverManager.removeAddonFiles(serverId, [addonFileName(body.fileName)]);
             json(res, 200, { mods: await serverManager.listInstalledFiles(serverId), removed });
             return;
           }
@@ -1374,7 +1389,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               return;
             }
             const body = await parseJsonBody(req);
-            const mods = await serverManager.setAddonEnabled(serverId, body.fileName, body.enabled === true);
+            const mods = await serverManager.setAddonEnabled(serverId, addonFileName(body.fileName), body.enabled === true);
             json(res, 200, { mods });
             return;
           }

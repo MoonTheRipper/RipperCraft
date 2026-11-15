@@ -297,26 +297,47 @@ function firstDependencyValue(value) {
   return parseFabricPredicate(value);
 }
 
+// A jar describes itself - its name, its version, the ranges it accepts - and
+// the owner's page shows what it says. Anyone who can upload a jar writes that
+// description, and in a JSON file a "name" can as easily be an object or a
+// megabyte of text. What is passed on is a short piece of text, or nothing.
+const METADATA_TEXT_LIMIT = 200;
+
+function metadataText(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value !== "string" || !value) {
+    return null;
+  }
+  return value.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, METADATA_TEXT_LIMIT);
+}
+
+// A declared range, as written, for display.
+function rangeText(value) {
+  return value === undefined ? null : metadataText(typeof value === "string" ? value : JSON.stringify(value));
+}
+
 function parseFabricMetadata(text, loaderKey) {
-  const manifest = JSON.parse(text);
-  const depends = manifest.depends || {};
+  const manifest = JSON.parse(text) || {};
+  const depends = manifest.depends && typeof manifest.depends === "object" ? manifest.depends : {};
   const rawLoader = depends[loaderKey];
   const rawMinecraft = depends.minecraft;
 
   return {
     loaderBound: firstDependencyValue(rawLoader),
-    loaderRaw: rawLoader === undefined ? null : JSON.stringify(rawLoader),
+    loaderRaw: rawLoader === undefined ? null : rangeText(JSON.stringify(rawLoader)),
     minecraftBound: firstDependencyValue(rawMinecraft),
-    minecraftRaw: rawMinecraft === undefined ? null : JSON.stringify(rawMinecraft),
-    modId: manifest.id || null,
-    name: manifest.name || manifest.id || null,
-    version: manifest.version || null
+    minecraftRaw: rawMinecraft === undefined ? null : rangeText(JSON.stringify(rawMinecraft)),
+    modId: metadataText(manifest.id),
+    name: metadataText(manifest.name) || metadataText(manifest.id),
+    version: metadataText(manifest.version)
   };
 }
 
 function parseQuiltMetadata(text, loaderKey) {
-  const manifest = JSON.parse(text);
-  const quiltLoader = manifest.quilt_loader || {};
+  const manifest = JSON.parse(text) || {};
+  const quiltLoader = manifest.quilt_loader && typeof manifest.quilt_loader === "object" ? manifest.quilt_loader : {};
   const depends = Array.isArray(quiltLoader.depends) ? quiltLoader.depends : [];
   const find = (id) =>
     depends.find((entry) => entry && typeof entry === "object" && entry.id === id) ||
@@ -327,12 +348,12 @@ function parseQuiltMetadata(text, loaderKey) {
 
   return {
     loaderBound: loaderEntry ? firstDependencyValue(loaderEntry.versions) : null,
-    loaderRaw: loaderEntry ? JSON.stringify(loaderEntry.versions) : null,
+    loaderRaw: loaderEntry ? rangeText(JSON.stringify(loaderEntry.versions)) : null,
     minecraftBound: minecraftEntry ? firstDependencyValue(minecraftEntry.versions) : null,
-    minecraftRaw: minecraftEntry ? JSON.stringify(minecraftEntry.versions) : null,
-    modId: quiltLoader.id || null,
-    name: (quiltLoader.metadata && quiltLoader.metadata.name) || quiltLoader.id || null,
-    version: quiltLoader.version || null
+    minecraftRaw: minecraftEntry ? rangeText(JSON.stringify(minecraftEntry.versions)) : null,
+    modId: metadataText(quiltLoader.id),
+    name: metadataText(quiltLoader.metadata && quiltLoader.metadata.name) || metadataText(quiltLoader.id),
+    version: metadataText(quiltLoader.version)
   };
 }
 
@@ -372,12 +393,12 @@ function parseForgeMetadata(text, loaderKey) {
 
   return {
     loaderBound,
-    loaderRaw,
+    loaderRaw: rangeText(loaderRaw === null ? undefined : loaderRaw),
     minecraftBound,
-    minecraftRaw,
-    modId,
-    name: readString(modsBlock, "displayName") || modId,
-    version: readString(modsBlock, "version")
+    minecraftRaw: rangeText(minecraftRaw === null ? undefined : minecraftRaw),
+    modId: metadataText(modId),
+    name: metadataText(readString(modsBlock, "displayName")) || metadataText(modId),
+    version: metadataText(readString(modsBlock, "version"))
   };
 }
 

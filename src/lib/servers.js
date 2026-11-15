@@ -1207,7 +1207,10 @@ function createServerManager(store, options = {}) {
     // of a bare filename. Files with no manifest entry were dropped in by hand
     // and stay deliberately bare - there is nothing truthful to show for them.
     const manifest = await readAddonManifest(serverId);
-    const detailsByFileName = new Map(manifest.map((entry) => [entry.fileName, entry]));
+    const detailsByFileName = new Map(manifest.filter(Boolean).map((entry) => [entry.fileName, entry]));
+    // The manifest is a file in the server's folder, and the page draws these
+    // fields. Whatever the file holds, what is sent to the page is text.
+    const text = (value, fallback = "") => (typeof value === "string" && value ? value : fallback);
 
     return [...active, ...disabled]
       .map((entry) => {
@@ -1217,13 +1220,13 @@ function createServerManager(store, options = {}) {
         }
         return {
           ...entry,
-          clientSide: tracked.clientSide || "unknown",
-          iconUrl: tracked.iconUrl || "",
-          pageUrl: tracked.pageUrl || "",
-          provider: tracked.provider || "",
-          serverSide: tracked.serverSide || "unknown",
-          sourceId: tracked.sourceId || "",
-          title: tracked.title || "",
+          clientSide: text(tracked.clientSide, "unknown"),
+          iconUrl: text(tracked.iconUrl),
+          pageUrl: text(tracked.pageUrl),
+          provider: text(tracked.provider),
+          serverSide: text(tracked.serverSide, "unknown"),
+          sourceId: text(tracked.sourceId),
+          title: text(tracked.title),
           tracked: true
         };
       })
