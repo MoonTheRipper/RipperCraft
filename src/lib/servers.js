@@ -290,11 +290,12 @@ function createServerManager(store, options = {}) {
   }
 
   async function resolveRequestedReleaseVersion(version) {
+    // The version asked for in an update or an adoption. It goes into request
+    // paths and, once the runtime is installed, into the record; checked here
+    // it is refused before anything is fetched rather than after.
+    const requested = !version || version === "latest" ? "" : normalizeMinecraftVersion(version, "The target Minecraft version");
     const manifest = await fetchMinecraftVersionManifest();
-    if (!version || version === "latest") {
-      return manifest.latest.release;
-    }
-    return String(version).trim();
+    return requested || manifest.latest.release;
   }
 
   async function listServerDirectories() {
@@ -3154,7 +3155,11 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     }
 
     const paths = resolveRecordPaths(server);
-    const targetVersion = String(options.minecraftVersion || server.minecraftVersion || "").trim();
+    const asked = options.minecraftVersion;
+    const targetVersion =
+      asked === undefined || asked === null || asked === ""
+        ? String(server.minecraftVersion || "").trim()
+        : normalizeMinecraftVersion(asked, "The target Minecraft version");
     if (!targetVersion || targetVersion === "unknown") {
       throw userFacingError(
         `Set the Minecraft version for ${server.name} in server settings before adopting its runtime - the dashboard needs to know which build to install.`

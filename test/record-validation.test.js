@@ -378,6 +378,24 @@ test("a version read from a server's own log is only believed when it looks like
   assert.equal(records.Hostile.minecraftVersion, "unknown");
 });
 
+test("a target version for an update is checked before anything is fetched", async (t) => {
+  const { scriptedOutbound } = require("../test-support/outbound");
+  const { calls, outbound } = scriptedOutbound({ addresses: () => ["93.184.215.14"], respond: () => ({ body: "{}" }) });
+  const { app, owner } = await startWithAdmin(t, { app: { outbound } });
+
+  for (const gameVersion of ["../../maven", "1.21/../x", "1.21?x=1", "<b>", "1.21\n1.22"]) {
+    const response = await owner("GET", `/api/servers/DemoServer/loader-versions?gameVersion=${encodeURIComponent(gameVersion)}`);
+    assert.equal(response.status, 400, gameVersion);
+    assert.match(response.json.error, /target Minecraft version/);
+  }
+  for (const targetVersion of ["../../maven", { __html: MARKUP }, ["1.21"]]) {
+    const planned = await owner("POST", "/api/servers/DemoServer/runtime/adopt", { json: { minecraftVersion: targetVersion } });
+    assert.ok(planned.status >= 400 && planned.status < 500, JSON.stringify(targetVersion));
+  }
+  assert.deepEqual(calls, []);
+  assert.equal((await recordOf(app)).minecraftVersion, "1.21.1");
+});
+
 // --- registering a server ---------------------------------------------------------
 
 test("registering a server checks every field before anything is stored", async (t) => {
