@@ -345,7 +345,7 @@ test("backups, restores and new worlds asked for together all happen, one after 
     world.worldManager.createNewWorld("DemoServer", { name: "fresh" }),
     world.worldManager.captureActiveWorld("DemoServer", "three")
   ]);
-  // The export is a file in the temp folder; it goes whatever happens below.
+  // The export is a folder beside the world; it goes whatever happens below.
   t.after(() => outcomes[3].status === "fulfilled" && outcomes[3].value.cleanup());
   // In the order they were asked for: the last backup finds no world left.
   assert.deepEqual(outcomes.map((outcome) => outcome.status), ["fulfilled", "fulfilled", "fulfilled", "fulfilled", "fulfilled", "rejected"]);
@@ -356,6 +356,42 @@ test("backups, restores and new worlds asked for together all happen, one after 
   assert.equal(levels.find(([name]) => name.startsWith("one"))[1], "original");
   assert.equal(levels.find(([name]) => name.startsWith("two"))[1], "incoming");
   assert.equal(fs.existsSync(path.join(world.serverDir, "world")), false);
+});
+
+test("a world is zipped for download beside the world folder, and the folder goes afterwards", async (t) => {
+  const world = await managedWorld(t);
+
+  const archive = await world.worldManager.createExportArchive("DemoServer");
+  t.after(() => archive.cleanup());
+
+  // On the disk the world is on, not in the system's temporary folder: that is
+  // often memory, and small for a service that is given one of its own.
+  const folder = path.dirname(archive.outputPath);
+  assert.equal(path.dirname(folder), world.serverDir);
+  assert.match(path.basename(folder), /^\.rippercraft-export-[0-9a-f]{16}$/);
+  assert.equal(fs.statSync(folder).mode & 0o777, 0o700);
+  assert.equal(execFileSync("unzip", ["-p", archive.outputPath, "world/level.dat"]).toString(), "original");
+
+  await archive.cleanup();
+  assert.deepEqual(fs.readdirSync(world.serverDir).filter((name) => name.startsWith(".rippercraft-export-")), []);
+});
+
+test("an export folder left by a dashboard that was stopped half-way is cleared once it is a day old", async (t) => {
+  const world = await managedWorld(t);
+  const stale = path.join(world.serverDir, ".rippercraft-export-0123456789abcdef");
+  const recent = path.join(world.serverDir, ".rippercraft-export-fedcba9876543210");
+  for (const folder of [stale, recent]) {
+    await fsp.mkdir(folder);
+    await fsp.writeFile(path.join(folder, "DemoServer-active-world.zip"), "half an archive");
+  }
+  const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+  await fsp.utimes(stale, twoDaysAgo, twoDaysAgo);
+
+  await (await world.worldManager.createExportArchive("DemoServer")).cleanup();
+
+  assert.equal(fs.existsSync(stale), false);
+  // Another export may still be on its way to a browser.
+  assert.equal(fs.existsSync(recent), true);
 });
 
 test("two backups made in the same millisecond are two archives", async (t) => {
