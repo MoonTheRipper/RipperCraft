@@ -2362,7 +2362,16 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     const runtimeLog = fs.createWriteStream(paths.runtimeLog, { flags: "a" });
     runtimeLog.write(`\n[${nowIso()}] Starting ${server.name} as ${actor.username}\n`);
 
-    const launchSpec = await resolveLaunchCommand(serverId, server);
+    let launchSpec;
+    try {
+      launchSpec = await resolveLaunchCommand(serverId, server);
+    } catch (error) {
+      // The log was opened above. Say why nothing started, and close it: left
+      // open, every refused start kept a file handle for good.
+      runtimeLog.write(`[${nowIso()}] Start failed: ${error.message}\n`);
+      runtimeLog.end();
+      throw error;
+    }
     const command = launchSpec.command;
     const spawnDirectly = shouldSpawnDirectly(command);
     const directCommandPath = spawnDirectly ? path.resolve(paths.serverDir, command) : null;

@@ -253,6 +253,19 @@ test("a record that already holds a command where a memory size belongs is not t
     assert.equal(fs.existsSync(marker), false, `${field}: the command ran`);
     assert.equal(server.scriptExists(), false, `${field}: a script was written`);
     assert.equal((await server.serverManager.getServerStatus("Managed")).running, false);
+
+    // The server's own log says why it did not start, and is not left open:
+    // refusing a hundred starts in a row does not use up a hundred handles.
+    // /dev/fd lists this process's open files on Linux and macOS alike.
+    const openFiles = () => fs.readdirSync("/dev/fd").length;
+    const openBefore = openFiles();
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      await assert.rejects(server.serverManager.startServer("Managed", server.owner), { statusCode: 409 });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.ok(openFiles() < openBefore + 20, "refused starts left their log open");
+    const log = await fsp.readFile(path.join(server.serverDir, ".rippermoon", "runtime.log"), "utf8");
+    assert.match(log, /Start failed: This server's (min|max) memory setting is not a memory size/);
   }
 });
 
