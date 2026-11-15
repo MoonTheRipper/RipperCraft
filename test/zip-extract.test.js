@@ -76,8 +76,11 @@ test("an ordinary world unpacks to exactly what was packed", async (t) => {
   ]);
 
   const total = Object.values(contents).reduce((sum, data) => sum + Buffer.byteLength(data), 0);
-  assert.deepEqual(await inspectZip(archive), { directories: 2, files: 6, totalBytes: total });
-  assert.deepEqual(await extractZip(archive, space.target), { directories: 2, files: 6, totalBytes: total });
+  // Six folders: the two that are listed and the four the paths pass through.
+  // Each is charged a 4 KB block against the limit, on top of the files.
+  const summary = { directories: 6, files: 6, totalBytes: total, weight: total + 6 * 4096 };
+  assert.deepEqual(await inspectZip(archive), summary);
+  assert.deepEqual(await extractZip(archive, space.target), summary);
 
   assert.deepEqual(listTree(space.target), [
     "world/",
@@ -96,7 +99,8 @@ test("an ordinary world unpacks to exactly what was packed", async (t) => {
   for (const [name, data] of Object.entries(contents)) {
     assert.ok(Buffer.from(data).equals(await fsp.readFile(path.join(space.target, name))), name);
   }
-  assert.deepEqual(await assertPlainTree(space.target), { directories: 6, files: 6, totalBytes: total });
+  // What is on disk afterwards weighs exactly what the archive said it would.
+  assert.deepEqual(await assertPlainTree(space.target), summary);
 });
 
 test("an archive made by the zip command unpacks to the folder it was made from", async (t) => {
@@ -132,7 +136,7 @@ test("archives past 4 GB or 65,535 entries are laid out differently, and are rea
   for (const [label, [list, options]] of Object.entries(layouts)) {
     const space = await workspace(t);
     const archive = await space.write(list, options);
-    assert.deepEqual(await extractZip(archive, space.target), { directories: 1, files: 3, totalBytes: 200_011 }, label);
+    assert.deepEqual(await extractZip(archive, space.target), { directories: 2, files: 3, totalBytes: 200_011, weight: 200_011 + 2 * 4096 }, label);
     assert.equal(await fsp.readFile(path.join(space.target, "world", "level.dat"), "utf8"), "level", label);
     assert.equal((await fsp.stat(path.join(space.target, "world", "region", "r.0.0.mca"))).size, 200_000, label);
   }
@@ -145,7 +149,7 @@ test("sizes written after the data rather than before it are still found", async
     { data: "level", descriptor: true, name: "world/level.dat" },
     { data: Buffer.alloc(1_200_000, "x"), descriptor: true, name: "world/big.bin" }
   ]);
-  assert.deepEqual(await extractZip(archive, space.target), { directories: 0, files: 2, totalBytes: 1_200_005 });
+  assert.deepEqual(await extractZip(archive, space.target), { directories: 1, files: 2, totalBytes: 1_200_005, weight: 1_200_005 + 4096 });
   assert.equal(await fsp.readFile(path.join(space.target, "world", "level.dat"), "utf8"), "level");
 });
 
@@ -219,7 +223,7 @@ test("a path that leads out of the folder is refused, however it is spelled", as
 });
 
 test("names with control characters, or too long to create, are refused", async (t) => {
-  for (const name of ["world/a\nb.txt", "world/a\rb.txt", "world/\u0000.txt", "world/a\u001bb", `world/${"n".repeat(256)}`, `${"d/".repeat(600)}f`]) {
+  for (const name of ["world/a\nb.txt", "world/a\rb.txt", "world/\u0000.txt", "world/a\u001bb", `world/${"n".repeat(256)}`, `world/${"\u00e9".repeat(128)}`, `${"d/".repeat(600)}f`]) {
     const space = await workspace(t);
     await refused(space, [{ data: "level", name: "world/level.dat" }, { data: "x", name }], undefined, {
       error: { statusCode: 400 }
@@ -242,6 +246,10 @@ test("an archive that unpacks to more than the limit is refused before anything 
   });
   // The same archive is fine under a limit it fits.
   assert.equal((await extractZip(archive, space.target, { maxBytes: 65 * 1024 * 1024 })).totalBytes, 64 * 1024 * 1024 + 5);
+  // The limit is exact: its files and its one folder, to the byte.
+  const exact = 64 * 1024 * 1024 + 5 + 4096;
+  assert.equal((await inspectZip(archive, { maxBytes: exact })).weight, exact);
+  await assert.rejects(inspectZip(archive, { maxBytes: exact - 1 }), { statusCode: 413 });
 });
 
 test("the limit counts every entry, so many small ones add up", async (t) => {
@@ -286,6 +294,121 @@ test("an archive with more entries than the limit is refused", async (t) => {
     error: { message: /holds 12 entries; at most 10/, statusCode: 413 },
     limits: { maxEntries: 10 }
   });
+});
+
+test("folders count against the limit, listed or only passed through", async (t) => {
+  // An empty folder holds no bytes and still takes a block of the disk. A
+  // hundred kilobytes of archive used to make fifty thousand of them under a
+  // limit of one byte.
+  const listed = Array.from({ length: 400 }, (_unused, index) => ({ name: `world/empty-${index}/` }));
+  const implied = Array.from({ length: 20 }, (_unused, index) => ({ data: "x", name: `world/${Array.from({ length: 30 }, (_u, depth) => `d${index}-${depth}`).join("/")}/f` }));
+
+  for (const [label, entries, folders] of [["listed", listed, 401], ["passed through", implied, 601]]) {
+    const space = await workspace(t);
+    const archive = await space.write(entries);
+    const summary = await inspectZip(archive);
+    assert.equal(summary.directories, folders, label);
+    assert.equal(summary.weight, summary.totalBytes + folders * 4096, label);
+
+    await refused(space, entries, undefined, {
+      error: { message: /unpacks to .* and the limit is/, statusCode: 413 },
+      limits: { maxBytes: 100 * 4096 }
+    });
+    // And they are counted with the files against the number of entries: the
+    // twenty paths below are twenty entries, and six hundred and one folders.
+    await refused(space, entries, undefined, {
+      error: { message: label === "listed" ? /holds 400 entries; at most 300/ : /more than 300 files and folders/, statusCode: 413 },
+      limits: { maxEntries: 300 }
+    });
+    assert.equal((await extractZip(archive, space.target, { maxBytes: summary.weight, maxEntries: folders + entries.length })).directories, folders, label);
+  }
+});
+
+test("a path may only go so deep", async (t) => {
+  const path64 = `${Array.from({ length: 63 }, (_unused, index) => `d${index}`).join("/")}/level.dat`;
+  const path65 = `d/${path64}`;
+
+  const fits = await workspace(t);
+  assert.equal((await extractZip(await fits.write([{ data: "x", name: path64 }]), fits.target)).directories, 63);
+
+  for (const name of [path65, `${"a/".repeat(200)}f`, `${"a/".repeat(65)}`]) {
+    const space = await workspace(t);
+    await refused(space, [{ data: "level", name: "world/level.dat" }, { data: "x", name }], undefined, {
+      error: { message: /more than 64 folders deep/, statusCode: 400 }
+    });
+  }
+});
+
+test("a path written with ./ in front is the path without it", async (t) => {
+  const space = await workspace(t);
+  // How bsdtar and other tar-like tools write a zip: "./" first, then "./name".
+  const archive = await space.write([
+    { name: "./" },
+    { name: "./world/" },
+    { data: "level", name: "./world/level.dat" },
+    { data: "region", name: "./world/./region/r.0.0.mca" },
+    { data: "x", name: "world//doubled/slash.txt" }
+  ]);
+  assert.deepEqual(await extractZip(archive, space.target), { directories: 3, files: 3, totalBytes: 12, weight: 12 + 3 * 4096 });
+  assert.deepEqual(listTree(space.target), ["world/", "world/doubled/", "world/doubled/slash.txt", "world/level.dat", "world/region/", "world/region/r.0.0.mca"]);
+
+  // ".." is still what it always was.
+  const climbing = await workspace(t);
+  await refused(climbing, [{ data: "x", name: "./../outside.txt" }], undefined, { error: { message: /leads outside/, statusCode: 400 } });
+  const nameless = await workspace(t);
+  await refused(nameless, [{ data: "x", name: "./." }], undefined, { error: { statusCode: 400 } });
+});
+
+test("a very long list of contents is read in pieces, so other work is not held up", async (t) => {
+  const space = await workspace(t);
+  const entries = Array.from({ length: 30_000 }, (_unused, index) => ({ name: `world/region-${index % 300}/chunks/empty-${index}.dat` }));
+  const archive = await space.write(entries);
+
+  // Something else the dashboard has to keep doing meanwhile: how many turns
+  // does it get while the list is read? Read in one go it got a handful, one
+  // each time the file was touched, and for a list as long as an archive may
+  // carry nothing else was answered for seconds.
+  let turns = 0;
+  let reading = true;
+  const takeTurn = () => {
+    if (reading) {
+      turns += 1;
+      setImmediate(takeTurn);
+    }
+  };
+  setImmediate(takeTurn);
+  try {
+    const summary = await inspectZip(archive);
+    assert.equal(summary.files, 30_000);
+    assert.equal(summary.directories, 601);
+  } finally {
+    reading = false;
+  }
+  // 30,000 entries four names deep is 150,000 steps, taken 2,000 at a time.
+  assert.ok(turns >= 60, `other work got ${turns} turns`);
+});
+
+test("the caller can stop an unpacking after the checks and before anything is written", async (t) => {
+  const space = await workspace(t);
+  const archive = await space.write([{ data: "level", name: "world/level.dat" }]);
+  const seen = [];
+
+  await assert.rejects(
+    extractZip(archive, space.target, {
+      beforeWriting: async (summary) => {
+        seen.push(summary);
+        throw Object.assign(new Error("not now"), { statusCode: 507 });
+      }
+    }),
+    { message: "not now" }
+  );
+  assert.deepEqual(seen, [{ directories: 1, files: 1, totalBytes: 5, weight: 5 + 4096 }]);
+  assert.deepEqual(listTree(space.target), []);
+
+  // It is not asked about an archive that failed a check of its own.
+  const hostile = await space.write([{ data: "level", name: "world/level.dat" }, { name: "world/link", symlink: "/etc" }]);
+  await assert.rejects(extractZip(hostile, space.target, { beforeWriting: async () => seen.push("asked") }), { statusCode: 400 });
+  assert.equal(seen.length, 1);
 });
 
 // --- damaged, encrypted and unsupported archives ------------------------------------------
@@ -374,8 +497,10 @@ test("a folder of files and folders passes; a link or a pipe anywhere in it does
   await fsp.mkdir(path.join(root, "world", "region"), { recursive: true });
   await fsp.writeFile(path.join(root, "world", "level.dat"), "level");
   await fsp.writeFile(path.join(root, "world", "region", "r.0.0.mca"), Buffer.alloc(1000));
-  assert.deepEqual(await assertPlainTree(root), { directories: 2, files: 2, totalBytes: 1005 });
-  await assert.rejects(assertPlainTree(root, { maxBytes: 1004 }), { statusCode: 413 });
+  const plain = { directories: 2, files: 2, totalBytes: 1005, weight: 1005 + 2 * 4096 };
+  assert.deepEqual(await assertPlainTree(root), plain);
+  assert.deepEqual(await assertPlainTree(root, { maxBytes: plain.weight }), plain);
+  await assert.rejects(assertPlainTree(root, { maxBytes: plain.weight - 1 }), { statusCode: 413 });
 
   const outside = path.join(space.base, "outside");
   await fsp.mkdir(outside);
@@ -394,7 +519,7 @@ test("a folder of files and folders passes; a link or a pipe anywhere in it does
     await assert.rejects(assertPlainTree(root), { message: /world\/region\/planted.*not allowed/, statusCode: 409 }, label);
     await fsp.rm(planted, { force: true });
   }
-  assert.deepEqual(await assertPlainTree(root), { directories: 2, files: 2, totalBytes: 1005 });
+  assert.deepEqual(await assertPlainTree(root), plain);
 
   // The folder being checked has to be a real one itself.
   const alias = path.join(space.base, "alias");

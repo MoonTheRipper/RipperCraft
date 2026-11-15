@@ -27,6 +27,11 @@ const { HttpError, describeBytes } = require("./http");
 //     the limit, and then enforced: an entry that turns out to hold more than it
 //     declared stops the whole thing. What is written can therefore never
 //     exceed what was checked.
+//   * Folders count too. An empty folder holds no bytes but takes a block of
+//     the disk, and a path may name hundreds of them: a hundred kilobytes of
+//     archive made fifty thousand folders under a limit of nothing. Each folder
+//     is charged to the limit and counted with the files, and a path may only
+//     go so deep.
 //   * Each file's checksum is verified, so a damaged archive is refused rather
 //     than restored.
 //
@@ -44,12 +49,23 @@ const MAX_COMMENT_LENGTH = 0xffff;
 const ZIP64_LOCATOR_LENGTH = 20;
 const ZIP64_EOCD_LENGTH = 56;
 
-// A world is a few thousand files; a very large one, tens of thousands.
+// A world is a few thousand files; a very large one, tens of thousands. The
+// limit is on files and folders together, including every folder a path
+// implies without listing it.
 const DEFAULT_MAX_ENTRIES = 200_000;
 // 46 bytes and a name per entry. More than the entry limit can need, and
 // little enough to hold in memory.
 const MAX_DIRECTORY_BYTES = 64 * 1024 * 1024;
 const MAX_NAME_BYTES = 1024;
+// How deep a path may go. Minecraft's own go a handful of levels down, a data
+// pack's a dozen.
+const MAX_DEPTH = 64;
+// What a folder is charged against the size limit: the block it takes on disk.
+const FOLDER_COST_BYTES = 4096;
+// Reading a long list of contents is done in pieces, with a pause between them
+// so the dashboard keeps answering other requests. A piece is this much work:
+// one for an entry and one for each folder on its path.
+const WORK_PER_SLICE = 2000;
 const READ_CHUNK_BYTES = 256 * 1024;
 // Most of a world is small files - player data, statistics, one per player -
 // and setting up streams for each costs more than unpacking it. Anything this
@@ -165,9 +181,11 @@ async function locateDirectory(handle, fileSize) {
 // The name of an entry as text. The archive says when a name is UTF-8; when it
 // does not, it usually still is (zip on Linux and macOS writes it that way),
 // and otherwise each byte is taken as one character.
+const STRICT_UTF8 = new TextDecoder("utf-8", { fatal: true });
+
 function decodeName(bytes, declaredUtf8) {
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return STRICT_UTF8.decode(bytes);
   } catch {
     if (declaredUtf8) {
       throw damaged("a file name in it is not valid UTF-8");
@@ -176,27 +194,35 @@ function decodeName(bytes, declaredUtf8) {
   }
 }
 
+// A name as it is quoted in a refusal.
+function quoted(name) {
+  return JSON.stringify(name.slice(0, 80));
+}
+
 // The path an entry will be written to, relative to the folder being unpacked
 // into, as a list of names. Refuses anything that is not a plain path downward.
+// An empty list is the folder itself ("./"), which some tools list first.
 function safeSegments(name) {
   // Windows tools write backslashes; treated as separators they are held to
   // the same rules instead of becoming part of a file name.
-  const normalized = name.replaceAll("\\", "/");
+  const normalized = name.includes("\\") ? name.replaceAll("\\", "/") : name;
   if (!normalized || normalized.startsWith("/")) {
-    throw archiveError(`The archive holds an entry with an absolute path (${JSON.stringify(name.slice(0, 80))}), which is not allowed.`);
+    throw archiveError(`The archive holds an entry with an absolute path (${quoted(name)}), which is not allowed.`);
   }
   if (CONTROL_CHARACTERS.test(normalized)) {
     throw archiveError("The archive holds a file name with control characters in it, which is not allowed.");
   }
-  const segments = normalized.split("/").filter((segment) => segment !== "");
-  if (!segments.length) {
-    throw damaged("an entry in it has no name");
+  // "." means "here" and changes nothing, so "./world/level.dat" - how bsdtar
+  // and tar-like tools write a path - is "world/level.dat".
+  const segments = normalized.split("/").filter((segment) => segment !== "" && segment !== ".");
+  if (segments.length > MAX_DEPTH) {
+    throw archiveError(`The archive holds a path more than ${MAX_DEPTH} folders deep (${quoted(name)}), which is not allowed.`);
   }
   for (const segment of segments) {
-    if (segment === "." || segment === ".." || /^[A-Za-z]:$/.test(segment)) {
-      throw archiveError(`The archive holds a path that leads outside the world folder (${JSON.stringify(name.slice(0, 80))}), which is not allowed.`);
+    if (segment === ".." || (segment.length === 2 && /^[A-Za-z]:$/.test(segment))) {
+      throw archiveError(`The archive holds a path that leads outside the world folder (${quoted(name)}), which is not allowed.`);
     }
-    if (Buffer.byteLength(segment) > 255) {
+    if (segment.length > 85 && Buffer.byteLength(segment) > 255) {
       throw archiveError("The archive holds a file name longer than 255 bytes, which cannot be created.");
     }
   }
@@ -219,9 +245,37 @@ async function readEntries(handle, fileSize, limits) {
   const central = await readExactly(handle, directory.offset, directory.size, "the list of contents");
 
   const entries = [];
+  // Every folder that unpacking will create: the ones the archive lists and
+  // the ones its paths pass through. Each is known by the folder it is in and
+  // its own name, not by its whole path, so that remembering them takes about
+  // as much memory as the list of contents itself and no more.
+  const folders = new Map();
+  const tooMany = () =>
+    archiveError(
+      `The archive holds more than ${limits.maxEntries.toLocaleString("en")} files and folders, which is more than can be unpacked.`,
+      413
+    );
+  const addFolders = (segments, count) => {
+    let parent = 0;
+    for (let depth = 0; depth < count; depth += 1) {
+      const key = `${parent}/${segments[depth]}`;
+      let folder = folders.get(key);
+      if (folder === undefined) {
+        folder = folders.size + 1;
+        folders.set(key, folder);
+      }
+      parent = folder;
+    }
+  };
   let cursor = 0;
+  let files = 0;
   let totalBytes = 0;
+  let workDone = 0;
   for (let index = 0; index < directory.entries; index += 1) {
+    if (workDone >= WORK_PER_SLICE) {
+      workDone = 0;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
     if (cursor + 46 > central.length || central.readUInt32LE(cursor) !== CENTRAL_SIGNATURE) {
       throw damaged("its list of contents is cut short");
     }
@@ -278,7 +332,6 @@ async function readEntries(handle, fileSize, limits) {
     }
 
     const name = decodeName(nameBytes, Boolean(flags & 0x0800));
-    const shown = JSON.stringify(name.slice(0, 80));
     if (flags & 0x2041) {
       throw archiveError("The archive is encrypted. Upload the world as a plain zip, without a password.");
     }
@@ -287,23 +340,36 @@ async function readEntries(handle, fileSize, limits) {
     const type = mode & TYPE_MASK;
     if (type === TYPE_SYMLINK) {
       throw archiveError(
-        `The archive holds a symbolic link (${shown}). Links are not restored: they can point anywhere on this machine. Replace the link with the files it stands for and zip the world again.`
+        `The archive holds a symbolic link (${quoted(name)}). Links are not restored: they can point anywhere on this machine. Replace the link with the files it stands for and zip the world again.`
       );
     }
     if (type !== 0 && type !== TYPE_FILE && type !== TYPE_DIRECTORY) {
-      throw archiveError(`The archive holds something that is neither a file nor a folder (${shown}), which is not restored.`);
+      throw archiveError(`The archive holds something that is neither a file nor a folder (${quoted(name)}), which is not restored.`);
     }
 
     const segments = safeSegments(name);
-    const isDirectory = /[\\/]$/.test(name) || type === TYPE_DIRECTORY || (type === 0 && Boolean(externalAttributes & 0x10) && size === 0);
+    workDone += 1 + segments.length;
+    const last = name.charCodeAt(name.length - 1);
+    const isDirectory =
+      last === 0x2f || last === 0x5c || type === TYPE_DIRECTORY || (type === 0 && Boolean(externalAttributes & 0x10) && size === 0);
     if (isDirectory) {
-      entries.push({ isDirectory: true, name, segments });
+      // "./" on its own is the folder being unpacked into: nothing to make.
+      if (segments.length) {
+        addFolders(segments, segments.length);
+        if (folders.size + files > limits.maxEntries) {
+          throw tooMany();
+        }
+        entries.push({ isDirectory: true, name, segments });
+      }
       continue;
+    }
+    if (!segments.length) {
+      throw damaged("an entry in it has no name");
     }
 
     if (method !== METHOD_STORED && method !== METHOD_DEFLATED) {
       throw archiveError(
-        `The archive is compressed with ${METHOD_NAMES[method] || `method ${method}`}, which the dashboard cannot unpack (${shown}). Zip the world again with the standard "deflate" compression.`
+        `The archive is compressed with ${METHOD_NAMES[method] || `method ${method}`}, which the dashboard cannot unpack (${quoted(name)}). Zip the world again with the standard "deflate" compression.`
       );
     }
     if (method === METHOD_STORED && compressedSize !== size) {
@@ -313,7 +379,12 @@ async function readEntries(handle, fileSize, limits) {
       throw damaged("an entry in it points outside the file");
     }
 
+    files += 1;
     totalBytes += size;
+    addFolders(segments, segments.length - 1);
+    if (folders.size + files > limits.maxEntries) {
+      throw tooMany();
+    }
     entries.push({
       compressedSize,
       crc,
@@ -326,7 +397,16 @@ async function readEntries(handle, fileSize, limits) {
     });
   }
 
-  return { entries, totalBytes };
+  return {
+    entries,
+    summary: {
+      directories: folders.size,
+      files,
+      totalBytes,
+      // What is held against the size limit: the files, and a block per folder.
+      weight: totalBytes + folders.size * FOLDER_COST_BYTES
+    }
+  };
 }
 
 function resolveLimits(options = {}) {
@@ -336,10 +416,10 @@ function resolveLimits(options = {}) {
   };
 }
 
-function assertWithinLimit(totalBytes, limits) {
-  if (totalBytes > limits.maxBytes) {
+function assertWithinLimit(summary, limits) {
+  if (summary.weight > limits.maxBytes) {
     throw archiveError(
-      `This archive unpacks to ${describeBytes(totalBytes)}, and the limit is ${describeBytes(limits.maxBytes)}. ` +
+      `This archive unpacks to ${describeBytes(summary.weight)}, and the limit is ${describeBytes(limits.maxBytes)}. ` +
         "If the world really is that large, raise RIPPERCRAFT_MAX_WORLD_MB.",
       413
     );
@@ -348,19 +428,18 @@ function assertWithinLimit(totalBytes, limits) {
 
 // Checks an archive without unpacking it: that it can be read, that everything
 // in it is a file or a folder with a safe name, and that it fits the limit.
-// Resolves to { directories, files, totalBytes }.
+//
+// Resolves to { directories, files, totalBytes, weight }: how many folders and
+// files unpacking would create, what the files add up to, and what is held
+// against the limit - the files plus a block for each folder.
 async function inspectZip(archivePath, options = {}) {
   const limits = resolveLimits(options);
   const handle = await fsp.open(archivePath, "r");
   try {
     const { size: fileSize } = await handle.stat();
-    const { entries, totalBytes } = await readEntries(handle, fileSize, limits);
-    assertWithinLimit(totalBytes, limits);
-    return {
-      directories: entries.filter((entry) => entry.isDirectory).length,
-      files: entries.filter((entry) => !entry.isDirectory).length,
-      totalBytes
-    };
+    const { summary } = await readEntries(handle, fileSize, limits);
+    assertWithinLimit(summary, limits);
+    return summary;
   } finally {
     await handle.close();
   }
@@ -485,15 +564,22 @@ async function extractFile(handle, fileSize, entry, targetPath) {
 // Rejects - with whatever was unpacked so far still in targetDir, for the
 // caller to remove - if the archive cannot be read, holds anything but files
 // and folders, or would unpack to more than options.maxBytes.
-// Resolves to { directories, files, totalBytes }.
+//
+// options.beforeWriting, if given, is called with the same summary inspectZip
+// returns once the archive has passed every check and before anything is
+// written; if it rejects, nothing is.
+// Resolves to { directories, files, totalBytes, weight }.
 async function extractZip(archivePath, targetDir, options = {}) {
   const limits = resolveLimits(options);
   const root = path.resolve(targetDir);
   const handle = await fsp.open(archivePath, "r");
   try {
     const { size: fileSize } = await handle.stat();
-    const { entries, totalBytes } = await readEntries(handle, fileSize, limits);
-    assertWithinLimit(totalBytes, limits);
+    const { entries, summary } = await readEntries(handle, fileSize, limits);
+    assertWithinLimit(summary, limits);
+    if (options.beforeWriting) {
+      await options.beforeWriting(summary);
+    }
 
     const made = new Set();
     const makeDirectory = async (segments) => {
@@ -512,24 +598,20 @@ async function extractZip(archivePath, targetDir, options = {}) {
       made.add(key);
     };
 
-    let directories = 0;
-    let files = 0;
     for (const entry of entries) {
       const targetPath = path.join(root, ...entry.segments);
       // The names were checked one by one; this is the same check on the result.
-      if (targetPath !== root && !targetPath.startsWith(`${root}${path.sep}`)) {
+      if (!targetPath.startsWith(`${root}${path.sep}`)) {
         throw archiveError("The archive holds a path that leads outside the world folder, which is not allowed.");
       }
       if (entry.isDirectory) {
         await makeDirectory(entry.segments);
-        directories += 1;
         continue;
       }
       await makeDirectory(entry.segments.slice(0, -1));
       await extractFile(handle, fileSize, entry, targetPath);
-      files += 1;
     }
-    return { directories, files, totalBytes };
+    return summary;
   } finally {
     await handle.close();
   }
@@ -539,9 +621,10 @@ async function extractZip(archivePath, targetDir, options = {}) {
 // files - no symbolic link, socket, pipe or device anywhere in it - and adds up
 // what the files weigh. `root` itself must be a real folder too.
 //
-// Resolves to { directories, files, totalBytes }. Rejects, naming the first
-// offender, otherwise; and if options.maxBytes is given, when the files add up
-// to more than that.
+// Resolves to { directories, files, totalBytes, weight }, where weight is the
+// files plus a block for each folder, as for an archive. Rejects, naming the
+// first offender, otherwise; and if options.maxBytes is given, when the weight
+// comes to more than that.
 async function assertPlainTree(root, options = {}) {
   const maxBytes = options.maxBytes === undefined ? Number.MAX_SAFE_INTEGER : options.maxBytes;
   const describe = (target) => JSON.stringify(path.relative(root, target) || path.basename(root));
@@ -566,20 +649,22 @@ async function assertPlainTree(root, options = {}) {
       } else if (stats.isFile()) {
         files += 1;
         totalBytes += stats.size;
-        if (totalBytes > maxBytes) {
-          throw archiveError(`This holds more than the ${describeBytes(maxBytes)} limit allows.`, 413);
-        }
       } else {
         const kind = stats.isSymbolicLink() ? "a symbolic link" : "neither a file nor a folder";
         throw archiveError(`${describe(target)} is ${kind}, which is not allowed in a world the dashboard restores.`, 409);
       }
+      if (totalBytes + directories * FOLDER_COST_BYTES > maxBytes) {
+        throw archiveError(`This holds more than the ${describeBytes(maxBytes)} limit allows.`, 413);
+      }
     }
   }
-  return { directories, files, totalBytes };
+  return { directories, files, totalBytes, weight: totalBytes + directories * FOLDER_COST_BYTES };
 }
 
 module.exports = {
   DEFAULT_MAX_ENTRIES,
+  FOLDER_COST_BYTES,
+  MAX_DEPTH,
   assertPlainTree,
   extractZip,
   inspectZip
