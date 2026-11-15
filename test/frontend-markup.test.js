@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { setHashCostForTests } = require("../src/lib/auth");
 const { PUBLIC_ROOT, installBrowserStubs, loadPublicModule } = require("../test-support/browser");
-const { realResponses, renderEverything } = require("../test-support/pages");
+const { hostileCopies, realResponses, renderEverything } = require("../test-support/pages");
 
 setHashCostForTests({ ln: 10, r: 8, p: 1 });
 installBrowserStubs();
@@ -133,17 +133,32 @@ test("a time is shown as a time or as unknown, and never breaks the page", async
 
 test("no text in a response is drawn as markup on any page", async (t) => {
   const responses = await realResponses(t);
+  // The marker, numbered when each piece of text is to be different. Where a
+  // link belongs it is one: a real address with the marker in it, which is
+  // let through as an address and has to be escaped as text all the same, or
+  // one that would run as script if it were ever put in a link.
+  const marker = (count, key) => {
+    const text = count ? MARKER.replace("unescaped", `unescaped ${count}`) : MARKER;
+    if (count && /url$/i.test(key)) {
+      return count % 2 ? `https://files.example/"> ${text}` : `javascript:alert(1)//${text}`;
+    }
+    return text;
+  };
 
   for (const role of ["owner", "admin"]) {
-    // Every string the server sent, swapped for markup.
-    const hostile = replaceEveryString(responses, () => MARKER);
-    hostile.bootstrap.user.role = role;
-    const page = await renderEverything(hostile, role);
+    // Every string the server sent, swapped for markup - and then again with
+    // the strings a page branches on left as they were, so that the branches
+    // real responses take are drawn with markup in them too.
+    for (const [label, hostile] of hostileCopies(responses, marker)) {
+      hostile.bootstrap.user.role = role;
+      const page = await renderEverything(hostile, role);
 
-    assert.doesNotMatch(page, /<b data-marker/, role);
-    assert.doesNotMatch(page, /onclick='alert/, role);
-    // It was drawn, as text.
-    assert.match(page, /&lt;b data-marker=&quot;x&quot;/, role);
+      assert.doesNotMatch(page, /<b data-marker/, `${role}, ${label}`);
+      assert.doesNotMatch(page, /onclick='alert/, `${role}, ${label}`);
+      assert.doesNotMatch(page, /(href|src)\s*=\s*["']?\s*javascript:/i, `${role}, ${label}`);
+      // It was drawn, as text.
+      assert.match(page, /&lt;b data-marker=&quot;x&quot;/, `${role}, ${label}`);
+    }
   }
 });
 
@@ -152,13 +167,14 @@ test("no object in a response is drawn as markup, and none of them breaks a page
 
   for (const role of ["owner", "admin"]) {
     // The same, with an object of the old trusted shape where each string was.
-    const hostile = replaceEveryString(responses, () => ({ __html: MARKER }));
-    hostile.bootstrap.user.role = role;
-    const page = await renderEverything(hostile, role);
+    for (const [label, hostile] of hostileCopies(responses, () => ({ __html: MARKER }))) {
+      hostile.bootstrap.user.role = role;
+      const page = await renderEverything(hostile, role);
 
-    assert.doesNotMatch(page, /data-marker/, role);
-    // And the page was drawn: an object where text belonged did not throw.
-    assert.match(page, /<h2>/, role);
+      assert.doesNotMatch(page, /data-marker/, `${role}, ${label}`);
+      // And the page was drawn: an object where text belonged did not throw.
+      assert.match(page, /<h2>/, `${role}, ${label}`);
+    }
   }
 });
 
@@ -171,4 +187,19 @@ test("the pages still draw what the server really sends", async (t) => {
   assert.match(page, /<strong><code>servers\/DemoServer<\/code><\/strong>/);
   assert.match(page, /example-mod\.jar/);
   assert.match(page, /first\.zip/);
+  // An add-on installed through a provider, with its title and its update.
+  assert.match(page, /<strong>Tracked Mod<\/strong><code class="addon-file">tracked-mod\.jar<\/code>/);
+  assert.match(page, /<strong>update: tracked-mod-2\.jar<\/strong>/);
+  assert.match(page, /check failed: Could not check: Request failed with status 500\./);
+  // The same server as one the dashboard manages, and as one it offers to.
+  assert.match(page, /<strong>loader mismatch<\/strong>/);
+  assert.match(page, /labelled <code>fabric<\/code> but the runtime installed on disk is <code>paper<\/code> \(0\.16\.14\)/);
+  assert.match(page, /<option value="0\.15\.0" disabled>0\.15\.0 [^<]*blocked by 1 mod<\/option>/);
+  assert.match(page, /current loader build: 0\.16\.14\. load the published builds/);
+  assert.match(page, /placeholder="0\.16\.10"/);
+  assert.match(page, /cannot provision a quilt runtime/);
+  assert.match(page, /only compatibility-matching add-ons are listed here for fabric on 1\.21\.1\./);
+  // The frame around the section, with the notice above it.
+  assert.match(page, /<main class="shell">/);
+  assert.match(page, /<section class="content">\s*<div class="notice notice--error" aria-hidden="true">something happened<\/div>/);
 });

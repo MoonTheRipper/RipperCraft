@@ -11,7 +11,30 @@ const { startWithAdmin } = require("./lane");
 async function realResponses(t) {
   const { admin, app, owner } = await startWithAdmin(t);
   const serverDir = path.join(app.root, "servers", "DemoServer");
-  fs.writeFileSync(path.join(serverDir, "mods", "example-mod.jar"), "jar");
+  // One add-on dropped in by hand, one whose update check failed, and one
+  // installed through a provider, which is the kind that has a title, artwork
+  // and a page of its own to draw.
+  for (const name of ["example-mod.jar", "other.jar", "tracked-mod.jar"]) {
+    fs.writeFileSync(path.join(serverDir, "mods", name), "jar");
+  }
+  fs.mkdirSync(path.join(serverDir, ".rippermoon"), { recursive: true });
+  fs.writeFileSync(
+    path.join(serverDir, ".rippermoon", "addons.json"),
+    JSON.stringify({
+      addons: [
+        {
+          clientSide: "required",
+          fileName: "tracked-mod.jar",
+          iconUrl: "https://cdn.modrinth.com/data/abc/icon.png",
+          pageUrl: "https://modrinth.com/mod/abc",
+          provider: "modrinth",
+          serverSide: "optional",
+          sourceId: "abc",
+          title: "Tracked Mod"
+        }
+      ]
+    })
+  );
   fs.writeFileSync(path.join(serverDir, "ops.json"), JSON.stringify([{ level: 4, name: "Moon", uuid: "0-0" }]));
   assert.equal((await admin("POST", "/api/servers/DemoServer/worlds/capture", { json: { label: "first" } })).status, 200);
 
@@ -69,6 +92,18 @@ function panelResponses() {
         { conflicts: [conflict], current: false, satisfiesInstalledMods: false, stable: false, version: "0.15.0" }
       ]
     },
+    // What the snapshot of a server carries when its runtime was installed by
+    // the dashboard - here one whose label has since been changed to another
+    // loader - and when it was not, with and without a loader the dashboard
+    // can install for it.
+    managedServer: {
+      managedRuntime: { kind: "paper", launch: { kind: "jar" }, loaderVersion: "0.16.14" },
+      updateSupport: { adoptable: false, loaderVersioned: true, runtimeKind: "fabric", supported: true }
+    },
+    adoptions: [
+      { alreadyManaged: false, currentStartCommand: "./start.sh", detectedLoaderVersion: "0.16.10", installable: true, loader: "fabric", minecraftVersion: "1.21.1" },
+      { alreadyManaged: false, currentStartCommand: "./start.sh", detectedLoaderVersion: "", installable: false, loader: "quilt", minecraftVersion: "1.21.1" }
+    ],
     manualDownload: { fileId: "1", fileName: "closed-mod.jar", modId: "2", modName: "Closed Mod", pageUrl: "https://www.curseforge.com/minecraft/mc-mods/closed/files/1", provider: "curseforge" },
     modResults: [
       {
@@ -103,7 +138,8 @@ function panelResponses() {
     modUpdates: {
       entries: [
         { fileName: "example-mod.jar", latestFileName: "example-mod-2.jar", latestVersion: "2.0", provider: "modrinth", sourceId: "abc", status: "update-available" },
-        { fileName: "other.jar", provider: "modrinth", reason: "Could not check: Request failed with status 500.", sourceId: "def", status: "error" }
+        { fileName: "other.jar", provider: "modrinth", reason: "Could not check: Request failed with status 500.", sourceId: "def", status: "error" },
+        { fileName: "tracked-mod.jar", latestFileName: "tracked-mod-2.jar", latestVersion: "2.0", provider: "modrinth", sourceId: "abc", status: "update-available" }
       ],
       gameVersion: "1.21.1",
       loader: "fabric",
@@ -150,6 +186,7 @@ function panelResponses() {
 // open, the sidebar, and every owner page with its dialogs open.
 async function renderEverything(responses, role) {
   const { state } = await loadPublicModule("js/state.js");
+  const { render } = await loadPublicModule("js/render.js");
   const { renderAuth } = await loadPublicModule("js/views/auth.js");
   const { renderServerContent } = await loadPublicModule("js/views/server.js");
   const { renderOwnerContent } = await loadPublicModule("js/views/owner.js");
@@ -193,19 +230,55 @@ async function renderEverything(responses, role) {
       state.serverSection = section;
       pages.push(renderServerContent());
     }
+    // The add-ons section again as it is before anything has been searched for.
+    state.modResults = [];
+    state.serverSection = "mods";
+    pages.push(renderServerContent());
+    state.modResults = panels.modResults;
+
+    if (role === "owner") {
+      // The same server as one the dashboard installed the runtime for: with
+      // the builds it could move to, and before those have been fetched.
+      const plain = state.serverSnapshot;
+      state.serverSnapshot = { ...plain, server: { ...plain.server, ...panels.managedServer } };
+      for (const loaderOptions of [state.loaderOptions, null]) {
+        state.loaderOptions = loaderOptions;
+        for (const section of ["overview", "settings"]) {
+          state.serverSection = section;
+          pages.push(renderServerContent());
+        }
+      }
+      state.loaderOptions = { options: panels.loaderOptions, serverId };
+      // And as one it did not, which it offers to take over - or cannot.
+      for (const runtimeAdoption of panels.adoptions) {
+        state.serverSnapshot = {
+          ...plain,
+          server: { ...plain.server, permissions: { ...plain.server.permissions, canAdoptRuntime: true }, runtimeAdoption }
+        };
+        state.serverSection = "overview";
+        pages.push(renderServerContent());
+      }
+      state.serverSnapshot = plain;
+    }
     state.navOpen = true;
     pages.push(renderSidebar("light"), renderVersionDatalist("minecraft-version-list", true));
+    // The page as a whole, the way the browser is handed it: the frame around
+    // a section, with the notice that sits above every one of them.
+    pages.push(drawWholePage(render));
 
     if (role === "owner") {
       state.view = "owner";
       state.createJob = panels.createJob;
       state.createVersionOpen = true;
+      // A version picked from the list, not the "latest" the form opens with.
+      state.createServerMinecraftVersion = panels.versionCatalog.versions[0].id;
       state.editingUserId = state.users[0].id;
       state.resettingUserId = state.users[state.users.length - 1].id;
       for (const section of ["servers", "admins", "integrations"]) {
         state.ownerSection = section;
         pages.push(renderOwnerContent());
       }
+      pages.push(drawWholePage(render));
     }
   } finally {
     Object.assign(state, saved);
@@ -213,7 +286,86 @@ async function renderEverything(responses, role) {
   return pages.join("\n");
 }
 
+// Runs the dashboard's own render() and returns what it put into the page.
+function drawWholePage(render) {
+  const app = document.getElementById("app");
+  app.innerHTML = "";
+  render();
+  assert.ok(app.innerHTML.includes('<main class="shell">'), "the whole page was not drawn");
+  return app.innerHTML;
+}
+
+// Text in a response is one of three things. Most of it is drawn. Some of it
+// decides what is drawn - a setting's type, an update's status - and some of
+// it says which thing a record is about, so that two records about the same
+// add-on or setting find each other. Replace all three and the page falls
+// back to its plainest branches, leaving the others undrawn and untested.
+const DECIDES = new Set([
+  "clientSide",
+  "installKind",
+  "kind",
+  "loaderDirection",
+  "mode",
+  "role",
+  "runtimeKind",
+  "serverSide",
+  "settingsMode",
+  "source",
+  "status",
+  "type",
+  "versionDirection"
+]);
+const IDENTIFIES = new Set(["fileName", "id", "key", "serverId"]);
+
+function replaceText(value, replacement, keep, key) {
+  if (typeof value === "string") {
+    return keep.has(key) ? value : replacement(key);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => replaceText(item, replacement, keep, key));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, replaceText(item, replacement, keep, name)]));
+  }
+  return value;
+}
+
+// Copies of a set of responses with the text in them replaced by whatever
+// `replacement` returns, in every combination a page's branches need: all of
+// it; all but what decides; all but what decides or identifies. Each of those
+// twice - once with the same replacement everywhere, so that records which
+// matched still match, and once with a different one each time, so that
+// nothing matches by accident. `replacement` is called with a number that
+// counts up, or 0 when the same value is wanted everywhere, and with the name
+// of the field being replaced.
+function hostileCopies(responses, replacement) {
+  const copies = [];
+  const keeps = [
+    ["every string", new Set()],
+    ["every string that is drawn or names something", DECIDES],
+    ["every string that is drawn", new Set([...DECIDES, ...IDENTIFIES])]
+  ];
+  for (const [label, keep] of keeps) {
+    copies.push([`${label}, the same everywhere`, replaceText(responses, (key) => replacement(0, key), keep, "")]);
+    let count = 0;
+    copies.push([
+      `${label}, different each time`,
+      replaceText(
+        responses,
+        (key) => {
+          count += 1;
+          return replacement(count, key);
+        },
+        keep,
+        ""
+      )
+    ]);
+  }
+  return copies;
+}
+
 module.exports = {
+  hostileCopies,
   realResponses,
   renderEverything
 };
