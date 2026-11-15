@@ -1,7 +1,7 @@
 const path = require("node:path");
 const fsp = require("node:fs/promises");
 const crypto = require("node:crypto");
-const { ensureDir, nowIso, randomId, readJson, writeJson } = require("./utils");
+const { createMutex, ensureDir, nowIso, randomId, readJson, writeJson } = require("./utils");
 
 function createStore(rootDir) {
   const DATA_DIR = path.join(rootDir, "data");
@@ -13,6 +13,12 @@ function createStore(rootDir) {
   // them should be world-readable.
   const SECRET_FILE_MODE = 0o600;
   let hardenedExistingFiles = false;
+  // Two requests arriving together used to each find a file missing and each
+  // write its default, the later one landing on top of a user the earlier one
+  // had just saved. Initialisation runs one caller at a time, and so does every
+  // read-modify-write of users.json.
+  const initializeExclusively = createMutex();
+  const mutateUsersExclusively = createMutex();
 
   async function hardenSecretFiles() {
     if (hardenedExistingFiles) {
@@ -28,7 +34,11 @@ function createStore(rootDir) {
     }
   }
 
-  async function ensureInitialized() {
+  function ensureInitialized() {
+    return initializeExclusively(initialize);
+  }
+
+  async function initialize() {
     await ensureDir(DATA_DIR);
 
     const app = await readJson(APP_FILE, null);
@@ -112,36 +122,62 @@ function createStore(rootDir) {
     return users.length > 0;
   }
 
-  async function createUser(user) {
+  async function hasOwner() {
     const users = await getUsers();
-    const timestamp = nowIso();
-    const nextUser = {
-      id: randomId("usr"),
-      displayName: user.displayName || user.username,
-      role: user.role || "admin",
-      servers: Array.isArray(user.servers) ? user.servers : [],
-      createdAt: timestamp,
-      updatedAt: timestamp,
-      ...user
-    };
-    users.push(nextUser);
-    await saveUsers(users);
-    return nextUser;
+    return users.some((user) => user.role === "owner");
   }
 
-  async function updateUser(userId, patch) {
-    const users = await getUsers();
-    const index = users.findIndex((user) => user.id === userId);
-    if (index === -1) {
-      return null;
-    }
-    users[index] = {
-      ...users[index],
-      ...patch,
-      updatedAt: nowIso()
-    };
-    await saveUsers(users);
-    return users[index];
+  function createUser(user) {
+    return mutateUsersExclusively(async () => {
+      const users = await getUsers();
+      const timestamp = nowIso();
+      const nextUser = {
+        id: randomId("usr"),
+        displayName: user.displayName || user.username,
+        role: user.role || "admin",
+        servers: Array.isArray(user.servers) ? user.servers : [],
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        ...user
+      };
+      users.push(nextUser);
+      await saveUsers(users);
+      return nextUser;
+    });
+  }
+
+  function updateUser(userId, patch) {
+    return mutateUsersExclusively(async () => {
+      const users = await getUsers();
+      const index = users.findIndex((user) => user.id === userId);
+      if (index === -1) {
+        return null;
+      }
+      users[index] = {
+        ...users[index],
+        ...patch,
+        updatedAt: nowIso()
+      };
+      await saveUsers(users);
+      return users[index];
+    });
+  }
+
+  // Swaps a stored password hash for a stronger encoding of the same password.
+  // It only happens while the hash is still the one that was just verified: a
+  // password reset that lands in between must not be undone by the upgrade.
+  // updatedAt is left alone, because nothing about the account changed.
+  function upgradePasswordHash(userId, verifiedHash, nextHash) {
+    return mutateUsersExclusively(async () => {
+      const users = await getUsers();
+      const index = users.findIndex((user) => user.id === userId);
+      if (index === -1 || users[index].passwordHash !== verifiedHash) {
+        return false;
+      }
+      users[index] = { ...users[index], passwordHash: nextHash };
+      await saveUsers(users);
+      return true;
+    });
   }
 
   async function getServerRecords() {
@@ -193,6 +229,7 @@ function createStore(rootDir) {
     getIntegrations,
     getServerRecords,
     getUsers,
+    hasOwner,
     hasUsers,
     rootDir,
     saveAppConfig,
@@ -200,7 +237,8 @@ function createStore(rootDir) {
     saveServerRecords,
     saveUsers,
     updateServerRecord,
-    updateUser
+    updateUser,
+    upgradePasswordHash
   };
 }
 

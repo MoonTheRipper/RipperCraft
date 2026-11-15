@@ -117,9 +117,16 @@ function renderVelocity(config, routes) {
 function renderCaddyfile(config) {
   const adminHost = config.adminHost || config.domain;
   const dashboardRemotePort = Number(config.dashboardRemotePort || 4300);
+  // The dashboard counts failed logins against the visitor's address, and when
+  // its peer is on loopback - as frpc is - it takes that address from request
+  // headers. Caddy rewrites X-Forwarded-For itself, but it passes any other
+  // header through, including a CF-Connecting-IP the visitor made up. Nothing
+  // in this layout is Cloudflare, so nobody here may send one.
   return `${adminHost}, www.${adminHost} {
   encode zstd gzip
-  reverse_proxy 127.0.0.1:${dashboardRemotePort}
+  reverse_proxy 127.0.0.1:${dashboardRemotePort} {
+    header_up -CF-Connecting-IP
+  }
 }
 `;
 }

@@ -712,3 +712,254 @@ test("the brand mark is decorative and sized so the rail cannot be stretched", a
   assert.match(markup, /width="512"/);
   assert.match(markup, /height="404"/);
 });
+
+test("the first-run screen asks for the setup code and the login screen does not", async (t) => {
+  const { state } = await load(path.join(jsRoot, "state.js"));
+  const { renderAuth } = await load(path.join(jsRoot, "views", "auth.js"));
+  const saved = { bootstrap: state.bootstrap, notice: state.notice };
+  t.after(() => Object.assign(state, saved));
+  state.notice = null;
+  state.bootstrap = { needsSetup: true, passwordMinLength: 12 };
+
+  const setup = renderAuth("Create the Owner Account", "setup");
+  assert.match(setup, /<form data-form="setup"/);
+  // The field the server reads, required, and not something to autofill or autocorrect.
+  const codeField = /<input\s+name="setupCode"[^>]*>/.exec(setup);
+  assert.ok(codeField, "no setup code field");
+  assert.match(codeField[0], /\brequired\b/);
+  assert.match(codeField[0], /autocomplete="off"/);
+  assert.match(codeField[0], /spellcheck="false"/);
+  assert.match(setup, /Printed in the terminal, or the service journal/);
+  // It comes before the account fields: nothing else matters without it.
+  assert.ok(setup.indexOf('name="setupCode"') < setup.indexOf('name="username"'));
+
+  const login = renderAuth("Are You Worthy", "login");
+  assert.match(login, /<form data-form="login"/);
+  assert.equal(login.includes("setupCode"), false);
+  assert.equal(login.includes("Setup Code"), false);
+});
+
+test("the password minimum is mirrored where a password is set, and only there", async (t) => {
+  const { state } = await load(path.join(jsRoot, "state.js"));
+  const { renderAuth } = await load(path.join(jsRoot, "views", "auth.js"));
+  const saved = { bootstrap: state.bootstrap, notice: state.notice };
+  t.after(() => Object.assign(state, saved));
+  state.notice = null;
+
+  state.bootstrap = { needsSetup: true, passwordMinLength: 12 };
+  const setup = renderAuth("Create the Owner Account", "setup");
+  assert.match(setup, /<input type="password" name="password" autocomplete="new-password" minlength="12" required \/>/);
+  assert.match(setup, /At least 12 characters\./);
+
+  // The number is the server's, not a second copy kept in the page.
+  state.bootstrap = { needsSetup: true, passwordMinLength: 16 };
+  assert.match(renderAuth("Create the Owner Account", "setup"), /minlength="16"/);
+  // An older server that does not say still gets the current rule.
+  state.bootstrap = { needsSetup: true };
+  assert.match(renderAuth("Create the Owner Account", "setup"), /minlength="12"/);
+
+  // Logging in must not be held to it: passwords set before the rule are shorter.
+  state.bootstrap = { needsSetup: false, passwordMinLength: 12 };
+  const login = renderAuth("Are You Worthy", "login");
+  assert.match(login, /<input type="password" name="password" autocomplete="current-password" required \/>/);
+  assert.equal(login.includes("minlength"), false);
+});
+
+test("the login and first-run screens show the notice, escaped", async (t) => {
+  const { state } = await load(path.join(jsRoot, "state.js"));
+  const { renderAuth } = await load(path.join(jsRoot, "views", "auth.js"));
+  const saved = { bootstrap: state.bootstrap, notice: state.notice };
+  t.after(() => Object.assign(state, saved));
+  state.bootstrap = { needsSetup: false, passwordMinLength: 12 };
+
+  state.notice = null;
+  assert.equal(renderAuth("Are You Worthy", "login").includes("notice"), false);
+
+  // A wrong password used to change nothing on screen: the banner only existed
+  // inside the logged-in shell.
+  state.notice = { message: "Too many failed login attempts. Try again in 15 minutes.", type: "error" };
+  for (const mode of ["login", "setup"]) {
+    const markup = renderAuth("title", mode);
+    assert.ok(
+      markup.includes(
+        '<div class="notice notice--error" aria-hidden="true">Too many failed login attempts. Try again in 15 minutes.</div>'
+      ),
+      mode
+    );
+  }
+
+  state.notice = { message: '<img src=x onerror="alert(1)">', type: 'error" onmouseover="alert(1)' };
+  const hostile = renderAuth("Are You Worthy", "login");
+  // (The page has an <img> of its own, the brand mark; this one must not join it.)
+  assert.equal(hostile.includes("<img src=x"), false);
+  assert.equal(hostile.includes('onmouseover="alert(1)"'), false);
+  assert.ok(hostile.includes("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;"));
+});
+
+test("the api wrapper sends what the server's cross-site checks require", async (t) => {
+  const { api } = await load(path.join(jsRoot, "api.js"));
+  const calls = [];
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    calls.push({ options, url });
+    return { headers: { get: () => "" }, ok: true, status: 204 };
+  };
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+  });
+
+  // The server refuses any call that changes something unless it is declared
+  // as JSON - including the ones that carry no body at all.
+  await api("/api/logout", { method: "POST" });
+  await api("/api/servers/x/start", { method: "POST" });
+  await api("/api/servers/x", { body: { confirmServerId: "x" }, method: "DELETE" });
+  await api("/api/users", { body: { username: "lane" }, method: "POST" });
+  await api("/api/servers/x/settings", { body: { motd: "hi" }, method: "PUT" });
+  for (const call of calls) {
+    assert.equal(call.options.headers["Content-Type"], "application/json", `${call.options.method} ${call.url}`);
+  }
+  assert.equal(calls[3].options.body, '{"username":"lane"}');
+  assert.equal(calls[0].options.body, undefined);
+
+  // Uploads are the exception: the browser must set the multipart boundary itself.
+  const form = new FormData();
+  form.set("file", new Blob(["jar"]), "mod.jar");
+  await api("/api/servers/x/mods/upload", { body: form, method: "POST" });
+  assert.equal("Content-Type" in calls[5].options.headers, false);
+  assert.equal(calls[5].options.body, form);
+
+  // Same-origin, relative URLs only: the session cookie and the Origin header
+  // are the browser's to attach.
+  for (const call of calls) {
+    assert.ok(call.url.startsWith("/api/"), call.url);
+    assert.equal(call.options.credentials, undefined);
+    assert.equal(call.options.mode, undefined);
+  }
+});
+
+test("every network call in the front end goes through the api wrapper", () => {
+  const offenders = [];
+  for (const file of [path.join(publicRoot, "app.js"), ...listModuleFiles(jsRoot)]) {
+    if (file === path.join(jsRoot, "api.js")) {
+      continue;
+    }
+    const source = fs.readFileSync(file, "utf8");
+    if (/\bfetch\s*\(|XMLHttpRequest|sendBeacon|new\s+WebSocket|new\s+EventSource/.test(source)) {
+      offenders.push(path.relative(publicRoot, file));
+    }
+  }
+  // A call made any other way would skip the JSON content type and be refused.
+  assert.deepEqual(offenders, []);
+  // And nothing changes state through a plain form post or a link.
+  for (const file of listModuleFiles(jsRoot)) {
+    const source = fs.readFileSync(file, "utf8");
+    assert.equal(/<form[^>]*\smethod=/i.test(source), false, `${path.relative(publicRoot, file)} has a form with its own method`);
+    assert.equal(/<form[^>]*\saction=/i.test(source), false, `${path.relative(publicRoot, file)} has a form with its own action`);
+  }
+});
+
+test("the owner's account forms mirror the password minimum", async (t) => {
+  const { state } = await load(path.join(jsRoot, "state.js"));
+  const { renderOwnerAdmins } = await load(path.join(jsRoot, "views", "owner.js"));
+  const saved = {
+    bootstrap: state.bootstrap,
+    editingUserId: state.editingUserId,
+    resettingUserId: state.resettingUserId,
+    servers: state.servers,
+    users: state.users
+  };
+  t.after(() => Object.assign(state, saved));
+  state.servers = [];
+  state.users = [{ displayName: "Lane", id: "usr_lane", permissions: { createWorldServers: [] }, role: "admin", servers: [], username: "lane" }];
+  state.bootstrap = { passwordMinLength: 12 };
+  const passwordInputs = (markup, formName) => {
+    const form = new RegExp(`<form data-form="${formName}"[\\s\\S]*?</form>`).exec(markup);
+    assert.ok(form, `no ${formName} form`);
+    return form[0].match(/<input type="password"[^>]*>/g) || [];
+  };
+
+  // Creating an account: required, and at least the minimum.
+  state.editingUserId = null;
+  state.resettingUserId = null;
+  let markup = renderOwnerAdmins();
+  assert.deepEqual(passwordInputs(markup, "create-user"), [
+    '<input type="password" name="password" autocomplete="new-password" minlength="12" placeholder="at least 12 characters" required />'
+  ]);
+  assert.equal(markup.includes('data-form="update-user"'), false);
+
+  // Editing one: optional - blank keeps the current password - but if a new
+  // one is typed it has to meet the minimum. minlength ignores an empty field.
+  state.editingUserId = "usr_lane";
+  markup = renderOwnerAdmins();
+  assert.deepEqual(passwordInputs(markup, "update-user"), [
+    '<input type="password" name="password" autocomplete="new-password" minlength="12" placeholder="leave blank to keep current" />'
+  ]);
+  assert.match(markup, /a new password needs at least 12 characters, and signs this user out everywhere else\./);
+  // The fields sit side by side in a row that stretches every cell to the
+  // tallest: a note inside one cell makes its neighbours' inputs grow. Each
+  // label in these rows holds its caption and its control and nothing else.
+  for (const formName of ["create-user", "update-user"]) {
+    const form = new RegExp(`<form data-form="${formName}"[\\s\\S]*?</form>`).exec(markup)[0];
+    const row = /<div class="input-grid[^"]*">([\s\S]*?)<\/div>/.exec(form)[1];
+    for (const label of row.match(/<label>[\s\S]*?<\/label>/g)) {
+      assert.equal((label.match(/<span>/g) || []).length, 1, `${formName}: ${label.replace(/\s+/g, " ")}`);
+    }
+  }
+
+  // Resetting one.
+  state.editingUserId = null;
+  state.resettingUserId = "usr_lane";
+  markup = renderOwnerAdmins();
+  assert.deepEqual(passwordInputs(markup, "reset-user-password"), [
+    '<input type="password" name="password" autocomplete="new-password" minlength="12" required />'
+  ]);
+  assert.match(markup, /this signs the user out everywhere else/);
+
+  // The number follows the server.
+  state.bootstrap = { passwordMinLength: 20 };
+  assert.match(renderOwnerAdmins(), /minlength="20"/);
+});
+
+test("an upload over the server's limit is stopped in the page, with the sizes spelled out", async (t) => {
+  const { state } = await load(path.join(jsRoot, "state.js"));
+  const { formatBytes } = await load(path.join(jsRoot, "format.js"));
+  const { assertUploadFits } = await load(path.join(jsRoot, "actions", "forms.js"));
+  const savedBootstrap = state.bootstrap;
+  t.after(() => {
+    state.bootstrap = savedBootstrap;
+  });
+
+  assert.equal(formatBytes(512 * 1024), "512 KB");
+  assert.equal(formatBytes(3.5 * 1024 * 1024), "3.5 MB");
+  assert.equal(formatBytes(4096 * 1024 * 1024), "4 GB");
+  assert.equal(formatBytes(100), "0.1 KB");
+
+  const megabyte = 1024 * 1024;
+  const asked = [];
+  const formWith = (file) => ({
+    querySelector(selector) {
+      asked.push(selector);
+      return { files: file ? [file] : [] };
+    }
+  });
+
+  state.bootstrap = { uploadLimitBytes: 100 * megabyte };
+  assert.doesNotThrow(() => assertUploadFits(formWith({ size: 100 * megabyte }), "archive"));
+  assert.doesNotThrow(() => assertUploadFits(formWith(null), "archive"));
+  assert.throws(
+    () => assertUploadFits(formWith({ size: 100 * megabyte + 1 }), "archive"),
+    /that file is 100 MB, and uploads here are limited to 100 MB/
+  );
+  assert.throws(
+    () => assertUploadFits(formWith({ size: 5000 * megabyte }), "file"),
+    /that file is 4\.9 GB, and uploads here are limited to 100 MB/
+  );
+  assert.deepEqual([...new Set(asked)], ['input[type="file"][name="archive"]', 'input[type="file"][name="file"]']);
+
+  // A server that does not report a limit: nothing to check against, so the
+  // upload is attempted and the server decides.
+  state.bootstrap = {};
+  assert.doesNotThrow(() => assertUploadFits(formWith({ size: 5000 * megabyte }), "file"));
+  state.bootstrap = null;
+  assert.doesNotThrow(() => assertUploadFits(formWith({ size: 5000 * megabyte }), "file"));
+});

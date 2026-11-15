@@ -4,11 +4,15 @@ const path = require("node:path");
 const os = require("node:os");
 const fsp = require("node:fs/promises");
 const { createStore } = require("../src/lib/store");
-const { createSessionManager, hashSecret, verifySecret } = require("../src/lib/auth");
+const { createSessionManager, hashSecret, setHashCostForTests, verifySecret } = require("../src/lib/auth");
 const { createServerManager } = require("../src/lib/servers");
 const { createWorldManager } = require("../src/lib/worlds");
 const { createModManager } = require("../src/lib/mod-sources");
 const { createJobRegistry } = require("../src/lib/jobs");
+
+// These tests hash dozens of passwords and passphrases on the way to checking
+// something else. test/auth.test.js covers hashing at its real cost.
+setHashCostForTests({ ln: 10, r: 8, p: 1 });
 
 async function createFixtureRoot() {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rippermoonstash-test-"));
@@ -28,9 +32,9 @@ async function createFixtureRoot() {
 }
 
 test("auth hashing verifies valid passwords and rejects invalid ones", async () => {
-  const hash = hashSecret("moon-pass");
-  assert.equal(verifySecret("moon-pass", hash), true);
-  assert.equal(verifySecret("wrong-pass", hash), false);
+  const hash = await hashSecret("moon-pass");
+  assert.equal(await verifySecret("moon-pass", hash), true);
+  assert.equal(await verifySecret("wrong-pass", hash), false);
 });
 
 test("store and server manager discover servers and sanitize snapshots", async (t) => {
@@ -47,7 +51,7 @@ test("store and server manager discover servers and sanitize snapshots", async (
   const owner = await store.createUser({
     username: "owner",
     displayName: "Ripper Moon",
-    passwordHash: hashSecret("moon-pass"),
+    passwordHash: await hashSecret("moon-pass"),
     role: "owner",
     servers: []
   });
@@ -120,7 +124,7 @@ test("admin snapshots stay locked until the server passphrase is unlocked and on
   const admin = await store.createUser({
     username: "lane-admin",
     displayName: "Lane Admin",
-    passwordHash: hashSecret("lane-pass"),
+    passwordHash: await hashSecret("lane-pass"),
     permissions: {
       createWorldServers: ["DemoServer"]
     },
@@ -172,7 +176,7 @@ test("server admins can manage add-on loader settings and remove add-ons after u
   const admin = await store.createUser({
     username: "lane-admin",
     displayName: "Lane Admin",
-    passwordHash: hashSecret("lane-pass"),
+    passwordHash: await hashSecret("lane-pass"),
     role: "admin",
     servers: ["DemoServer"]
   });
@@ -410,7 +414,7 @@ test("a per-server java binary is validated and reaches the launched process", a
   await store.ensureInitialized();
   const owner = await store.createUser({
     username: "owner",
-    passwordHash: hashSecret("moon-pass"),
+    passwordHash: await hashSecret("moon-pass"),
     role: "owner",
     servers: []
   });
@@ -1244,7 +1248,7 @@ test("discovery collapses duplicate records that point at the same server folder
   await store.createUser({
     username: "lane-admin",
     displayName: "Lane Admin",
-    passwordHash: hashSecret("lane-pass"),
+    passwordHash: await hashSecret("lane-pass"),
     permissions: {
       createWorldServers: ["DemoServer"]
     },
@@ -1299,14 +1303,14 @@ test("admin password reset changes only the password hash", async (t) => {
   await store.createUser({
     username: "owner",
     displayName: "Ripper Moon",
-    passwordHash: hashSecret("moon-pass"),
+    passwordHash: await hashSecret("moon-pass"),
     role: "owner",
     servers: []
   });
   const admin = await store.createUser({
     username: "lane-admin",
     displayName: "Lane Admin",
-    passwordHash: hashSecret("forgotten-pass"),
+    passwordHash: await hashSecret("forgotten-pass"),
     permissions: {
       createWorldServers: ["DemoServer"]
     },
@@ -1315,7 +1319,7 @@ test("admin password reset changes only the password hash", async (t) => {
   });
 
   await store.updateUser(admin.id, {
-    passwordHash: hashSecret("new-lane-pass")
+    passwordHash: await hashSecret("new-lane-pass")
   });
 
   const users = await store.getUsers();
@@ -1323,8 +1327,8 @@ test("admin password reset changes only the password hash", async (t) => {
   assert.equal(updatedAdmin.role, "admin");
   assert.deepEqual(updatedAdmin.servers, ["DemoServer"]);
   assert.deepEqual(updatedAdmin.permissions.createWorldServers, ["DemoServer"]);
-  assert.equal(verifySecret("forgotten-pass", updatedAdmin.passwordHash), false);
-  assert.equal(verifySecret("new-lane-pass", updatedAdmin.passwordHash), true);
+  assert.equal(await verifySecret("forgotten-pass", updatedAdmin.passwordHash), false);
+  assert.equal(await verifySecret("new-lane-pass", updatedAdmin.passwordHash), true);
 });
 
 test("sync normalizes machine-specific server paths back to the workspace root", async (t) => {

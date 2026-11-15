@@ -36,13 +36,94 @@ async function readJson(filePath, fallbackValue) {
   }
 }
 
-async function writeJson(filePath, value, options = {}) {
-  await ensureDir(path.dirname(filePath));
-  await fs.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  if (options.mode !== undefined) {
-    // writeFile only honours mode when creating, so set it explicitly.
-    await fs.chmod(filePath, options.mode);
+// Replaces a file in one step. The new contents go to a temporary file in the
+// same directory, are flushed to disk, and are then renamed over the target, so
+// a reader sees either the complete old file or the complete new one. Writing
+// in place could not promise that: two overlapping writes interleaved their
+// bytes and left data/users.json unparseable, and a crash mid-write left it cut
+// short.
+//
+// options.mode sets the permissions exactly, and the temporary file is created
+// with them, so a secret never sits in a more readable file even briefly.
+// Without it, an existing file keeps the permissions it already has.
+async function writeFileAtomic(filePath, data, options = {}) {
+  // Follow a symlink in the last position, so the link survives and the file it
+  // points at is the one replaced.
+  let targetPath = filePath;
+  try {
+    targetPath = await fs.realpath(filePath);
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
   }
+
+  const directory = path.dirname(targetPath);
+  await ensureDir(directory);
+
+  let mode = options.mode;
+  if (mode === undefined) {
+    try {
+      mode = (await fs.stat(targetPath)).mode & 0o7777;
+    } catch {
+      // A new file: the process umask decides, as it does for writeFile.
+    }
+  }
+
+  const temporaryPath = path.join(
+    directory,
+    `.${path.basename(targetPath)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`
+  );
+  let handle = null;
+  try {
+    handle = await fs.open(temporaryPath, "wx", mode === undefined ? 0o666 : mode);
+    if (mode !== undefined) {
+      // open() masks the mode with the umask; this makes it exact.
+      await handle.chmod(mode);
+    }
+    await handle.writeFile(data);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fs.rename(temporaryPath, targetPath);
+  } catch (error) {
+    if (handle) {
+      await handle.close().catch(() => {});
+    }
+    await fs.rm(temporaryPath, { force: true }).catch(() => {});
+    throw error;
+  }
+
+  // The rename lives in the directory, so flush that too. Not every platform
+  // allows a directory to be opened or synced; the write itself has succeeded.
+  try {
+    const directoryHandle = await fs.open(directory, "r");
+    try {
+      await directoryHandle.sync();
+    } finally {
+      await directoryHandle.close();
+    }
+  } catch {
+    // Best effort.
+  }
+}
+
+async function writeJson(filePath, value, options = {}) {
+  await writeFileAtomic(filePath, `${JSON.stringify(value, null, 2)}\n`, options);
+}
+
+// Runs async tasks one at a time, in the order they were queued. A task that
+// throws rejects its own caller and does not hold up the ones behind it.
+function createMutex() {
+  let tail = Promise.resolve();
+  return function runExclusive(task) {
+    const result = tail.then(() => task());
+    tail = result.then(
+      () => {},
+      () => {}
+    );
+    return result;
+  };
 }
 
 function randomId(prefix = "id") {
@@ -171,6 +252,7 @@ module.exports = {
   ENV_PREFIX,
   LEGACY_ENV_PREFIX,
   coerceBoolean,
+  createMutex,
   displayNameFromSlug,
   ensureDir,
   exists,
@@ -184,5 +266,6 @@ module.exports = {
   slugify,
   tailTextFile,
   withinParent,
+  writeFileAtomic,
   writeJson
 };

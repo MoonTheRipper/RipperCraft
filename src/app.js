@@ -2,13 +2,26 @@ const http = require("node:http");
 const path = require("node:path");
 const fs = require("node:fs/promises");
 const { createStore } = require("./lib/store");
-const { createSessionManager, hashSecret, verifySecret } = require("./lib/auth");
-const { json, noContent, parseFormData, parseJsonBody, sendFile, sendStream } = require("./lib/http");
+const { createSessionManager, hashSecret, needsRehash, verifyAccountSecret, verifySecret } = require("./lib/auth");
+const {
+  HttpError,
+  applySecurityHeaders,
+  closeAfterUnreadBody,
+  json,
+  noContent,
+  parseJsonBody,
+  sendFile,
+  staticFileHeaders
+} = require("./lib/http");
 const { createServerManager } = require("./lib/servers");
 const { createWorldManager } = require("./lib/worlds");
 const { createModManager } = require("./lib/mod-sources");
 const { createJobRegistry } = require("./lib/jobs");
-const { exists, withinParent } = require("./lib/utils");
+const { clientAddress, isHttpsRequest } = require("./lib/peer");
+const { generateSetupCode, setupCodeBanner, setupCodeMatches } = require("./lib/setup-code");
+const { createAttemptThrottle, createLoginThrottle, describeWait } = require("./lib/throttle");
+const { receiveUpload, resolveUploadLimitBytes } = require("./lib/upload");
+const { createMutex, exists, readEnv, withinParent } = require("./lib/utils");
 
 function sanitizeUser(user) {
   if (!user) {
@@ -31,8 +44,34 @@ function sanitizeUser(user) {
   };
 }
 
+// A field of a JSON body read as text: a string as it is, a number in its
+// usual spelling, and anything else - an object, a list, true, null - as
+// nothing. String() would instead turn {} into "[object Object]", and on a
+// list nested a few thousand deep it overflows the stack, which on the login
+// route was a 500 anybody could ask for.
+function textOf(value) {
+  if (typeof value === "string") {
+    return value;
+  }
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : "";
+}
+
 function isBlank(value) {
-  return !value || !String(value).trim();
+  return !textOf(value).trim();
+}
+
+// Applies to every password that is set from now on: the owner's at setup, a
+// new account's, and any reset or change. Passwords that already exist are not
+// measured against it, so nobody is locked out by the upgrade.
+const PASSWORD_MIN_LENGTH = 12;
+
+// Returns the reason a new password is not acceptable, or "" when it is.
+// Length is counted in characters, not UTF-16 units, so an emoji counts once.
+function newPasswordProblem(password) {
+  if ([...textOf(password)].length < PASSWORD_MIN_LENGTH) {
+    return `Password must be at least ${PASSWORD_MIN_LENGTH} characters.`;
+  }
+  return "";
 }
 
 function normalizeUserPermissions(rawPermissions) {
@@ -42,6 +81,41 @@ function normalizeUserPermissions(rawPermissions) {
         ? rawPermissions.createWorldServers.filter(Boolean)
         : []
   };
+}
+
+// Methods that only read. Everything else can change something, and is held to
+// the cross-site checks below.
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+function requestMediaType(req) {
+  return String(req.headers["content-type"] || "")
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
+}
+
+// Origins to accept besides the one in the Host header, from
+// RIPPERCRAFT_TRUSTED_ORIGINS: a comma-separated list such as
+// "https://example.com,https://www.example.com". Only needed behind a reverse
+// proxy that rewrites the Host header on its way here.
+function parseTrustedOrigins(value, logger) {
+  const origins = new Set();
+  for (const entry of String(value || "").split(",")) {
+    const text = entry.trim();
+    if (!text) {
+      continue;
+    }
+    try {
+      const parsed = new URL(text);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        throw new Error("not http(s)");
+      }
+      origins.add(parsed.origin);
+    } catch {
+      logger.warn("Ignoring an entry in TRUSTED_ORIGINS that is not an http(s) origin", { entry: text });
+    }
+  }
+  return origins;
 }
 
 function normalizeServerList(value) {
@@ -74,6 +148,44 @@ async function createApp(rootDir = process.cwd(), options = {}) {
   });
   const jobs = createJobRegistry();
   const publicRoot = path.join(rootDir, "public");
+  // The numbers and the reasoning behind them are in lib/throttle.js.
+  const loginThrottle = createLoginThrottle({ now: options.now });
+  const unlockThrottle = createAttemptThrottle({ now: options.now });
+  const uploadLimitBytes = options.uploadLimitBytes || resolveUploadLimitBytes(logger);
+  const trustedOrigins = parseTrustedOrigins(
+    options.trustedOrigins === undefined ? readEnv("TRUSTED_ORIGINS") : options.trustedOrigins,
+    logger
+  );
+
+  // Creating the owner takes a code that is only ever shown on this process's
+  // standard output. It exists exactly while no owner does: made at start, or
+  // on first need if the accounts file disappears while running, and dropped
+  // the moment an owner is created.
+  let setupCode = null;
+  const createOwnerExclusively = createMutex();
+  const announceSetupCode =
+    options.onSetupCode ||
+    ((code) => {
+      // Straight to stdout, not through the logger: the log file is readable
+      // by other local users, and this code is all it takes to become owner.
+      console.log(setupCodeBanner(code));
+    });
+
+  async function currentSetupCode() {
+    if (await store.hasOwner()) {
+      setupCode = null;
+      return null;
+    }
+    if (!setupCode) {
+      setupCode = generateSetupCode();
+      announceSetupCode(setupCode);
+      logger.info(
+        "No owner account exists. A setup code was printed to standard output (the terminal, or the service journal); the first-run screen asks for it."
+      );
+    }
+    return setupCode;
+  }
+  await currentSetupCode();
 
   async function getContext(req) {
     const session = await sessionManager.getSessionFromRequest(req);
@@ -83,7 +195,11 @@ async function createApp(rootDir = process.cwd(), options = {}) {
 
     const users = await store.getUsers();
     const user = users.find((item) => item.id === session.userId) || null;
-    if (!user) {
+    // A session ends with the password it was opened with. Revoking sessions
+    // when a password changes is not enough by itself: a login that had read
+    // the old hash and was still deriving would finish after the revocation
+    // and walk away with a fresh session.
+    if (!user || (session.credential !== undefined && session.credential !== user.passwordHash)) {
       sessionManager.destroySession(session.id);
       return { session: null, user: null };
     }
@@ -97,6 +213,72 @@ async function createApp(rootDir = process.cwd(), options = {}) {
     }
     json(res, 401, { error: "Login required." });
     return false;
+  }
+
+  // A browser attaches Origin to every cross-site request that can change
+  // anything, and it cannot be forged from a page. When it is present it has to
+  // name this dashboard: the host the request was addressed to, or an origin
+  // the operator listed. A request with no Origin did not come from another
+  // site's page - it is curl, a script, or this page on an old browser.
+  //
+  // Only hosts are compared, not schemes: behind a tunnel the dashboard is
+  // spoken to in plain HTTP and cannot know for certain what the visitor used.
+  function originIsOurs(req) {
+    const origin = req.headers.origin;
+    if (origin === undefined) {
+      return true;
+    }
+    let parsed;
+    try {
+      parsed = new URL(origin);
+    } catch {
+      // "null" (a sandboxed frame, a file) and anything unparseable.
+      return false;
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return false;
+    }
+    if (trustedOrigins.has(parsed.origin)) {
+      return true;
+    }
+    if (!req.headers.host) {
+      return false;
+    }
+    try {
+      // Parsed the same way, so case and default ports compare equal.
+      return new URL(`${parsed.protocol}//${req.headers.host}`).host === parsed.host;
+    } catch {
+      return false;
+    }
+  }
+
+  // The cookie is SameSite=Lax, which already keeps it off cross-site POSTs in
+  // current browsers. This is the second line: a form on another site can only
+  // send urlencoded, multipart or text/plain bodies, so insisting on JSON makes
+  // the request one a foreign page cannot produce without a CORS preflight,
+  // which is never granted here. Bodyless calls are held to it too.
+  function ensureJsonContentType(req, res) {
+    if (requestMediaType(req) === "application/json") {
+      return true;
+    }
+    json(res, 415, { error: "Send this request with Content-Type: application/json." });
+    return false;
+  }
+
+  function sessionCookieOptions(req) {
+    return { secure: isHttpsRequest(req) };
+  }
+
+  function respondTooManyAttempts(res, attempt, what) {
+    json(
+      res,
+      429,
+      {
+        error: `${what} Try again in ${describeWait(attempt.retryAfterSeconds)}.`,
+        retryAfterSeconds: attempt.retryAfterSeconds
+      },
+      { "Retry-After": String(attempt.retryAfterSeconds) }
+    );
   }
 
   function ensureOwner(res, context) {
@@ -144,8 +326,12 @@ async function createApp(rootDir = process.cwd(), options = {}) {
       appName: appConfig.appName,
       installableLoaders: serverManager.getInstallableLoaders(),
       loggedIn: Boolean(context.user),
-      needsSetup: !(await store.hasUsers()),
+      // Setup is needed while there is no owner. Asking also makes sure a code
+      // has been issued for it; the code itself never leaves the server.
+      needsSetup: (await currentSetupCode()) !== null,
+      passwordMinLength: PASSWORD_MIN_LENGTH,
       providers: await modManager.providerAvailability(),
+      uploadLimitBytes,
       user: sanitizeUser(context.user)
     });
   }
@@ -243,25 +429,33 @@ async function createApp(rootDir = process.cwd(), options = {}) {
     // directly.
     const requestedPath = pathname === "/" ? "/index.html" : pathname;
     const targetPath = path.resolve(publicRoot, `.${requestedPath}`);
-    if (withinParent(publicRoot, targetPath) && (await exists(targetPath))) {
-      sendFile(res, targetPath);
-      return true;
+    if (withinParent(publicRoot, targetPath)) {
+      if (await sendFile(res, targetPath, staticFileHeaders(targetPath))) {
+        return;
+      }
+      if (await exists(targetPath)) {
+        // Something is there, but not a file to serve: a directory such as
+        // /js. The page fallback below is for app routes, not for this.
+        logRouteMiss("static", { method: "GET" }, pathname);
+        json(res, 404, { error: "Not found." });
+        return;
+      }
     }
 
     const fallback = path.join(publicRoot, "index.html");
-    if (await exists(fallback) && !pathname.includes(".")) {
-      sendFile(res, fallback);
-      return true;
+    if (!pathname.includes(".") && (await sendFile(res, fallback, staticFileHeaders(fallback)))) {
+      return;
     }
 
     logRouteMiss("static", { method: "GET" }, pathname);
     json(res, 404, { error: "Not found." });
-    return true;
   }
 
   return http.createServer(async (req, res) => {
     const startedAt = Date.now();
     const requestPath = req.url || "/";
+    applySecurityHeaders(res);
+    closeAfterUnreadBody(req, res);
     res.on("finish", () => {
       logger.info("HTTP request completed", {
         durationMs: Date.now() - startedAt,
@@ -272,8 +466,12 @@ async function createApp(rootDir = process.cwd(), options = {}) {
     });
 
     try {
-      const url = new URL(req.url || "/", "http://localhost");
-      const context = await getContext(req);
+      let url;
+      try {
+        url = new URL(req.url || "/", "http://localhost");
+      } catch {
+        throw new HttpError(400, "The request URL is not valid.");
+      }
       const segments = url.pathname.split("/").filter(Boolean);
 
       if (!url.pathname.startsWith("/api/")) {
@@ -285,6 +483,23 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         json(res, 404, { error: "Not found." });
         return;
       }
+
+      const changesState = !SAFE_METHODS.has(req.method);
+      if (changesState && !originIsOurs(req)) {
+        logger.warn("Cross-site request refused", {
+          host: req.headers.host,
+          method: req.method,
+          origin: req.headers.origin,
+          path: requestPath
+        });
+        json(res, 403, {
+          error:
+            "This request came from another site and was refused. If RipperCraft is behind a reverse proxy that changes the Host header, list the dashboard's address in RIPPERCRAFT_TRUSTED_ORIGINS."
+        });
+        return;
+      }
+
+      const context = await getContext(req);
 
       if (req.method === "GET" && url.pathname === "/api/bootstrap") {
         await respondBootstrap(res, context);
@@ -304,71 +519,208 @@ async function createApp(rootDir = process.cwd(), options = {}) {
       }
 
       if (req.method === "POST" && url.pathname === "/api/setup-owner") {
-        if (await store.hasUsers()) {
+        if (!ensureJsonContentType(req, res)) {
+          return;
+        }
+        const expectedCode = await currentSetupCode();
+        if (!expectedCode) {
           json(res, 409, { error: "Initial setup is already complete." });
           return;
         }
 
         const body = await parseJsonBody(req);
+        // Before anything else is looked at, and before any password is hashed.
+        if (!setupCodeMatches(expectedCode, body.setupCode)) {
+          logger.warn("Owner setup refused: missing or wrong setup code", { address: clientAddress(req).address });
+          json(res, 403, {
+            error:
+              "The setup code is missing or wrong. It is printed in the terminal, or the service journal, each time RipperCraft starts without an owner account."
+          });
+          return;
+        }
         if (isBlank(body.username) || isBlank(body.password)) {
           json(res, 400, { error: "Username and password are required." });
           return;
         }
+        const passwordProblem = newPasswordProblem(body.password);
+        if (passwordProblem) {
+          json(res, 400, { error: passwordProblem });
+          return;
+        }
 
-        const owner = await store.createUser({
-          username: String(body.username).trim(),
-          displayName: String(body.displayName || body.username).trim(),
-          passwordHash: hashSecret(String(body.password)),
-          permissions: normalizeUserPermissions(body.permissions),
-          role: "owner",
-          servers: []
+        // One at a time: two requests that both passed the checks above must
+        // not both create an owner.
+        const ownerUsername = textOf(body.username).trim();
+        const outcome = await createOwnerExclusively(async () => {
+          const users = await store.getUsers();
+          if (users.some((user) => user.role === "owner")) {
+            return { error: "Initial setup is already complete." };
+          }
+          if (users.some((user) => user.username.toLowerCase() === ownerUsername.toLowerCase())) {
+            return { error: "That username already exists." };
+          }
+          const created = await store.createUser({
+            username: ownerUsername,
+            displayName: textOf(body.displayName).trim() || ownerUsername,
+            passwordHash: await hashSecret(textOf(body.password)),
+            permissions: normalizeUserPermissions(body.permissions),
+            role: "owner",
+            servers: []
+          });
+          setupCode = null;
+          return { owner: created };
         });
+        if (!outcome.owner) {
+          json(res, 409, { error: outcome.error });
+          return;
+        }
+        const owner = outcome.owner;
+        logger.info("Owner account created; the setup code is no longer valid", { username: owner.username });
 
-        const session = await sessionManager.createSession(owner.id);
+        const session = await sessionManager.createSession(owner.id, { credential: owner.passwordHash });
         json(
           res,
           201,
           {
             user: sanitizeUser(owner)
           },
-          { "Set-Cookie": await sessionManager.serializeSessionCookie(session) }
+          { "Set-Cookie": await sessionManager.serializeSessionCookie(session, sessionCookieOptions(req)) }
         );
         return;
       }
 
       if (req.method === "POST" && url.pathname === "/api/login") {
+        if (!ensureJsonContentType(req, res)) {
+          return;
+        }
         const body = await parseJsonBody(req);
-        const username = String(body.username || "").trim().toLowerCase();
-        const password = String(body.password || "");
-        const users = await store.getUsers();
-        const user = users.find((item) => item.username.toLowerCase() === username);
+        const username = textOf(body.username).trim().toLowerCase();
+        const password = textOf(body.password);
 
-        if (!user || !verifySecret(password, user.passwordHash)) {
+        // Counted against the address and the username exactly as typed, real
+        // account or not, so being refused says nothing about the username.
+        const visitor = clientAddress(req);
+        const attempt = loginThrottle.begin({ address: visitor.address, username });
+        if (!attempt.allowed) {
+          logger.warn("Login refused after too many failed attempts", {
+            address: visitor.address,
+            limit: attempt.scope,
+            retryAfterSeconds: attempt.retryAfterSeconds
+          });
+          respondTooManyAttempts(res, attempt, "Too many failed login attempts.");
+          return;
+        }
+
+        let user = null;
+        let verified = false;
+        try {
+          const users = await store.getUsers();
+          user = users.find((item) => item.username.toLowerCase() === username) || null;
+          // The same derivations run whether or not the account exists, so the
+          // answer and the time it takes say nothing about the username.
+          verified = await verifyAccountSecret(
+            password,
+            user ? user.passwordHash : null,
+            users.map((item) => item.passwordHash)
+          );
+        } catch (error) {
+          // The password was never checked, so this is not a failed guess.
+          attempt.cancelled();
+          throw error;
+        }
+        if (!user || !verified) {
+          attempt.failed();
+          // Only a real account's name is logged: whatever else was typed into
+          // the username field may well be somebody's password.
+          logger.warn("Login failed", { address: visitor.address, ...(user ? { username: user.username } : {}) });
           json(res, 401, { error: "Invalid username or password." });
           return;
         }
 
-        const session = await sessionManager.createSession(user.id);
+        // The hash this login will stand on: the one just verified, or its
+        // stronger replacement.
+        let credential = user.passwordHash;
+        if (needsRehash(credential)) {
+          // The password is known to be right at this moment, which is the only
+          // time a stronger hash of it can be made. Failing to store it must
+          // not fail the login.
+          try {
+            const stronger = await hashSecret(password);
+            if (await store.upgradePasswordHash(user.id, credential, stronger)) {
+              sessionManager.rebindUserSessions(user.id, credential, stronger);
+              credential = stronger;
+              logger.info("Password hash upgraded to the current format", { username: user.username });
+            }
+          } catch (error) {
+            logger.warn("Could not upgrade a stored password hash", {
+              error: error.message,
+              username: user.username
+            });
+          }
+        }
+
+        // Checking took a while, and the account may have changed meanwhile.
+        // If its hash is no longer the one this login stands on, the password
+        // has to be right for the hash that is there now: a reset made while
+        // the old password was being checked must not be outrun by that check.
+        let current = null;
+        let stillValid = false;
+        try {
+          current = (await store.getUsers()).find((item) => item.id === user.id) || null;
+          stillValid =
+            Boolean(current) &&
+            (current.passwordHash === credential || (await verifySecret(password, current.passwordHash)));
+        } catch (error) {
+          attempt.cancelled();
+          throw error;
+        }
+        if (!stillValid) {
+          attempt.failed();
+          logger.warn("Login failed: the password changed while it was being checked", {
+            address: visitor.address,
+            username: user.username
+          });
+          json(res, 401, { error: "Invalid username or password." });
+          return;
+        }
+        attempt.succeeded();
+        credential = current.passwordHash;
+
+        const session = await sessionManager.createSession(user.id, { credential });
         json(
           res,
           200,
           {
             user: sanitizeUser(user)
           },
-          { "Set-Cookie": await sessionManager.serializeSessionCookie(session) }
+          { "Set-Cookie": await sessionManager.serializeSessionCookie(session, sessionCookieOptions(req)) }
         );
         return;
       }
 
       if (req.method === "POST" && url.pathname === "/api/logout") {
+        if (!ensureJsonContentType(req, res)) {
+          return;
+        }
         if (context.session) {
           sessionManager.destroySession(context.session.id);
         }
-        noContent(res, { "Set-Cookie": sessionManager.clearSessionCookie() });
+        noContent(res, { "Set-Cookie": sessionManager.clearSessionCookie(sessionCookieOptions(req)) });
         return;
       }
 
       if (!ensureAuthenticated(res, context)) {
+        return;
+      }
+
+      // The two upload routes take multipart form data and check for it
+      // themselves; every other call that changes something takes JSON.
+      const isUploadRoute =
+        req.method === "POST" &&
+        segments[1] === "servers" &&
+        segments.length === 5 &&
+        ((segments[3] === "worlds" && segments[4] === "import") || (segments[3] === "mods" && segments[4] === "upload"));
+      if (changesState && !isUploadRoute && !ensureJsonContentType(req, res)) {
         return;
       }
 
@@ -490,12 +842,33 @@ async function createApp(rootDir = process.cwd(), options = {}) {
             return;
           }
 
-          const body = await parseJsonBody(req);
-          const valid = await serverManager.verifyServerPassphrase(serverId, body.passphrase || "");
+          // The passphrase is one secret shared by every admin of the server,
+          // so it gets the same limit as a password: per account, per server.
+          const attempt = unlockThrottle.begin(`${context.user.id}|${serverId}`);
+          if (!attempt.allowed) {
+            logger.warn("Server unlock refused after too many wrong passphrases", {
+              actor: context.user.username,
+              retryAfterSeconds: attempt.retryAfterSeconds,
+              serverId
+            });
+            respondTooManyAttempts(res, attempt, "Too many wrong passphrases for this server.");
+            return;
+          }
+
+          let valid = false;
+          try {
+            const body = await parseJsonBody(req);
+            valid = await serverManager.verifyServerPassphrase(serverId, textOf(body.passphrase));
+          } catch (error) {
+            attempt.cancelled();
+            throw error;
+          }
           if (!valid) {
+            attempt.failed();
             json(res, 403, { error: "Passphrase did not match." });
             return;
           }
+          attempt.succeeded();
           const unlockedUntil = await sessionManager.unlockServer(context.session, serverId);
           json(res, 200, { unlocked: true, unlockedUntil });
           return;
@@ -762,18 +1135,21 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               json(res, 403, { error: "Unlock the server before importing a world." });
               return;
             }
-            const formData = await parseFormData(req);
-            const file = formData.get("archive");
-            if (!file) {
-              json(res, 400, { error: "A zip archive is required." });
-              return;
+            const upload = await receiveUpload(req, {
+              directory: serverManager.resolveRecordPaths(server).worldLibraryDir,
+              fileField: "archive",
+              maxFileBytes: uploadLimitBytes
+            });
+            try {
+              if (!upload.file) {
+                json(res, 400, { error: "A zip archive is required." });
+                return;
+              }
+              const result = await worldManager.importWorldArchiveFile(serverId, upload.file.fileName, upload.file.path);
+              json(res, 201, result);
+            } finally {
+              await upload.cleanup();
             }
-            const result = await worldManager.importWorldArchive(
-              serverId,
-              file.name,
-              Buffer.from(await file.arrayBuffer())
-            );
-            json(res, 201, result);
             return;
           }
 
@@ -783,12 +1159,17 @@ async function createApp(rootDir = process.cwd(), options = {}) {
             }
             const archive = await worldManager.createExportArchive(serverId);
             const fileName = `${serverId}-active-world.zip`;
-            const stream = require("node:fs").createReadStream(archive.outputPath);
-            stream.on("close", archive.cleanup);
-            sendStream(res, 200, stream, {
-              "Content-Disposition": `attachment; filename="${fileName}"`,
-              "Content-Type": "application/zip"
-            });
+            try {
+              const sent = await sendFile(res, archive.outputPath, {
+                "Content-Disposition": `attachment; filename="${fileName}"`,
+                "Content-Type": "application/zip"
+              });
+              if (!sent) {
+                json(res, 500, { error: "The export archive could not be read." });
+              }
+            } finally {
+              await archive.cleanup();
+            }
             return;
           }
 
@@ -802,11 +1183,13 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               return;
             }
             const archivePath = await serverManager.readWorldArchivePath(serverId, archiveName);
-            const stream = require("node:fs").createReadStream(archivePath);
-            sendStream(res, 200, stream, {
+            const sent = await sendFile(res, archivePath, {
               "Content-Disposition": `attachment; filename="${path.basename(archivePath)}"`,
               "Content-Type": "application/zip"
             });
+            if (!sent) {
+              json(res, 404, { error: "That world archive does not exist." });
+            }
             return;
           }
         }
@@ -865,20 +1248,21 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               return;
             }
             const pack = await modManager.buildModpackArchive(serverId);
-            const stream = require("node:fs").createReadStream(pack.filePath);
-            // Drop the staging directory once the response has drained.
-            const cleanup = () => {
-              fs.rm(pack.tmpDir, { force: true, recursive: true }).catch(() => {});
-            };
-            stream.on("close", cleanup);
-            stream.on("error", cleanup);
-            sendStream(res, 200, stream, {
-              "Cache-Control": "no-store, max-age=0",
-              "Content-Disposition": `attachment; filename="${path.basename(pack.filePath)}"`,
-              "Content-Type": "application/zip",
-              "X-Modpack-Bundled": String(pack.bundled),
-              "X-Modpack-Manual": String(pack.manual)
-            });
+            try {
+              const sent = await sendFile(res, pack.filePath, {
+                "Cache-Control": "no-store, max-age=0",
+                "Content-Disposition": `attachment; filename="${path.basename(pack.filePath)}"`,
+                "Content-Type": "application/zip",
+                "X-Modpack-Bundled": String(pack.bundled),
+                "X-Modpack-Manual": String(pack.manual)
+              });
+              if (!sent) {
+                json(res, 500, { error: "The modpack archive could not be read." });
+              }
+            } finally {
+              // Drop the staging directory once the response has drained.
+              await fs.rm(pack.tmpDir, { force: true, recursive: true }).catch(() => {});
+            }
             return;
           }
 
@@ -985,22 +1369,30 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               json(res, 403, { error: "Unlock the server before uploading files." });
               return;
             }
-            const formData = await parseFormData(req);
-            const file = formData.get("file");
-            if (!file) {
-              json(res, 400, { error: "A file upload is required." });
+            // Decided before any of the file is accepted, not after it has all
+            // been received.
+            if (!serverManager.userCanManageAddons(context.user, server)) {
+              json(res, 403, { error: "Manual add-on installs require add-on management permission for this server." });
               return;
             }
-            const installed = await modManager.installUpload(
-              serverId,
-              file.name,
-              Buffer.from(await file.arrayBuffer()),
-              {
-                manualAllowed: serverManager.userCanManageAddons(context.user, server),
-                confirmManualCompatibility: String(formData.get("confirmManualCompatibility") || "") === "true"
+            const upload = await receiveUpload(req, {
+              directory: serverManager.resolveRecordPaths(server).modsDir,
+              fileField: "file",
+              maxFileBytes: uploadLimitBytes
+            });
+            try {
+              if (!upload.file) {
+                json(res, 400, { error: "A file upload is required." });
+                return;
               }
-            );
-            json(res, 201, { installed });
+              const installed = await modManager.installUploadedFile(serverId, upload.file.fileName, upload.file.path, {
+                confirmManualCompatibility: String(upload.fields.confirmManualCompatibility || "") === "true",
+                manualAllowed: true
+              });
+              json(res, 201, { installed });
+            } finally {
+              await upload.cleanup();
+            }
             return;
           }
         }
@@ -1167,6 +1559,11 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           json(res, 400, { error: "Username and password are required." });
           return;
         }
+        const passwordProblem = newPasswordProblem(body.password);
+        if (passwordProblem) {
+          json(res, 400, { error: passwordProblem });
+          return;
+        }
         if (users.some((user) => user.username.toLowerCase() === username.toLowerCase())) {
           json(res, 409, { error: "That username already exists." });
           return;
@@ -1176,7 +1573,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         const user = await store.createUser({
           username,
           displayName: String(body.displayName || username).trim(),
-          passwordHash: hashSecret(String(body.password)),
+          passwordHash: await hashSecret(textOf(body.password)),
           permissions: access.permissions,
           role: body.role === "owner" ? "owner" : "admin",
           servers: access.servers
@@ -1196,6 +1593,11 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           json(res, 400, { error: "A new password is required." });
           return;
         }
+        const passwordProblem = newPasswordProblem(body.password);
+        if (passwordProblem) {
+          json(res, 400, { error: passwordProblem });
+          return;
+        }
 
         const users = await store.getUsers();
         const existing = users.find((user) => user.id === userId);
@@ -1205,8 +1607,17 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         }
 
         const updated = await store.updateUser(userId, {
-          passwordHash: hashSecret(String(body.password))
+          passwordHash: await hashSecret(textOf(body.password))
         });
+        // Whoever was logged in with the old password - which may be the very
+        // reason for the reset - is logged out. The owner doing the reset
+        // keeps the session they are using.
+        const endedSessions = sessionManager.destroyUserSessions(userId, { exceptSessionId: context.session.id });
+        if (context.session.userId === userId) {
+          // Their own password: the session they are using moves to the new one.
+          context.session.credential = updated.passwordHash;
+        }
+        logger.info("Password reset", { actor: context.user.username, endedSessions, username: existing.username });
         json(res, 200, { user: sanitizeUser(updated) });
         return;
       }
@@ -1231,6 +1642,14 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           return;
         }
 
+        // A blank password means "keep the current one", so only a password
+        // that was actually typed is held to the minimum.
+        const passwordProblem = isBlank(body.password) ? "" : newPasswordProblem(body.password);
+        if (passwordProblem) {
+          json(res, 400, { error: passwordProblem });
+          return;
+        }
+
         const nextUsername = String(body.username || existing.username).trim();
         const duplicate = users.find(
           (user) => user.id !== userId && user.username.toLowerCase() === nextUsername.toLowerCase()
@@ -1252,10 +1671,17 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           username: nextUsername
         };
         if (!isBlank(body.password)) {
-          patch.passwordHash = hashSecret(String(body.password));
+          patch.passwordHash = await hashSecret(textOf(body.password));
         }
 
         const updated = await store.updateUser(userId, patch);
+        if (patch.passwordHash) {
+          const endedSessions = sessionManager.destroyUserSessions(userId, { exceptSessionId: context.session.id });
+          if (context.session.userId === userId) {
+            context.session.credential = updated.passwordHash;
+          }
+          logger.info("Password changed", { actor: context.user.username, endedSessions, username: updated.username });
+        }
         json(res, 200, { user: sanitizeUser(updated) });
         return;
       }
@@ -1264,17 +1690,38 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         segments
       });
     } catch (error) {
-      logger.error("HTTP request failed", {
-        error: error.message || "Unexpected server error.",
-        method: req.method,
-        path: requestPath,
-        stack: error.stack
-      });
-      json(res, typeof error.statusCode === "number" ? error.statusCode : 500, {
-        error: error.message || "Unexpected server error.",
-        ...(error.code ? { code: error.code } : {}),
-        ...(error.manualDownload ? { manualDownload: error.manualDownload } : {})
-      });
+      if (error.expose === true) {
+        // The client's doing - too large, malformed, gone - and already worded
+        // for them. Not a fault, so no stack trace.
+        logger.warn("HTTP request refused", {
+          error: error.message,
+          method: req.method,
+          path: requestPath,
+          statusCode: error.statusCode
+        });
+      } else {
+        logger.error("HTTP request failed", {
+          error: error.message || "Unexpected server error.",
+          method: req.method,
+          path: requestPath,
+          stack: error.stack
+        });
+      }
+      if (res.headersSent) {
+        // Part of a response is already on the wire; all that is left is to end it.
+        res.destroy();
+        return;
+      }
+      json(
+        res,
+        typeof error.statusCode === "number" ? error.statusCode : 500,
+        {
+          error: error.message || "Unexpected server error.",
+          ...(error.code ? { code: error.code } : {}),
+          ...(error.manualDownload ? { manualDownload: error.manualDownload } : {})
+        },
+        error.expose === true && error.headers ? error.headers : {}
+      );
     }
   });
 }

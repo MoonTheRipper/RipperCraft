@@ -110,6 +110,8 @@ export function renderOwnerServers() {
 }
 
 export function renderOwnerAdmins() {
+  // Enforced by the server; mirrored here so the browser can say so first.
+  const minLength = Number(state.bootstrap?.passwordMinLength) || 12;
   const editingUser = state.users.find((user) => user.id === state.editingUserId);
   const resettingUser = state.users.find((user) => user.id === state.resettingUserId);
 
@@ -186,7 +188,7 @@ export function renderOwnerAdmins() {
               </label>
               <label>
                 <span>new password</span>
-                <input type="password" name="password" placeholder="leave blank to keep current" />
+                <input type="password" name="password" autocomplete="new-password" minlength="${minLength}" placeholder="leave blank to keep current" />
               </label>
               <label>
                 <span>role</span>
@@ -196,6 +198,7 @@ export function renderOwnerAdmins() {
                 </select>
               </label>
             </div>
+            <p class="muted">a new password needs at least ${minLength} characters, and signs this user out everywhere else.</p>
             <div>
               <p class="permission-title">server permissions</p>
               <p class="muted">world creation automatically includes server access for that server.</p>
@@ -231,7 +234,8 @@ export function renderOwnerAdmins() {
             <input type="hidden" name="userId" value="${escapeHtml(user.id)}" />
             <label>
               <span>new temporary password</span>
-              <input type="password" name="password" autocomplete="new-password" required />
+              <input type="password" name="password" autocomplete="new-password" minlength="${minLength}" required />
+              <span>at least ${minLength} characters. this signs the user out everywhere else.</span>
             </label>
             <div class="submit-line submit-line--split">
               <button class="button button--quiet" type="button" data-action="close-password-reset">cancel</button>
@@ -260,7 +264,7 @@ export function renderOwnerAdmins() {
             </label>
             <label>
               <span>password</span>
-              <input type="password" name="password" required />
+              <input type="password" name="password" autocomplete="new-password" minlength="${minLength}" placeholder="at least ${minLength} characters" required />
             </label>
             <label>
               <span>role</span>

@@ -185,6 +185,7 @@ If multiple local servers run at once, each one still needs a unique local `serv
 - Do not expose frp proxy ports publicly; `frps.toml` uses `proxyBindAddr = "127.0.0.1"` so Caddy and Velocity are the only public entry points.
 - Do not port-forward the Minecraft backend ports on your router.
 - Keep the admin dashboard protected with strong owner/admin passwords and server passphrases.
+- The dashboard limits failed logins per visitor address, which in this layout it reads from `X-Forwarded-For` as Caddy sets it. The generated `Caddyfile` also removes any `CF-Connecting-IP` header a visitor sends, since nothing here is Cloudflare. If you wrote your `Caddyfile` by hand or generated it before this was added, regenerate it or add `header_up -CF-Connecting-IP` inside `reverse_proxy`.
 - If you later move Paper/Purpur backends behind Velocity, switch to Velocity modern forwarding and configure the Paper forwarding secret.
 
 ## Sources

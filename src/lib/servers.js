@@ -4,7 +4,8 @@ const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
-const { hashSecret } = require("./auth");
+const { hashSecret, verifySecret } = require("./auth");
+const { isUploadTempName } = require("./upload");
 const {
   compareVersions,
   evaluateLoaderCandidate,
@@ -690,7 +691,7 @@ function createServerManager(store) {
   async function countFiles(directoryPath) {
     try {
       const entries = await fsp.readdir(directoryPath, { withFileTypes: true });
-      return entries.filter((entry) => entry.isFile()).length;
+      return entries.filter((entry) => entry.isFile() && !isUploadTempName(entry.name)).length;
     } catch (error) {
       if (error.code === "ENOENT") {
         return 0;
@@ -812,7 +813,7 @@ function createServerManager(store) {
     }
     if (typeof nextPatch.passphrase === "string") {
       const trimmed = nextPatch.passphrase.trim();
-      nextPatch.passphraseHash = trimmed ? hashSecret(trimmed) : null;
+      nextPatch.passphraseHash = trimmed ? await hashSecret(trimmed) : null;
       delete nextPatch.passphrase;
     }
 
@@ -1109,7 +1110,8 @@ function createServerManager(store) {
     const entries = await fsp.readdir(paths.modsDir, { withFileTypes: true });
     const disabledEntries = await fsp.readdir(paths.disabledModsDir, { withFileTypes: true });
     const active = entries
-      .filter((entry) => entry.isFile())
+      // An upload in progress writes its temporary file here; it is not an add-on.
+      .filter((entry) => entry.isFile() && !isUploadTempName(entry.name))
       .map((entry) => ({ enabled: true, fileName: entry.name }));
     const disabled = disabledEntries
       .filter((entry) => entry.isFile())
@@ -1254,6 +1256,20 @@ function createServerManager(store) {
     await ensureDir(paths.modsDir);
     const targetFile = path.join(paths.modsDir, safeFilename(fileName));
     await fsp.writeFile(targetFile, buffer);
+    return path.basename(targetFile);
+  }
+
+  // Moves a file that is already on disk into the add-on directory. An upload
+  // is received into that same directory, so this is a rename, not a copy.
+  async function installManagedFileFromPath(serverId, fileName, sourcePath) {
+    const server = await getServer(serverId);
+    if (!server) {
+      throw new Error("Server not found.");
+    }
+    const paths = resolveRecordPaths(server);
+    await ensureDir(paths.modsDir);
+    const targetFile = path.join(paths.modsDir, safeFilename(fileName));
+    await fsp.rename(sourcePath, targetFile);
     return path.basename(targetFile);
   }
 
@@ -2079,7 +2095,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       minecraftVersion: spec.minecraftVersion || (await detectVersion(serverDir)),
       modsDir: spec.modsDir || "mods",
       name: spec.name || displayNameFromSlug(serverId),
-      passphraseHash: spec.passphrase ? hashSecret(spec.passphrase) : null,
+      passphraseHash: spec.passphrase ? await hashSecret(String(spec.passphrase)) : null,
       serverPropertiesFile: spec.serverPropertiesFile || "server.properties",
       startCommand: spec.startCommand || (mode === "existing" ? DEFAULT_EXISTING_START_COMMAND : DEFAULT_MANAGED_START_COMMAND),
       worldDir: spec.worldDir || "world"
@@ -2330,8 +2346,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     if (!server.passphraseHash) {
       return false;
     }
-    const { verifySecret } = require("./auth");
-    return verifySecret(passphrase, server.passphraseHash);
+    return await verifySecret(passphrase, server.passphraseHash);
   }
 
   async function listWorldArchives(serverId) {
@@ -2438,7 +2453,8 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     const paths = resolveRecordPaths(server);
     const fullPath = path.join(paths.worldLibraryDir, safeFilename(archiveName));
     if (!withinParent(paths.worldLibraryDir, fullPath)) {
-      throw new Error("Invalid archive path.");
+      // A name such as ".." - the caller's mistake, not a server fault.
+      throw userFacingError("Invalid archive path.", 400);
     }
     return fullPath;
   }
@@ -3110,6 +3126,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     getServerSnapshot,
     getServerStatus,
     installManagedFile,
+    installManagedFileFromPath,
     listAvailableMinecraftVersions,
     listInstalledFiles,
     listServerOperators,

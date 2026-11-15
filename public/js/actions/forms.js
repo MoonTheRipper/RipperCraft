@@ -1,6 +1,7 @@
 import { api } from "../api.js";
 import { confirmRequiresStoppedServer, confirmWithStopNotice } from "../confirm.js";
 import { loadBootstrap, loadServers, loadSnapshot, pollCreateJob, refreshAll } from "../data.js";
+import { formatBytes } from "../format.js";
 import { installableLoaders, isInstallableLoader } from "../loaders.js";
 import { releaseReturnFocus } from "../modal.js";
 import { clearNotice, setNotice } from "../notice.js";
@@ -13,6 +14,19 @@ export function checkedValues(form, name) {
 
 export function normalizeAccessSelection(accessServers, worldServers) {
   return [...new Set([...(accessServers || []), ...(worldServers || [])])];
+}
+
+// The server enforces the upload limit by cutting the connection, which a
+// browser reports as a failed request with no reason attached - after sending
+// however much of the file it got through. Checking the size here gives the
+// reason at once and sends nothing.
+export function assertUploadFits(form, fieldName) {
+  const limit = Number(state.bootstrap?.uploadLimitBytes) || 0;
+  const input = form.querySelector(`input[type="file"][name="${fieldName}"]`);
+  const file = input && input.files ? input.files[0] : null;
+  if (limit && file && file.size > limit) {
+    throw new Error(`that file is ${formatBytes(file.size)}, and uploads here are limited to ${formatBytes(limit)}`);
+  }
 }
 
 export async function handleAppSubmit(event) {
@@ -186,6 +200,7 @@ export async function handleAppSubmit(event) {
         break;
       }
       case "import-world": {
+        assertUploadFits(form, "archive");
         const data = new FormData(form);
         state.updatePlan = null;
         await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/worlds/import`, {
@@ -247,6 +262,7 @@ export async function handleAppSubmit(event) {
         break;
       }
       case "upload-mod": {
+        assertUploadFits(form, "file");
         const data = new FormData(form);
         state.updatePlan = null;
         await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/mods/upload`, {
