@@ -475,6 +475,25 @@ test("a world folder reached through a link out of the server folder is not writ
   assert.deepEqual(fs.readdirSync(outside), ["world"]);
 });
 
+test("every zip the dashboard makes stores a link as a link", () => {
+  // -y. Without it zip follows a link and archives what it points to. The
+  // world archives above are tested by making one; this holds for any other
+  // archive too, including the client modpack, which is built from a folder
+  // of the dashboard's own and so has no link in it to test with.
+  const source = path.join(__dirname, "..", "src");
+  const files = fs.readdirSync(source, { recursive: true }).filter((name) => String(name).endsWith(".js"));
+  const calls = files.flatMap((name) =>
+    [...fs.readFileSync(path.join(source, String(name)), "utf8").matchAll(/runCommand\(\s*"zip",\s*\[\s*"(-[A-Za-z]+)"/g)].map((match) => [String(name), match[1]])
+  );
+  assert.deepEqual(calls.map(([name]) => name).sort(), [path.join("lib", "mod-sources.js"), path.join("lib", "worlds.js")]);
+  for (const [name, flags] of calls) {
+    assert.match(flags, /y/, `${name} runs zip ${flags}`);
+  }
+  // And nothing runs zip any other way: every program is started through runCommand.
+  const started = files.filter((name) => /\b(spawn|spawnSync|exec|execSync|execFile|execFileSync)\(\s*["'`]zip["'`]/.test(fs.readFileSync(path.join(source, String(name)), "utf8")));
+  assert.deepEqual(started, []);
+});
+
 // --- backing up, exporting and downloading ---------------------------------------------------
 
 test("a backup stores a link in the world as a link, never as what it points to", async (t) => {
