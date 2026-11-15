@@ -67,32 +67,12 @@ function normalizeAddress(value) {
   return groups.map((group) => group.toString(16)).join(":");
 }
 
-// Both of these take an address already passed through normalizeAddress.
+// Takes an address already passed through normalizeAddress.
 function isLoopbackAddress(address) {
   if (!address) {
     return false;
   }
   return address.includes(":") ? address === "0:0:0:0:0:0:0:1" : address.startsWith("127.");
-}
-
-// Private, link-local and carrier-grade NAT ranges: addresses that cannot be
-// reached from the internet at large.
-function isPrivateAddress(address) {
-  if (!address) {
-    return false;
-  }
-  if (address.includes(":")) {
-    const first = parseInt(address.split(":")[0], 16);
-    return (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80;
-  }
-  const [a, b] = address.split(".").map(Number);
-  return (
-    a === 10 ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168) ||
-    (a === 169 && b === 254) ||
-    (a === 100 && b >= 64 && b <= 127)
-  );
 }
 
 // What failed attempts are counted against: the address, except where one
@@ -113,42 +93,46 @@ function addressBucket(address) {
   return `${address.split(":").slice(0, 4).join(":")}::/64`;
 }
 
+function headerText(value) {
+  return String(Array.isArray(value) ? value.join(",") : value || "");
+}
+
 function firstHeaderValue(value) {
-  return String(Array.isArray(value) ? value[0] : value || "")
-    .split(",")[0]
-    .trim();
+  return headerText(value).split(",")[0].trim();
 }
 
 function socketPeer(req) {
   return normalizeAddress(req.socket && req.socket.remoteAddress);
 }
 
-// The visitor's address.
+// The visitor's address: who failed attempts are counted against. `forwarded`
+// is true when it came from a proxy header rather than from the socket.
 //
-//   address    who failed attempts are counted against
-//   forwarded  true when it came from a proxy header rather than the socket
-//   local      true when the visitor connected to us directly from loopback or
-//              a private range, with no proxy in between
+// Headers are only looked at when the socket peer is loopback, and then:
 //
-// Behind Cloudflare, CF-Connecting-IP is set by Cloudflare and cannot be
-// supplied by the visitor, so it is preferred. X-Forwarded-For is the fallback
-// for other proxies; its first entry is only as trustworthy as the proxy, which
-// must replace the header rather than append to one the visitor sent.
+//   - CF-Connecting-IP, when X-Forwarded-For does not contradict it. Cloudflare
+//     sets both, and always puts the address it names in CF-Connecting-IP into
+//     X-Forwarded-For as well. A proxy that is not Cloudflare passes a
+//     CF-Connecting-IP header straight through from the visitor, who could
+//     then choose the address they are counted under; but such a proxy also
+//     writes the real address into X-Forwarded-For, and the visitor's invention
+//     is not in that list.
+//   - Otherwise the first address in X-Forwarded-For. That is only as good as
+//     the proxy: it has to replace the header, not append to what it was sent.
+//   - Otherwise the socket's own address.
 function clientAddress(req) {
   const peer = socketPeer(req);
   if (peer && isLoopbackAddress(peer)) {
-    const forwarded =
-      normalizeAddress(firstHeaderValue(req.headers["cf-connecting-ip"])) ||
-      normalizeAddress(firstHeaderValue(req.headers["x-forwarded-for"]));
-    if (forwarded) {
-      return { address: forwarded, forwarded: true, local: false };
+    const claimed = normalizeAddress(firstHeaderValue(req.headers["cf-connecting-ip"]));
+    const hops = headerText(req.headers["x-forwarded-for"]).split(",").map(normalizeAddress).filter(Boolean);
+    if (claimed && (hops.length === 0 || hops.includes(claimed))) {
+      return { address: claimed, forwarded: true };
+    }
+    if (hops.length) {
+      return { address: hops[0], forwarded: true };
     }
   }
-  return {
-    address: peer || "unknown",
-    forwarded: false,
-    local: Boolean(peer) && (isLoopbackAddress(peer) || isPrivateAddress(peer))
-  };
+  return { address: peer || "unknown", forwarded: false };
 }
 
 // True when the visitor's own connection was HTTPS: either this socket is TLS,
@@ -179,6 +163,5 @@ module.exports = {
   clientAddress,
   isHttpsRequest,
   isLoopbackAddress,
-  isPrivateAddress,
   normalizeAddress
 };

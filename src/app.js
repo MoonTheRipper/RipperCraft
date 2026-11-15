@@ -572,10 +572,8 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         }
         const owner = outcome.owner;
         logger.info("Owner account created; the setup code is no longer valid", { username: owner.username });
-        // This address has just signed in as the owner, in effect.
-        loginThrottle.remember({ address: clientAddress(req).address, username: owner.username });
 
-        const session = await sessionManager.createSession(owner.id);
+        const session = await sessionManager.createSession(owner.id, { credential: owner.passwordHash });
         json(
           res,
           201,
@@ -598,7 +596,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         // Counted against the address and the username exactly as typed, real
         // account or not, so being refused says nothing about the username.
         const visitor = clientAddress(req);
-        const attempt = loginThrottle.begin({ address: visitor.address, local: visitor.local, username });
+        const attempt = loginThrottle.begin({ address: visitor.address, username });
         if (!attempt.allowed) {
           logger.warn("Login refused after too many failed attempts", {
             address: visitor.address,

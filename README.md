@@ -53,23 +53,23 @@ The owner can run commands on this machine, so the first-run screen is not open 
 
 **Passwords.** Every password set from now on - the owner's, a new account's, a reset or a change - needs at least 12 characters. Passwords that already exist keep working whatever their length. They are stored as scrypt hashes (`N=2^15, r=8, p=3`); hashes written by earlier versions still verify, and each one is rewritten in the new format the next time that user signs in.
 
-**Failed sign-ins** are counted in memory, per 15 minutes:
+**Failed sign-ins** are counted in memory, against the address they came from:
 
 | What is counted | Limit | Then |
 | --- | --- | --- |
-| Failures from one address against one username | 5 | That address is refused (`429`, with `Retry-After`) until the oldest failure is 15 minutes old. |
-| Failures from one address, any usernames | 20 | That address is refused the same way. |
-| Failures for one username, from any addresses | 10 | Every further failure makes other addresses wait before the next attempt on that username is looked at: 1 second, doubling up to 5 minutes. It starts over after 15 minutes without a failure. |
+| Failures from one address against one username | 5 in 15 minutes | That address must wait before trying that username again (`429`, with `Retry-After`): 15 minutes, and then twice as long after every further failure, up to 24 hours. It gets its five tries back by signing in, or once a day has passed since its wait ended without another failure. |
+| Failures from one address, any usernames | 20 in 15 minutes | That address is refused until the oldest of them is 15 minutes old. |
+| A username that 4 or more addresses have failed on within 15 minutes | no free tries | On that username every failure counts as the fifth would: the address that made it waits 15 minutes, then twice as long each time. |
 
-While an address is being refused its attempts are not checked at all, so the right password is refused too; wait out the time shown. Signing in successfully clears that address's count for that username.
+While an address is waiting its attempts are not checked at all, so the right password is refused too; wait out the time shown. Signing in successfully clears that address's counts for that username.
 
-The third rule is the one that stops guessing spread across many addresses, and it must not let a stranger lock you out by failing under your name. So it never applies to an address that has already signed in to that account (remembered for 30 days, or until a restart), nor to a machine connecting directly from your own network. Those are still held to 5 failures per 15 minutes.
+The third rule is for guessing spread across many addresses, where five tries each is too many. All three rules only ever refuse the address that did the failing. No limit is shared by a whole account, because anyone can fail on purpose under your name: what other addresses do never stops yours being checked, and the right password from an address that has not been failing always gets in. The price is that a crowd still gets a guess per address before it is slowed, so the limits are no substitute for a password that is not on a list.
 
-A wrong **server passphrase** is limited the same way: 5 per account and server per 15 minutes.
+A wrong **server passphrase** is limited the same way, counted per account and server instead of per address: 5 tries in 15 minutes, then a wait of 15 minutes that doubles with every further wrong one, up to 24 hours. Unlocking the server clears it; so does a day passing after the wait has ended without another wrong one.
 
 **Sessions.** Resetting or changing a password signs that user out everywhere else. Restarting RipperCraft signs everyone out and clears the counts above.
 
-**Behind a tunnel or reverse proxy.** The visitor's address is taken from the connection. `CF-Connecting-IP`, or failing that the first address in `X-Forwarded-For`, is believed only when the connection comes from this machine itself (`127.0.0.1` / `::1`), which is how `cloudflared` and a local reverse proxy connect. Behind Cloudflare that is always `CF-Connecting-IP`, which a visitor cannot set. Any other proxy has to *replace* `X-Forwarded-For` rather than append to what the visitor sent (Caddy does by default), or visitors can pick the address they are counted under. A proxy that passes no address at all makes every visitor share one count. In the same way the session cookie is marked `Secure` when a local proxy reports HTTPS through `X-Forwarded-Proto` or `CF-Visitor`; on plain HTTP over the LAN it is not.
+**Behind a tunnel or reverse proxy.** The visitor's address is taken from the connection. Request headers are believed only when the connection comes from this machine itself (`127.0.0.1` / `::1`), which is how `cloudflared` and a local reverse proxy connect: `CF-Connecting-IP` when `X-Forwarded-For` does not contradict it, otherwise the first address in `X-Forwarded-For`. Behind Cloudflare that is always `CF-Connecting-IP`, which a visitor cannot set. Any other proxy has to *replace* `X-Forwarded-For` rather than append to what the visitor sent (Caddy does by default) and should remove `CF-Connecting-IP` from incoming requests (the Caddyfile generated by `infra/hosting` does), or visitors can pick the address they are counted under. A proxy that passes no address at all makes every visitor share one count. In the same way the session cookie is marked `Secure` when a local proxy reports HTTPS through `X-Forwarded-Proto` or `CF-Visitor`; on plain HTTP over the LAN it is not.
 
 Requests that change anything must come from the dashboard's own page: the browser's `Origin` header has to match the `Host` header. Cloudflare Tunnel (unless its `httpHostHeader` option is set) and Caddy pass `Host` through unchanged. If your proxy rewrites it, sign-in fails with "This request came from another site"; either make the proxy pass the original `Host`, or set `RIPPERCRAFT_TRUSTED_ORIGINS`.
 

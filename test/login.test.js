@@ -289,13 +289,13 @@ test("five wrong passwords get 429 with Retry-After, and the right password is r
   }
   assert.equal(derivations.count, 5);
 
-  // The sixth is refused, with the time left until the first failure expires.
+  // The sixth is refused: fifteen minutes from the fifth failure, a second ago.
   const refused = await loginFrom(app, attacker, "owner", "wrong-guess-5");
   assert.equal(refused.status, 429);
-  assert.equal(refused.headers["retry-after"], "895");
+  assert.equal(refused.headers["retry-after"], "899");
   assert.deepEqual(refused.json, {
     error: "Too many failed login attempts. Try again in 15 minutes.",
-    retryAfterSeconds: 895
+    retryAfterSeconds: 899
   });
   assert.equal(refused.headers["set-cookie"], undefined);
 
@@ -309,14 +309,14 @@ test("five wrong passwords get 429 with Retry-After, and the right password is r
 
   // Asking again does not extend the wait.
   now.advance(14 * MINUTE);
-  assert.equal((await loginFrom(app, attacker, "owner", OWNER_PASSWORD)).headers["retry-after"], "55");
+  assert.equal((await loginFrom(app, attacker, "owner", OWNER_PASSWORD)).headers["retry-after"], "59");
 
   // Another address was never locked out of the account.
   const elsewhere = await loginFrom(app, "203.0.113.9", "owner", OWNER_PASSWORD);
   assert.equal(elsewhere.status, 200);
 
   // Once the wait is over the right password works, and wipes the slate.
-  now.advance(55 * 1000);
+  now.advance(59 * 1000);
   const afterWait = await loginFrom(app, attacker, "owner", OWNER_PASSWORD);
   assert.equal(afterWait.status, 200);
   assert.ok(afterWait.headers["set-cookie"][0].startsWith("rippermoon_session="));
@@ -327,7 +327,7 @@ test("five wrong passwords get 429 with Retry-After, and the right password is r
 
   const refusals = app.logs.filter((entry) => entry.message === "Login refused after too many failed attempts");
   assert.equal(refusals.length, 4);
-  assert.deepEqual(refusals[0].meta, { address: attacker, limit: "address+username", retryAfterSeconds: 895 });
+  assert.deepEqual(refusals[0].meta, { address: attacker, limit: "address+username", retryAfterSeconds: 899 });
 });
 
 test("the right password before the limit logs in and resets the count", async (t) => {
@@ -376,45 +376,75 @@ test("one address spraying usernames is cut off after twenty failures", async (t
   assert.equal(refused.headers["retry-after"], "900");
 });
 
-test("a crowd failing on one username slows it down, without keeping its real user out", async (t) => {
+test("a username under attack from several addresses costs each of them longer waits, and nobody else anything", async (t) => {
+  const now = clock();
+  const app = await startApp(t, { app: { now } });
+  await app.setupOwner();
+  const guess = (address) => loginFrom(app, address, "owner", "from-a-list");
+
+  // Three addresses failing are not yet a crowd: each still has its five tries.
+  for (let index = 1; index <= 3; index += 1) {
+    assert.equal((await guess(`198.51.100.${index}`)).status, 401);
+    assert.equal((await guess(`198.51.100.${index}`)).status, 401);
+  }
+
+  // The fourth makes one, and from here a single failure means a fifteen-minute wait.
+  assert.equal((await guess("198.51.100.4")).status, 401);
+  const waiting = await guess("198.51.100.4");
+  assert.equal(waiting.status, 429);
+  assert.equal(waiting.headers["retry-after"], "900");
+  assert.deepEqual(waiting.json, {
+    error: "Too many failed login attempts. Try again in 15 minutes.",
+    retryAfterSeconds: 900
+  });
+  // An address that was already failing is caught by its next failure too.
+  assert.equal((await guess("198.51.100.1")).status, 401);
+  assert.equal((await guess("198.51.100.1")).status, 429);
+
+  // The wait doubles each time the same address comes back and fails.
+  now.advance(15 * MINUTE);
+  assert.equal((await guess("198.51.100.4")).status, 401);
+  assert.equal((await guess("198.51.100.4")).headers["retry-after"], "1800");
+  now.advance(30 * MINUTE);
+  assert.equal((await guess("198.51.100.4")).status, 401);
+  const hour = await guess("198.51.100.4");
+  assert.equal(hour.headers["retry-after"], "3600");
+  assert.equal(hour.json.error, "Too many failed login attempts. Try again in 60 minutes.");
+
+  // Through all of it, the right password from an address that has not been
+  // failing is checked at once: nobody is waiting on anybody else.
+  for (const address of ["203.0.113.50", "203.0.113.51", null]) {
+    assert.equal((await loginFrom(app, address, "owner", OWNER_PASSWORD)).status, 200, String(address));
+  }
+  // So is the right password from a crowd member once its own wait is over, and it clears the slate.
+  now.advance(60 * MINUTE);
+  assert.equal((await loginFrom(app, "198.51.100.4", "owner", OWNER_PASSWORD)).status, 200);
+  for (let index = 0; index < 5; index += 1) {
+    assert.equal((await guess("198.51.100.4")).status, 401);
+  }
+
+  const refusals = app.logs.filter((entry) => entry.message === "Login refused after too many failed attempts");
+  assert.deepEqual(refusals[0].meta, { address: "198.51.100.4", limit: "address+username", retryAfterSeconds: 900 });
+});
+
+test("one address guessing for hours never costs another address its login", async (t) => {
   const now = clock();
   const app = await startApp(t, { app: { now } });
   await app.setupOwner();
 
-  // The owner has logged in from home before the trouble starts.
-  assert.equal((await loginFrom(app, "203.0.113.50", "owner", OWNER_PASSWORD)).status, 200);
-
-  // Ten addresses fail once each: none of them is near its own limit.
-  for (let index = 1; index <= 10; index += 1) {
-    assert.equal((await loginFrom(app, `198.51.100.${index}`, "owner", "from-a-list")).status, 401);
+  let refusedOthers = 0;
+  for (let round = 0; round < 24; round += 1) {
+    // Five wrong guesses and a sixth that is refused, every fifteen minutes, for six hours.
+    for (let index = 0; index < 6; index += 1) {
+      await loginFrom(app, "198.51.100.66", "owner", `guess-${round}-${index}`);
+    }
+    const other = await loginFrom(app, `203.0.113.${round + 1}`, "owner", OWNER_PASSWORD);
+    if (other.status !== 200) {
+      refusedOthers += 1;
+    }
+    now.advance(15 * MINUTE);
   }
-
-  // The eleventh address is told to wait, and the waits double from there.
-  const waits = [];
-  for (let index = 11; index <= 15; index += 1) {
-    const refused = await loginFrom(app, `198.51.100.${index}`, "owner", OWNER_PASSWORD);
-    assert.equal(refused.status, 429);
-    waits.push(Number(refused.headers["retry-after"]));
-    now.advance(waits.at(-1) * 1000);
-    assert.equal((await loginFrom(app, `198.51.100.${index}`, "owner", "from-a-list")).status, 401);
-  }
-  assert.deepEqual(waits, [1, 2, 4, 8, 16]);
-  const outsider = await loginFrom(app, "198.51.100.99", "owner", OWNER_PASSWORD);
-  assert.equal(outsider.status, 429);
-  assert.equal(outsider.headers["retry-after"], "32");
-
-  // The address the owner has used before gets straight in...
-  assert.equal((await loginFrom(app, "203.0.113.50", "owner", OWNER_PASSWORD)).status, 200);
-  // ...and so does a direct connection with no proxy in front, which is what a
-  // machine on the LAN looks like. (This one comes from loopback itself.)
-  assert.equal((await loginFrom(app, null, "owner", OWNER_PASSWORD)).status, 200);
-
-  // Other accounts are not slowed at all.
-  assert.equal((await loginFrom(app, "198.51.100.99", "lane", "whatever-it-is")).status, 401);
-
-  // And the wait ends by itself.
-  now.advance(32 * 1000);
-  assert.equal((await loginFrom(app, "198.51.100.99", "owner", OWNER_PASSWORD)).status, 200);
+  assert.equal(refusedOthers, 0);
 });
 
 test("the visitor's address is read from the tunnel's headers: IPv6 per /64, X-Forwarded-For as the fallback", async (t) => {
@@ -438,9 +468,15 @@ test("the visitor's address is read from the tunnel's headers: IPv6 per /64, X-F
   }
   assert.equal(await attempt({ "X-Forwarded-For": "198.51.100.90" }, "lane"), 429);
   assert.equal(await attempt({ "X-Forwarded-For": "198.51.100.91, 198.51.100.90" }, "lane"), 401);
-  // When both are present, Cloudflare's header is the one that counts.
-  assert.equal(await attempt({ "CF-Connecting-IP": "198.51.100.92", "X-Forwarded-For": "198.51.100.90" }, "lane"), 401);
-  assert.equal(await attempt({ "CF-Connecting-IP": "198.51.100.90", "X-Forwarded-For": "198.51.100.93" }, "lane"), 429);
+  // Cloudflare's header counts when X-Forwarded-For bears it out...
+  assert.equal(
+    await attempt({ "CF-Connecting-IP": "198.51.100.90", "X-Forwarded-For": "203.0.113.1, 198.51.100.90" }, "lane"),
+    429
+  );
+  // ...and not when it does not: that is a visitor behind some other proxy
+  // sending the header themselves, to be counted as somebody else.
+  assert.equal(await attempt({ "CF-Connecting-IP": "198.51.100.92", "X-Forwarded-For": "198.51.100.90" }, "lane"), 429);
+  assert.equal(await attempt({ "CF-Connecting-IP": "198.51.100.90", "X-Forwarded-For": "198.51.100.93" }, "lane"), 401);
 });
 
 test("many guesses sent at once are not all checked", async (t) => {
@@ -528,25 +564,31 @@ test("wrong server passphrases are limited per account and per server", async (t
     assert.equal((await unlock(lane, "another-wrong-one")).status, 403);
   }
   assert.equal((await unlock(lane, "lane-secret")).status, 200);
-});
 
-test("the address the owner was created from counts as one that has signed in", async (t) => {
-  const now = clock();
-  const app = await startApp(t, { app: { now } });
-  // First-run setup through the tunnel, from the owner's home address.
-  const created = await app.request({
-    headers: { "CF-Connecting-IP": "203.0.113.50" },
-    json: { password: OWNER_PASSWORD, setupCode: app.setupCodes[0], username: "owner" },
-    method: "POST",
-    path: "/api/setup-owner"
-  });
-  assert.equal(created.status, 201);
-
-  for (let index = 1; index <= 12; index += 1) {
-    await loginFrom(app, `198.51.100.${index}`, "owner", "from-a-list");
+  // Used up again, the wait is back. From here on there is one try per wait,
+  // and each wrong one doubles the next wait, as a wrong password does.
+  for (let index = 0; index < 5; index += 1) {
+    assert.equal((await unlock(lane, "still-wrong")).status, 403);
   }
-  assert.equal((await loginFrom(app, "198.51.100.99", "owner", OWNER_PASSWORD)).status, 429);
-  assert.equal((await loginFrom(app, "203.0.113.50", "owner", OWNER_PASSWORD)).status, 200);
+  assert.equal((await unlock(lane, "lane-secret")).headers["retry-after"], "900");
+  now.advance(15 * MINUTE);
+  assert.equal((await unlock(lane, "still-wrong")).status, 403);
+  const doubled = await unlock(lane, "lane-secret");
+  assert.equal(doubled.status, 429);
+  assert.deepEqual(doubled.json, {
+    error: "Too many wrong passphrases for this server. Try again in 30 minutes.",
+    retryAfterSeconds: 1800
+  });
+  // Still nobody else's wait.
+  assert.equal((await unlock(moss, "lane-secret")).status, 200);
+
+  // The right passphrase after the longer wait ends it: five tries again.
+  now.advance(30 * MINUTE);
+  assert.equal((await unlock(lane, "lane-secret")).status, 200);
+  for (let index = 0; index < 4; index += 1) {
+    assert.equal((await unlock(lane, "wrong-once-more")).status, 403);
+  }
+  assert.equal((await unlock(lane, "lane-secret")).status, 200);
 });
 
 test("a server passphrase hashed by the previous version still unlocks the server", async (t) => {

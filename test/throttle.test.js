@@ -10,6 +10,7 @@ const {
 
 const SECOND = 1000;
 const MINUTE = 60 * SECOND;
+const HOUR = 60 * MINUTE;
 
 function clock(start = 1_800_000_000_000) {
   let current = start;
@@ -31,18 +32,24 @@ function fail(throttle, attempt) {
 
 test("the documented login limits are the ones enforced", () => {
   assert.deepEqual(LOGIN_LIMITS, {
-    knownAddressTtlMs: 30 * 24 * 60 * MINUTE,
+    crowdAddresses: 4,
+    ladderBaseMs: 15 * MINUTE,
+    ladderMaxMs: 24 * HOUR,
+    ladderMemoryMs: 24 * HOUR,
     maxFailuresPerAddress: 20,
     maxFailuresPerAddressAndUsername: 5,
-    usernameBackoffBaseMs: SECOND,
-    usernameBackoffMaxMs: 5 * MINUTE,
-    usernameFailuresBeforeBackoff: 10,
     windowMs: 15 * MINUTE
   });
-  assert.deepEqual(UNLOCK_LIMITS, { maxFailures: 5, windowMs: 15 * MINUTE });
+  assert.deepEqual(UNLOCK_LIMITS, {
+    ladderBaseMs: 15 * MINUTE,
+    ladderMaxMs: 24 * HOUR,
+    ladderMemoryMs: 24 * HOUR,
+    maxFailures: 5,
+    windowMs: 15 * MINUTE
+  });
 });
 
-test("five failures from one address against one username are refused until the oldest ages out", () => {
+test("five failures from one address against one username start a ladder of doubling waits", () => {
   const now = clock();
   const throttle = createLoginThrottle({ now });
   const attempt = { address: stranger(1), username: "owner" };
@@ -52,22 +59,39 @@ test("five failures from one address against one username are refused until the 
     now.advance(MINUTE);
   }
 
-  // Five minutes after the first failure: ten more to wait.
-  assert.deepEqual(throttle.begin(attempt), { allowed: false, retryAfterSeconds: 600, scope: "address+username" });
+  // A minute after the fifth failure: fourteen of its fifteen minutes to go.
+  assert.deepEqual(throttle.begin(attempt), { allowed: false, retryAfterSeconds: 840, scope: "address+username" });
 
   // Being refused is not a failure: asking again does not push the time out.
-  now.advance(9 * MINUTE);
+  now.advance(13 * MINUTE);
   for (let index = 0; index < 50; index += 1) {
     assert.equal(throttle.begin(attempt).retryAfterSeconds, 60);
   }
   now.advance(59 * SECOND);
   assert.equal(throttle.begin(attempt).retryAfterSeconds, 1);
 
-  // The first failure is now 15 minutes old: one attempt is available again,
-  // and using it up closes the door until the second failure ages out.
-  now.advance(SECOND);
-  fail(throttle, attempt);
-  assert.deepEqual(throttle.begin(attempt), { allowed: false, retryAfterSeconds: 60, scope: "address+username" });
+  // After the wait there is one try, not five, and each one that fails doubles
+  // the next wait, up to a day.
+  const waits = [];
+  for (let round = 0; round < 8; round += 1) {
+    now.advance(round === 0 ? SECOND : waits.at(-1) * SECOND);
+    fail(throttle, attempt);
+    const refused = throttle.begin(attempt);
+    assert.equal(refused.allowed, false);
+    assert.equal(refused.scope, "address+username");
+    waits.push(refused.retryAfterSeconds);
+  }
+  assert.deepEqual(waits, [1800, 3600, 7200, 14400, 28800, 57600, 86400, 86400]);
+
+  // Failures spread thinly never reach it: four a quarter of an hour, for a day.
+  const patient = createLoginThrottle({ now });
+  for (let quarter = 0; quarter < 96; quarter += 1) {
+    for (let index = 0; index < 4; index += 1) {
+      fail(patient, attempt);
+    }
+    now.advance(15 * MINUTE);
+  }
+  assert.equal(patient.begin(attempt).allowed, true);
 });
 
 test("username case and padding do not buy extra attempts, and other usernames are separate", () => {
@@ -174,136 +198,185 @@ test("guesses sent at the same moment cannot all be checked before the first is 
   assert.equal(throttle.begin(attempt).allowed, false);
 });
 
-test("failures for one username from many addresses slow it down, doubling to five minutes", () => {
+test("a username failed on from four addresses puts each failing address on a doubling wait", () => {
   const now = clock();
   const throttle = createLoginThrottle({ now });
+  const on = (index) => ({ address: stranger(index), username: "owner" });
 
-  // Ten addresses, one wrong guess each: no single address is near its limit.
-  for (let index = 1; index <= 9; index += 1) {
-    fail(throttle, { address: stranger(index), username: "owner" });
+  // Three addresses are not a crowd: each keeps its ordinary five tries.
+  for (let index = 1; index <= 3; index += 1) {
+    fail(throttle, on(index));
+    fail(throttle, on(index));
   }
-  assert.equal(throttle.begin({ address: stranger(100), username: "owner" }).allowed, true);
+  assert.equal(throttle.begin(on(1)).allowed, true);
 
-  // The tenth failure (just made, still unsettled) starts the waits.
+  // The fourth makes one. Its failure costs it fifteen minutes...
+  fail(throttle, on(4));
+  assert.deepEqual(throttle.begin(on(4)), { allowed: false, retryAfterSeconds: 900, scope: "address+username" });
+  // ...and so does the next failure of an address that was failing before the
+  // crowd formed, although it has used only three of its five tries.
+  assert.equal(throttle.begin(on(2)).allowed, true);
+  assert.deepEqual(throttle.begin(on(2)), { allowed: false, retryAfterSeconds: 900, scope: "address+username" });
+
+  // Other usernames are not affected, even from the same addresses.
+  fail(throttle, { address: stranger(4), username: "lane" });
+  assert.equal(throttle.begin({ address: stranger(4), username: "lane" }).allowed, true);
+
+  // Each time the same address fails again its wait doubles, up to a day.
   const waits = [];
-  for (let index = 101; index <= 112; index += 1) {
-    const refused = throttle.begin({ address: stranger(index), username: "owner" });
+  for (let round = 0; round < 9; round += 1) {
+    const refused = throttle.begin(on(4));
     assert.equal(refused.allowed, false);
-    assert.equal(refused.scope, "username");
+    assert.equal(refused.scope, "address+username");
     waits.push(refused.retryAfterSeconds);
-    // Wait it out, then fail once more from yet another address.
     now.advance(refused.retryAfterSeconds * SECOND);
-    fail(throttle, { address: stranger(index), username: "owner" });
+    fail(throttle, on(4));
   }
-  assert.deepEqual(waits, [1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300, 300]);
-
-  // Other usernames are not slowed, even from the same addresses.
-  assert.equal(throttle.begin({ address: stranger(112), username: "lane" }).allowed, true);
-
-  // It is a wait, not a lock: it ends on its own, and after fifteen quiet
-  // minutes the count starts from nothing.
-  assert.equal(throttle.begin({ address: stranger(200), username: "owner" }).retryAfterSeconds, 300);
-  now.advance(5 * MINUTE);
-  assert.equal(throttle.begin({ address: stranger(200), username: "owner" }).allowed, true);
-  now.advance(15 * MINUTE);
-  for (let index = 1; index <= 9; index += 1) {
-    fail(throttle, { address: stranger(210 + index), username: "owner" });
-  }
-  assert.equal(throttle.begin({ address: stranger(220), username: "owner" }).allowed, true);
+  assert.deepEqual(waits, [900, 1800, 3600, 7200, 14400, 28800, 57600, 86400, 86400]);
 });
 
-test("the real user is not kept out by other people's failures", () => {
+test("what other addresses do never stops an address that has not been failing", () => {
   const now = clock();
   const throttle = createLoginThrottle({ now });
 
-  // The owner has logged in from home before.
-  throttle.begin({ address: "203.0.113.50", username: "owner" }).succeeded();
-
-  // Then a crowd hammers the owner's username until it is at the longest wait.
-  for (let index = 1; index <= 30; index += 1) {
+  // A crowd works on the owner's username until every one of its addresses is waiting.
+  for (let index = 1; index <= 40; index += 1) {
     const result = throttle.begin({ address: stranger(index), username: "owner" });
     if (result.allowed) {
       result.failed();
-    } else {
-      now.advance(result.retryAfterSeconds * SECOND);
-      fail(throttle, { address: stranger(index), username: "owner" });
     }
   }
-  const outsider = throttle.begin({ address: stranger(250), username: "owner" });
-  assert.deepEqual(outsider, { allowed: false, retryAfterSeconds: 300, scope: "username" });
+  assert.equal(throttle.begin({ address: stranger(40), username: "owner" }).scope, "address+username");
 
-  // The address that has logged in before is let straight through...
-  const fromHome = throttle.begin({ address: "203.0.113.50", username: "owner" });
-  assert.equal(fromHome.allowed, true);
-  fromHome.succeeded();
-
-  // ...and so is a direct connection from the LAN, which no crowd on the
-  // internet can pretend to be.
-  const fromLan = throttle.begin({ address: "192.168.1.20", local: true, username: "owner" });
-  assert.equal(fromLan.allowed, true);
-  fromLan.succeeded();
-
-  // A legitimate login does not shorten the wait for everyone else either.
-  assert.equal(throttle.begin({ address: stranger(250), username: "owner" }).retryAfterSeconds, 300);
-
-  // Neither exemption is a way round the per-address limit.
+  // The owner, from an address that has never been seen, is checked at once.
   for (let index = 0; index < 5; index += 1) {
-    fail(throttle, { address: "192.168.1.20", local: true, username: "owner" });
-    fail(throttle, { address: "203.0.113.50", username: "owner" });
+    const fresh = throttle.begin({ address: `203.0.113.${index + 1}`, username: "owner" });
+    assert.equal(fresh.allowed, true);
+    fresh.succeeded();
   }
-  assert.equal(throttle.begin({ address: "192.168.1.20", local: true, username: "owner" }).scope, "address+username");
-  assert.equal(throttle.begin({ address: "203.0.113.50", username: "owner" }).scope, "address+username");
-
-  // Having logged in as one account says nothing about another.
-  throttle.begin({ address: "203.0.113.60", username: "lane" }).succeeded();
-  assert.equal(throttle.begin({ address: "203.0.113.60", username: "owner" }).scope, "username");
+  // A slip of their own is theirs alone to wait out: nobody else's address is held.
+  fail(throttle, { address: "203.0.113.50", username: "owner" });
+  assert.deepEqual(throttle.begin({ address: "203.0.113.50", username: "owner" }), {
+    allowed: false,
+    retryAfterSeconds: 900,
+    scope: "address+username"
+  });
+  assert.equal(throttle.begin({ address: "203.0.113.51", username: "owner" }).allowed, true);
 });
 
-test("a remembered address is forgotten after thirty days", () => {
+test("one address failing for hours cannot keep anyone else out", () => {
+  // The rule this replaced counted failures per username, and one address that
+  // never exceeded its own limit could hold a username at the longest wait for
+  // every address that had not logged in before.
   const now = clock();
   const throttle = createLoginThrottle({ now });
-  throttle.begin({ address: "203.0.113.50", username: "owner" }).succeeded();
+  let checkedGuesses = 0;
+  let refusedOthers = 0;
 
-  const hammer = () => {
-    for (let index = 1; index <= 12; index += 1) {
-      const result = throttle.begin({ address: stranger(index), username: "owner" });
-      if (result.allowed) {
-        result.failed();
-      }
+  for (let minute = 0; minute < 6 * 60; minute += 1) {
+    const guess = throttle.begin({ address: stranger(66), username: "owner" });
+    if (guess.allowed) {
+      guess.failed();
+      checkedGuesses += 1;
     }
-  };
+    // Meanwhile somebody tries the right password from an address not seen before.
+    const other = throttle.begin({ address: `203.0.${minute % 250}.${Math.floor(minute / 250) + 1}`, username: "owner" });
+    if (other.allowed) {
+      other.succeeded();
+    } else {
+      refusedOthers += 1;
+    }
+    now.advance(MINUTE);
+  }
 
-  now.advance(29 * 24 * 60 * MINUTE);
-  hammer();
-  assert.equal(throttle.begin({ address: "203.0.113.50", username: "owner" }).allowed, true);
-
-  now.advance(2 * 24 * 60 * MINUTE);
-  hammer();
-  assert.equal(throttle.begin({ address: "203.0.113.50", username: "owner" }).scope, "username");
+  assert.equal(refusedOthers, 0);
+  // Its own five tries, then one guess per rung of the ladder: at 19, 49, 109
+  // and 229 minutes. Nine guesses in six hours.
+  assert.equal(checkedGuesses, 9);
 });
 
-test("a successful login does not count towards slowing the username down", () => {
+test("a correct login takes an address off the ladder and out of the crowd", () => {
   const now = clock();
   const throttle = createLoginThrottle({ now });
-  for (let index = 1; index <= 9; index += 1) {
-    fail(throttle, { address: stranger(index), username: "owner" });
+  const on = (index) => ({ address: stranger(index), username: "owner" });
+  for (let index = 1; index <= 4; index += 1) {
+    fail(throttle, on(index));
+  }
+  assert.equal(throttle.begin(on(4)).scope, "address+username");
+
+  // Address 4 waits its fifteen minutes and then gets it right.
+  now.advance(15 * MINUTE);
+  throttle.begin(on(4)).succeeded();
+  // Its slate is clean: the ordinary five tries, and no doubling from where it left off.
+  for (let index = 0; index < 5; index += 1) {
+    fail(throttle, on(4));
+  }
+  assert.deepEqual(throttle.begin(on(4)), { allowed: false, retryAfterSeconds: 900, scope: "address+username" });
+
+  // Successful logins never make a crowd, however many addresses they come from.
+  const calm = createLoginThrottle({ now });
+  for (let index = 1; index <= 30; index += 1) {
+    calm.begin({ address: stranger(index), username: "lane" }).succeeded();
+  }
+  fail(calm, { address: stranger(100), username: "lane" });
+  assert.equal(calm.begin({ address: stranger(100), username: "lane" }).allowed, true);
+});
+
+test("an address keeps its place on the ladder until it has gone a day without failing, crowd or no crowd", () => {
+  const now = clock();
+  const throttle = createLoginThrottle({ now });
+  const on = (index) => ({ address: stranger(index), username: "owner" });
+  for (let index = 1; index <= 4; index += 1) {
+    fail(throttle, on(index));
+  }
+  assert.equal(throttle.begin(on(4)).retryAfterSeconds, 900);
+
+  // Two hours later the crowd is long gone, but this address was part of it:
+  // its next failure is its second rung, not a fresh start.
+  now.advance(2 * HOUR);
+  fail(throttle, on(4));
+  assert.deepEqual(throttle.begin(on(4)), { allowed: false, retryAfterSeconds: 1800, scope: "address+username" });
+  // An address that was not part of it has its ordinary five tries.
+  fail(throttle, on(9));
+  assert.equal(throttle.begin(on(9)).allowed, true);
+
+  // The half hour passes, and then a day in which it could have tried and did
+  // not: only then is it forgotten.
+  now.advance(30 * MINUTE + 23 * HOUR);
+  fail(throttle, on(4));
+  assert.deepEqual(throttle.begin(on(4)), { allowed: false, retryAfterSeconds: 3600, scope: "address+username" });
+  now.advance(HOUR + 24 * HOUR);
+  fail(throttle, on(4));
+  assert.equal(throttle.begin(on(4)).allowed, true);
+});
+
+test("an attempt that could not be checked leaves no trace in the crowd or on the ladder", () => {
+  const now = clock();
+  const throttle = createLoginThrottle({ now });
+  const on = (index) => ({ address: stranger(index), username: "owner" });
+  for (let index = 1; index <= 3; index += 1) {
+    fail(throttle, on(index));
   }
 
-  // Many successes from many addresses: still nine failures on the books.
-  for (let index = 20; index < 40; index += 1) {
-    throttle.begin({ address: stranger(index), username: "owner" }).succeeded();
+  // The fourth address's attempt is let through and then cannot be checked.
+  for (let index = 0; index < 10; index += 1) {
+    throttle.begin(on(4)).cancelled();
   }
-  assert.equal(throttle.begin({ address: stranger(50), username: "owner" }).allowed, true);
+  // No crowd was formed by it: the next failure from address 1 costs nothing extra...
+  fail(throttle, on(1));
+  assert.equal(throttle.begin(on(1)).allowed, true);
+  // ...and address 4 itself is not on the ladder.
+  fail(throttle, on(4));
+  assert.equal(throttle.begin(on(4)).scope, "address+username");
+  assert.equal(throttle.begin(on(4)).retryAfterSeconds, 900);
 
-  // Nor do they keep old failures alive: 15 minutes after the last *failure*
-  // the count is gone, however recently somebody logged in.
-  now.advance(14 * MINUTE);
-  throttle.begin({ address: stranger(60), username: "owner" }).succeeded();
-  now.advance(2 * MINUTE);
-  for (let index = 70; index < 79; index += 1) {
-    fail(throttle, { address: stranger(index), username: "owner" });
-  }
-  assert.equal(throttle.begin({ address: stranger(90), username: "owner" }).allowed, true);
+  // While an attempt on a crowded username is being checked, a second one from
+  // the same address is not let through alongside it.
+  const first = throttle.begin(on(5));
+  assert.equal(first.allowed, true);
+  assert.equal(throttle.begin(on(5)).allowed, false);
+  first.cancelled();
+  assert.equal(throttle.begin(on(5)).allowed, true);
 });
 
 test("addresses in one IPv6 /64 share a limit", () => {
@@ -319,10 +392,10 @@ test("every loopback address shares one limit", () => {
   const throttle = createLoginThrottle({ now: clock() });
   // A program on this machine, connecting from a different 127.x.y.z each time.
   for (let index = 1; index <= 5; index += 1) {
-    fail(throttle, { address: `127.0.0.${index}`, local: true, username: "owner" });
+    fail(throttle, { address: `127.0.0.${index}`, username: "owner" });
   }
-  assert.equal(throttle.begin({ address: "127.44.55.66", local: true, username: "owner" }).scope, "address+username");
-  assert.equal(throttle.begin({ address: "0:0:0:0:0:0:0:1", local: true, username: "owner" }).scope, "address+username");
+  assert.equal(throttle.begin({ address: "127.44.55.66", username: "owner" }).scope, "address+username");
+  assert.equal(throttle.begin({ address: "0:0:0:0:0:0:0:1", username: "owner" }).scope, "address+username");
 });
 
 test("the tables stay bounded however many usernames and addresses are thrown at them", () => {
@@ -337,7 +410,7 @@ test("the tables stay bounded however many usernames and addresses are thrown at
       result.failed();
     }
   }
-  // Three tables of failures and one of remembered addresses, 50 keys each.
+  // Four tables, 50 keys each.
   assert.ok(throttle.size() <= 200, `tracking ${throttle.size()} keys`);
 
   // An entry that has expired is dropped rather than kept until it is evicted.
@@ -351,7 +424,57 @@ test("the tables stay bounded however many usernames and addresses are thrown at
   assert.equal(quiet.size(), 0);
 });
 
-test("the single-key limiter used for server passphrases allows five failures per window", () => {
+test("when a table is full, entries that are refusing someone are the last to go", () => {
+  const now = clock();
+  const throttle = createLoginThrottle({ maxKeys: 8, now });
+  const blocked = { address: stranger(1), username: "owner" };
+  for (let index = 0; index < 5; index += 1) {
+    fail(throttle, blocked);
+  }
+  assert.equal(throttle.begin(blocked).allowed, false);
+
+  // Far more single failures than the tables hold, from other addresses on
+  // other usernames. Dropping the oldest entry first would drop the block.
+  for (let index = 0; index < 60; index += 1) {
+    fail(throttle, { address: `203.0.113.${index + 1}`, username: `filler-${index}` });
+  }
+  assert.deepEqual(throttle.begin(blocked), { allowed: false, retryAfterSeconds: 900, scope: "address+username" });
+
+  // The same on the ladder. Address 4 climbs to an hour's wait...
+  const laddered = createLoginThrottle({ maxKeys: 8, now });
+  const crowd = (username, first) => {
+    for (let index = first; index < first + 4; index += 1) {
+      const result = laddered.begin({ address: stranger(index), username });
+      if (result.allowed) {
+        result.failed();
+      }
+    }
+  };
+  crowd("owner", 1);
+  now.advance(15 * MINUTE);
+  fail(laddered, { address: stranger(4), username: "owner" });
+  now.advance(30 * MINUTE);
+  fail(laddered, { address: stranger(4), username: "owner" });
+  assert.equal(laddered.begin({ address: stranger(4), username: "owner" }).retryAfterSeconds, 3600);
+
+  // ...then other crowds put seven more addresses on fifteen-minute waits, which
+  // run out while address 4 is still waiting. Its entry is now the oldest in a
+  // full table, and the only one still refusing anybody.
+  for (let name = 0; name < 7; name += 1) {
+    crowd(`crowded-${name}`, 10 + name * 4);
+  }
+  now.advance(20 * MINUTE);
+  for (let name = 7; name < 12; name += 1) {
+    crowd(`crowded-${name}`, 10 + name * 4);
+  }
+  assert.deepEqual(laddered.begin({ address: stranger(4), username: "owner" }), {
+    allowed: false,
+    retryAfterSeconds: 2400,
+    scope: "address+username"
+  });
+});
+
+test("the single-key limiter used for server passphrases allows five tries, then the same ladder", () => {
   const now = clock();
   const throttle = createAttemptThrottle({ now });
   const key = "usr_lane|DemoServer";
@@ -377,8 +500,23 @@ test("the single-key limiter used for server passphrases allows five failures pe
   }
   assert.equal(throttle.begin(other).allowed, true);
 
-  now.advance(15 * MINUTE);
+  // After the wait there is one try at a time, and every one that fails doubles the next wait.
+  const waits = [];
+  for (let round = 0; round < 8; round += 1) {
+    now.advance(round === 0 ? 15 * MINUTE : waits.at(-1) * SECOND);
+    throttle.begin(key).failed();
+    waits.push(throttle.begin(key).retryAfterSeconds);
+  }
+  assert.deepEqual(waits, [1800, 3600, 7200, 14400, 28800, 57600, 86400, 86400]);
+
+  // Getting it right ends that too: five tries again.
+  now.advance(24 * HOUR);
+  throttle.begin(key).succeeded();
+  for (let index = 0; index < 4; index += 1) {
+    throttle.begin(key).failed();
+  }
   assert.equal(throttle.begin(key).allowed, true);
+  assert.ok(throttle.size() <= 6);
 });
 
 test("waits are described in words a person can act on", () => {
@@ -389,29 +527,9 @@ test("waits are described in words a person can act on", () => {
   assert.equal(describeWait(300), "5 minutes");
   assert.equal(describeWait(841), "15 minutes");
   assert.equal(describeWait(900), "15 minutes");
-});
-
-test("an address can be remembered without a login, as the owner's is at first run", () => {
-  const now = clock();
-  const throttle = createLoginThrottle({ now });
-  throttle.remember({ address: "203.0.113.50", username: " Owner " });
-
-  for (let index = 1; index <= 12; index += 1) {
-    const result = throttle.begin({ address: stranger(index), username: "owner" });
-    if (result.allowed) {
-      result.failed();
-    }
-  }
-  assert.equal(throttle.begin({ address: stranger(99), username: "owner" }).scope, "username");
-  assert.equal(throttle.begin({ address: "203.0.113.50", username: "owner" }).allowed, true);
-  // Remembered for that account only.
-  assert.equal(throttle.begin({ address: "203.0.113.50", username: "lane" }).allowed, true);
-  now.advance(31 * 24 * 60 * MINUTE);
-  for (let index = 1; index <= 12; index += 1) {
-    const result = throttle.begin({ address: stranger(index), username: "owner" });
-    if (result.allowed) {
-      result.failed();
-    }
-  }
-  assert.equal(throttle.begin({ address: "203.0.113.50", username: "owner" }).scope, "username");
+  assert.equal(describeWait(3600), "60 minutes");
+  assert.equal(describeWait(5399), "90 minutes");
+  assert.equal(describeWait(5400), "2 hours");
+  assert.equal(describeWait(14400), "4 hours");
+  assert.equal(describeWait(86400), "24 hours");
 });

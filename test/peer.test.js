@@ -1,13 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const {
-  addressBucket,
-  clientAddress,
-  isHttpsRequest,
-  isLoopbackAddress,
-  isPrivateAddress,
-  normalizeAddress
-} = require("../src/lib/peer");
+const { addressBucket, clientAddress, isHttpsRequest, isLoopbackAddress, normalizeAddress } = require("../src/lib/peer");
 
 function fakeRequest(remoteAddress, headers = {}, socket = {}) {
   return { headers, socket: { remoteAddress, ...socket } };
@@ -34,40 +27,12 @@ test("addresses are normalised to one spelling each", () => {
   }
 });
 
-test("loopback and private ranges are recognised", () => {
+test("loopback addresses are recognised, in every spelling", () => {
   for (const address of ["127.0.0.1", "127.8.9.10", normalizeAddress("::1"), normalizeAddress("::ffff:127.0.0.1")]) {
     assert.equal(isLoopbackAddress(address), true, address);
   }
   for (const address of ["128.0.0.1", "10.0.0.1", "203.0.113.7", normalizeAddress("::2"), normalizeAddress("2001:db8::1"), null]) {
     assert.equal(isLoopbackAddress(address), false, String(address));
-  }
-
-  for (const address of [
-    "10.1.2.3",
-    "172.16.0.1",
-    "172.31.255.254",
-    "192.168.1.20",
-    "169.254.10.10",
-    "100.64.0.1",
-    "100.127.255.254",
-    normalizeAddress("fd12:3456::1"),
-    normalizeAddress("fe80::1")
-  ]) {
-    assert.equal(isPrivateAddress(address), true, address);
-  }
-  for (const address of [
-    "172.15.0.1",
-    "172.32.0.1",
-    "192.169.1.1",
-    "100.63.255.255",
-    "100.128.0.1",
-    "8.8.8.8",
-    "203.0.113.7",
-    normalizeAddress("2001:db8::1"),
-    normalizeAddress("fec0::1"),
-    null
-  ]) {
-    assert.equal(isPrivateAddress(address), false, String(address));
   }
 });
 
@@ -90,63 +55,57 @@ test("IPv6 addresses are counted per /64, IPv4 addresses one by one", () => {
 });
 
 test("forwarding headers are believed only when the socket peer is loopback", () => {
-  const spoofed = { "cf-connecting-ip": "198.51.100.1", "x-forwarded-for": "198.51.100.2" };
+  const spoofed = { "cf-connecting-ip": "198.51.100.1", "x-forwarded-for": "198.51.100.1" };
 
   // A LAN machine, or anyone reaching the port directly, cannot pick its address.
-  assert.deepEqual(clientAddress(fakeRequest("192.168.1.20", spoofed)), {
-    address: "192.168.1.20",
-    forwarded: false,
-    local: true
-  });
-  assert.deepEqual(clientAddress(fakeRequest("203.0.113.7", spoofed)), {
-    address: "203.0.113.7",
-    forwarded: false,
-    local: false
-  });
-  assert.deepEqual(clientAddress(fakeRequest("::ffff:192.168.1.20", spoofed)), {
-    address: "192.168.1.20",
-    forwarded: false,
-    local: true
-  });
+  assert.deepEqual(clientAddress(fakeRequest("192.168.1.20", spoofed)), { address: "192.168.1.20", forwarded: false });
+  assert.deepEqual(clientAddress(fakeRequest("203.0.113.7", spoofed)), { address: "203.0.113.7", forwarded: false });
+  assert.deepEqual(clientAddress(fakeRequest("::ffff:192.168.1.20", spoofed)), { address: "192.168.1.20", forwarded: false });
 
   // The tunnel connects from loopback and names the visitor.
   for (const loopback of ["127.0.0.1", "::1", "::ffff:127.0.0.1"]) {
     assert.deepEqual(clientAddress(fakeRequest(loopback, { "cf-connecting-ip": "198.51.100.1" })), {
       address: "198.51.100.1",
-      forwarded: true,
-      local: false
+      forwarded: true
     });
   }
 });
 
-test("CF-Connecting-IP wins over X-Forwarded-For, whose first hop is the fallback", () => {
-  assert.equal(
-    clientAddress(fakeRequest("127.0.0.1", { "cf-connecting-ip": "198.51.100.1", "x-forwarded-for": "203.0.113.99, 198.51.100.1" }))
-      .address,
-    "198.51.100.1"
-  );
-  assert.equal(
-    clientAddress(fakeRequest("127.0.0.1", { "x-forwarded-for": "198.51.100.2, 10.0.0.1, 127.0.0.1" })).address,
-    "198.51.100.2"
-  );
-  assert.equal(
-    clientAddress(fakeRequest("127.0.0.1", { "cf-connecting-ip": "2001:db8::abcd" })).address,
-    "2001:db8:0:0:0:0:0:abcd"
-  );
-  // A forwarded private address is not "local": only the socket can vouch for that.
-  assert.deepEqual(clientAddress(fakeRequest("127.0.0.1", { "x-forwarded-for": "192.168.1.20" })), {
-    address: "192.168.1.20",
-    forwarded: true,
-    local: false
+test("CF-Connecting-IP is believed when X-Forwarded-For does not contradict it", () => {
+  const from = (headers) => clientAddress(fakeRequest("127.0.0.1", headers)).address;
+
+  // What Cloudflare sends: its own header, and the same address at the end of
+  // X-Forwarded-For - after anything the visitor put there themselves.
+  assert.equal(from({ "cf-connecting-ip": "198.51.100.1", "x-forwarded-for": "198.51.100.1" }), "198.51.100.1");
+  assert.equal(from({ "cf-connecting-ip": "198.51.100.1", "x-forwarded-for": "203.0.113.99, 198.51.100.1" }), "198.51.100.1");
+  assert.equal(from({ "cf-connecting-ip": "2001:db8::abcd", "x-forwarded-for": "2001:0db8:0:0:0:0:0:abcd" }), "2001:db8:0:0:0:0:0:abcd");
+  // With no X-Forwarded-For there is nothing to contradict it.
+  assert.equal(from({ "cf-connecting-ip": "198.51.100.1" }), "198.51.100.1");
+  assert.equal(from({ "cf-connecting-ip": "198.51.100.1", "x-forwarded-for": "unknown" }), "198.51.100.1");
+
+  // Behind a proxy that is not Cloudflare, a visitor can send the header
+  // themselves. The proxy still writes their real address into
+  // X-Forwarded-For, and the address they claimed is not in it.
+  assert.equal(from({ "cf-connecting-ip": "198.51.100.1", "x-forwarded-for": "203.0.113.7" }), "203.0.113.7");
+  assert.equal(from({ "cf-connecting-ip": "10.0.0.1", "x-forwarded-for": "203.0.113.7" }), "203.0.113.7");
+  assert.equal(from({ "cf-connecting-ip": "127.0.0.1", "x-forwarded-for": "203.0.113.7" }), "203.0.113.7");
+});
+
+test("without CF-Connecting-IP the first X-Forwarded-For hop is the visitor", () => {
+  assert.deepEqual(clientAddress(fakeRequest("127.0.0.1", { "x-forwarded-for": "198.51.100.2, 10.0.0.1, 127.0.0.1" })), {
+    address: "198.51.100.2",
+    forwarded: true
   });
+  assert.equal(clientAddress(fakeRequest("::1", { "x-forwarded-for": "[2001:db8::7]:4711" })).address, "2001:db8:0:0:0:0:0:7");
+  // Entries that are not addresses are skipped rather than believed.
+  assert.equal(clientAddress(fakeRequest("127.0.0.1", { "x-forwarded-for": "unknown, 198.51.100.3" })).address, "198.51.100.3");
 });
 
 test("unusable forwarding headers fall back to the socket address", () => {
-  assert.deepEqual(clientAddress(fakeRequest("127.0.0.1", {})), { address: "127.0.0.1", forwarded: false, local: true });
+  assert.deepEqual(clientAddress(fakeRequest("127.0.0.1", {})), { address: "127.0.0.1", forwarded: false });
   assert.deepEqual(clientAddress(fakeRequest("127.0.0.1", { "cf-connecting-ip": "not-an-address", "x-forwarded-for": "unknown" })), {
     address: "127.0.0.1",
-    forwarded: false,
-    local: true
+    forwarded: false
   });
   // A junk first header does not hide a usable second one.
   assert.equal(
@@ -156,10 +115,9 @@ test("unusable forwarding headers fall back to the socket address", () => {
   // A socket that has already gone away has no address at all.
   assert.deepEqual(clientAddress(fakeRequest(undefined, { "cf-connecting-ip": "198.51.100.1" })), {
     address: "unknown",
-    forwarded: false,
-    local: false
+    forwarded: false
   });
-  assert.deepEqual(clientAddress({ headers: {} }), { address: "unknown", forwarded: false, local: false });
+  assert.deepEqual(clientAddress({ headers: {} }), { address: "unknown", forwarded: false });
 });
 
 test("HTTPS is taken from a loopback proxy's headers and from nobody else's", () => {
