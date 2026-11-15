@@ -17,6 +17,7 @@ const {
 const {
   ENV_PREFIX,
   LEGACY_ENV_PREFIX,
+  childEnvironment,
   coerceBoolean,
   displayNameFromSlug,
   ensureDir,
@@ -2344,9 +2345,13 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     }
 
     const shellCommand = resolveShellCommand();
+    // The server gets a short list of variables, not the dashboard's own
+    // environment: it runs mods, and they have no business with the
+    // dashboard's keys. See childEnvironment() in utils.js for the list.
+    //
     // The launch script already prefers the JAVA_BIN override, so a per-server
     // override only needs to reach this child's environment.
-    const childEnv = { ...process.env };
+    const childEnv = childEnvironment();
     if (server.javaBin) {
       childEnv[`${ENV_PREFIX}JAVA_BIN`] = server.javaBin;
       // Hand-written launch scripts in existing server folders read the
