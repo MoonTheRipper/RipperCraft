@@ -14,7 +14,7 @@ const {
   staticFileHeaders
 } = require("./lib/http");
 const { createServerManager } = require("./lib/servers");
-const { createWorldManager } = require("./lib/worlds");
+const { createWorldManager, resolveWorldLimitBytes } = require("./lib/worlds");
 const { createModManager } = require("./lib/mod-sources");
 const { createJobRegistry } = require("./lib/jobs");
 const { clientAddress, isHttpsRequest } = require("./lib/peer");
@@ -142,7 +142,9 @@ async function createApp(rootDir = process.cwd(), options = {}) {
 
   const sessionManager = createSessionManager(() => store.getAppConfig());
   const serverManager = createServerManager(store);
-  const worldManager = createWorldManager(serverManager);
+  const worldManager = createWorldManager(serverManager, {
+    worldLimitBytes: options.worldLimitBytes || resolveWorldLimitBytes(logger)
+  });
   const modManager = createModManager(serverManager, {
     readIntegrations: () => store.getIntegrations()
   });
@@ -1186,10 +1188,17 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               return;
             }
             const archivePath = await serverManager.readWorldArchivePath(serverId, archiveName);
-            const sent = await sendFile(res, archivePath, {
-              "Content-Disposition": `attachment; filename="${path.basename(archivePath)}"`,
-              "Content-Type": "application/zip"
-            });
+            // Only a file that is really in the library: a link left there
+            // under an archive's name is not followed to whatever it points at.
+            const sent = await sendFile(
+              res,
+              archivePath,
+              {
+                "Content-Disposition": `attachment; filename="${path.basename(archivePath)}"`,
+                "Content-Type": "application/zip"
+              },
+              { followLinks: false }
+            );
             if (!sent) {
               json(res, 404, { error: "That world archive does not exist." });
             }

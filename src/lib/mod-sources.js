@@ -1272,8 +1272,9 @@ function createModManager(serverManager, options = {}) {
         tmpDir,
         `${String(manifest.serverName || "modpack").replace(/[^A-Za-z0-9._-]+/g, "-")}.mrpack`
       );
-      // .mrpack is a zip; build it from the staged directory.
-      await runCommand("zip", ["-rq", outputPath, "modrinth.index.json", "overrides"], { cwd: tmpDir });
+      // .mrpack is a zip; build it from the staged directory. -y: like every
+      // zip the dashboard makes, it never follows a symbolic link.
+      await runCommand("zip", ["-ryq", outputPath, "modrinth.index.json", "overrides"], { cwd: tmpDir });
 
       return {
         bundled: files.length,

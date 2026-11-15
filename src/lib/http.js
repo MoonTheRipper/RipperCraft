@@ -260,10 +260,15 @@ function staticFileHeaders(filePath) {
 // a directory (GET /js) or an archive that was not there therefore failed with
 // the status line already sent: the error handler threw trying to send a
 // second one, and the request hung until the client gave up.
-async function sendFile(res, filePath, headers = {}) {
+//
+// With options.followLinks set to false, a path whose last part is a symbolic
+// link counts as not a file: it is neither reported as one nor opened, even if
+// it became a link in the moment between the two.
+async function sendFile(res, filePath, headers = {}, options = {}) {
+  const followLinks = options.followLinks !== false;
   let stats;
   try {
-    stats = await fsp.stat(filePath);
+    stats = followLinks ? await fsp.stat(filePath) : await fsp.lstat(filePath);
   } catch {
     return false;
   }
@@ -272,7 +277,10 @@ async function sendFile(res, filePath, headers = {}) {
   }
 
   return await new Promise((resolve, reject) => {
-    const stream = fs.createReadStream(filePath);
+    const stream = fs.createReadStream(
+      filePath,
+      followLinks ? {} : { flags: fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW }
+    );
     stream.once("error", () => resolve(false));
     stream.once("open", () => {
       stream.removeAllListeners("error");
