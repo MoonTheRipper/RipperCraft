@@ -195,14 +195,43 @@ function redirect(res, location) {
   res.end();
 }
 
-// Sent with every response, whatever it is.
+// What the page may load and run. The dashboard draws itself by assigning
+// markup built from server responses, so this is the second line behind the
+// escaping: markup that does get through still cannot run a script, load one,
+// or send anything anywhere.
 //
-// The Content-Security-Policy is deliberately only frame-ancestors: it stops
-// the dashboard being framed (as X-Frame-Options does for older browsers)
-// without yet restricting what the page itself may load. A full policy is a
-// change of its own.
+// Nothing here is looser than the page needs. It has no inline script and no
+// inline style - the three that existed (a style attribute on the live region,
+// one on the progress bar, an onerror attribute on add-on artwork) were moved
+// into the stylesheet and into modules so that neither 'unsafe-inline' nor a
+// hash list is required.
+const CONTENT_SECURITY_POLICY = [
+  // Anything not named below, such as the web app manifest: this origin only.
+  "default-src 'self'",
+  // The page's own modules. No inline script, no eval, no other host.
+  "script-src 'self'",
+  // The one stylesheet. Widths worked out at run time are set from script,
+  // which this does not restrict; style attributes in markup it does.
+  "style-src 'self'",
+  // The logo and icons from here, and add-on artwork, which Modrinth and
+  // CurseForge serve from their own CDNs: any https host, never plain http.
+  // data: is for an image written out inline, which is as inert as a file.
+  "img-src 'self' data: https:",
+  // The API, and nothing else: no page script can send data to another host.
+  "connect-src 'self'",
+  // System fonts only, so nothing is ever fetched; this keeps it that way.
+  "font-src 'self'",
+  // No plugins, no <base> to re-point relative URLs, no form posted elsewhere.
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'self'",
+  // Never inside a frame (X-Frame-Options says the same to older browsers).
+  "frame-ancestors 'none'"
+].join("; ");
+
+// Sent with every response, whatever it is.
 const SECURITY_HEADERS = Object.freeze({
-  "Content-Security-Policy": "frame-ancestors 'none'",
+  "Content-Security-Policy": CONTENT_SECURITY_POLICY,
   "Referrer-Policy": "same-origin",
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY"
@@ -231,10 +260,15 @@ function staticFileHeaders(filePath) {
 // a directory (GET /js) or an archive that was not there therefore failed with
 // the status line already sent: the error handler threw trying to send a
 // second one, and the request hung until the client gave up.
-async function sendFile(res, filePath, headers = {}) {
+//
+// With options.followLinks set to false, a path whose last part is a symbolic
+// link counts as not a file: it is neither reported as one nor opened, even if
+// it became a link in the moment between the two.
+async function sendFile(res, filePath, headers = {}, options = {}) {
+  const followLinks = options.followLinks !== false;
   let stats;
   try {
-    stats = await fsp.stat(filePath);
+    stats = followLinks ? await fsp.stat(filePath) : await fsp.lstat(filePath);
   } catch {
     return false;
   }
@@ -243,7 +277,10 @@ async function sendFile(res, filePath, headers = {}) {
   }
 
   return await new Promise((resolve, reject) => {
-    const stream = fs.createReadStream(filePath);
+    const stream = fs.createReadStream(
+      filePath,
+      followLinks ? {} : { flags: fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW }
+    );
     stream.once("error", () => resolve(false));
     stream.once("open", () => {
       stream.removeAllListeners("error");
@@ -280,6 +317,7 @@ async function sendFile(res, filePath, headers = {}) {
 }
 
 module.exports = {
+  CONTENT_SECURITY_POLICY,
   HttpError,
   JSON_BODY_LIMIT_BYTES,
   SECURITY_HEADERS,

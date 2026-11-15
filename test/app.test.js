@@ -9,10 +9,17 @@ const { createServerManager } = require("../src/lib/servers");
 const { createWorldManager } = require("../src/lib/worlds");
 const { createModManager } = require("../src/lib/mod-sources");
 const { createJobRegistry } = require("../src/lib/jobs");
+const { useFetchForOutbound } = require("../test-support/outbound");
 
 // These tests hash dozens of passwords and passphrases on the way to checking
 // something else. test/auth.test.js covers hashing at its real cost.
 setHashCostForTests({ ln: 10, r: 8, p: 1 });
+
+// The tests below describe Mojang, Modrinth and the rest by replacing fetch.
+// The dashboard no longer calls fetch itself - it resolves and checks every
+// address and connects to it directly - so those last steps are swapped for
+// one that asks fetch. test/outbound.test.js covers the real ones.
+useFetchForOutbound();
 
 async function createFixtureRoot() {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rippermoonstash-test-"));

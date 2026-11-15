@@ -8,6 +8,9 @@ const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const { createApp } = require("../src/app");
+// Loaded for what it does on the way in: apps started here are given a
+// fetcher that connects to nothing unless a test hands them another.
+require("./outbound");
 
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
 
@@ -18,7 +21,11 @@ const ADMIN_PASSWORD = "admin-password-1";
 async function createRoot(t) {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rippercraft-http-"));
   t.after(async () => {
-    await fsp.rm(root, { recursive: true, force: true });
+    // Retried: a request that failed part-way can leave the app still writing
+    // here for a moment, and a removal that fails skips the hooks after it -
+    // including the one that closes the server, which then keeps the test
+    // process alive for ever.
+    await fsp.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   });
 
   const serverDir = path.join(root, "servers", "DemoServer");

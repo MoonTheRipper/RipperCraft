@@ -2,7 +2,9 @@ const crypto = require("node:crypto");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
-const { ensureDir, nowIso, readEnv, runCommand, safeFilename } = require("./utils");
+const { getDefaultOutbound } = require("./outbound");
+const { ensureDir, nowIso, runCommand, safeFilename } = require("./utils");
+const { httpsAddress, invalid, plainText } = require("./validate");
 
 const MODRINTH_API = "https://api.modrinth.com/v2";
 const CURSEFORGE_API = "https://api.curseforge.com/v1";
@@ -28,7 +30,42 @@ const RELEASE_PRIORITY = {
   beta: 1,
   alpha: 2
 };
-const REMOTE_USER_AGENT = readEnv("USER_AGENT", "RipperCraft/0.1 (https://github.com/MoonTheRipper/RipperCraft)");
+// What a provider's id for a project looks like. The ids arrive from the
+// browser and go into the path of a request to the provider's API, where the
+// CurseForge one is sent along with the owner's API key. Held to these shapes
+// (and still percent-encoded where they are used) they can name a project and
+// nothing else: no "../" to another endpoint, no "?" to add parameters.
+const MODRINTH_PROJECT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const CURSEFORGE_MOD_ID = /^[0-9]{1,12}$/;
+
+function modrinthProjectId(value) {
+  const id = plainText(value);
+  if (id === null || !MODRINTH_PROJECT_ID.test(id.trim())) {
+    throw invalid("That is not a Modrinth project id.");
+  }
+  return id.trim();
+}
+
+// A field of a provider's answer, as text. The page draws what a search finds;
+// a field that is missing, or is not text, is drawn as nothing.
+function providerText(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  return typeof value === "string" ? value.slice(0, 2000) : "";
+}
+
+function listOf(value) {
+  return Array.isArray(value) ? value.filter((item) => item && typeof item === "object") : [];
+}
+
+function curseforgeModId(value) {
+  const id = plainText(value);
+  if (id === null || !CURSEFORGE_MOD_ID.test(id.trim())) {
+    throw invalid("That is not a CurseForge project id.");
+  }
+  return id.trim();
+}
 
 // Normalises the two providers' side fields onto one vocabulary. Modrinth
 // publishes client_side/server_side per project; CurseForge has no equivalent,
@@ -42,6 +79,9 @@ function createModManager(serverManager, options = {}) {
   // Owner-managed keys live in data/app.json; an environment variable always
   // wins so ops can override whatever is stored without editing the UI.
   const readIntegrations = options.readIntegrations || (async () => ({}));
+  // Every request to a provider, and every file fetched from one, goes
+  // through the one checked fetcher.
+  const outbound = options.outbound || getDefaultOutbound();
   // Project metadata (title, icon, which side it belongs on) is stable and gets
   // asked for once per add-on per install or refresh, so a short cache keeps a
   // 40-mod refresh from making 40 uncached round trips per pass.
@@ -133,34 +173,10 @@ function createModManager(serverManager, options = {}) {
     return profile;
   }
 
-  async function fetchJson(url, options = {}) {
-    const response = await fetch(url, {
-      ...options,
-      headers: {
-        "User-Agent": REMOTE_USER_AGENT,
-        ...(options.headers || {})
-      }
-    });
-    if (!response.ok) {
-      const error = new Error(`Request failed with status ${response.status}.`);
-      error.status = response.status;
-      throw error;
-    }
-    return await response.json();
-  }
-
-  async function downloadBuffer(url, options = {}) {
-    const response = await fetch(url, {
-      ...options,
-      headers: {
-        "User-Agent": REMOTE_USER_AGENT,
-        ...(options.headers || {})
-      }
-    });
-    if (!response.ok) {
-      throw new Error(`Download failed with status ${response.status}.`);
-    }
-    return Buffer.from(await response.arrayBuffer());
+  // A provider API call. A failure carries the status as `status`, which the
+  // CurseForge code reads to tell "not allowed to download" from "broken".
+  async function fetchJson(url, requestOptions = {}) {
+    return await outbound.fetchJson(url, { headers: requestOptions.headers });
   }
 
   async function searchModrinth(server, query) {
@@ -182,21 +198,21 @@ function createModManager(serverManager, options = {}) {
     }
 
     const payload = await fetchJson(url.toString());
-    return payload.hits.map((result) => ({
-      author: result.author,
+    return listOf(payload && payload.hits).map((result) => ({
+      author: providerText(result.author),
       // Search hits already carry the client/server split, so where an add-on
       // belongs is visible before it is installed rather than after.
       clientSide: normalizeSide(result.client_side),
       compatibilityLabel: `${profile.loader} • ${profile.gameVersion} • ${profile.projectType}`,
-      description: result.description,
-      downloads: result.downloads,
-      iconUrl: result.icon_url,
-      id: result.project_id,
-      pageUrl: result.slug ? `https://modrinth.com/mod/${result.slug}` : "",
+      description: providerText(result.description),
+      downloads: Number(result.downloads) || 0,
+      iconUrl: httpsAddress(result.icon_url),
+      id: providerText(result.project_id),
+      pageUrl: providerText(result.slug) ? `https://modrinth.com/mod/${encodeURIComponent(providerText(result.slug))}` : "",
       provider: "modrinth",
       serverSide: normalizeSide(result.server_side),
-      slug: result.slug,
-      title: result.title
+      slug: providerText(result.slug),
+      title: providerText(result.title)
     }));
   }
 
@@ -221,10 +237,9 @@ function createModManager(serverManager, options = {}) {
 
     let response;
     try {
-      response = await fetch(`${CURSEFORGE_API}/games/${curseforgeGameId()}`, {
+      response = await outbound.get(`${CURSEFORGE_API}/games/${encodeURIComponent(curseforgeGameId())}`, {
         headers: {
           Accept: "application/json",
-          "User-Agent": REMOTE_USER_AGENT,
           "x-api-key": key
         }
       });
@@ -235,11 +250,16 @@ function createModManager(serverManager, options = {}) {
     if (response.status === 403 || response.status === 401) {
       return { ok: false, reason: "CurseForge rejected the key (403). Check for typos or surrounding quotes." };
     }
-    if (!response.ok) {
+    if (response.status < 200 || response.status > 299) {
       return { ok: false, reason: `CurseForge returned HTTP ${response.status}.` };
     }
 
-    const payload = await response.json().catch(() => null);
+    let payload = null;
+    try {
+      payload = JSON.parse(response.buffer.toString("utf8"));
+    } catch {
+      // A key that works with an answer that cannot be read is still a key that works.
+    }
     const gameName = payload && payload.data && payload.data.name;
     return { gameName: gameName || "", ok: true, reason: `Verified against ${gameName || "CurseForge"}.` };
   }
@@ -286,39 +306,44 @@ function createModManager(serverManager, options = {}) {
       headers: await curseforgeHeaders()
     });
 
-    return payload.data.map((result) => ({
-      author: (result.authors || []).map((author) => author.name).join(", "),
+    return listOf(payload && payload.data).map((result) => ({
+      author: listOf(result.authors)
+        .map((author) => providerText(author && author.name))
+        .filter(Boolean)
+        .join(", "),
       // CurseForge publishes no client/server split, so this stays unknown
       // instead of implying a certainty the API does not provide.
       clientSide: "unknown",
       compatibilityLabel: `${profile.loader} • ${profile.gameVersion} • mod`,
-      description: result.summary,
-      downloads: result.downloadCount,
-      iconUrl: result.logo && result.logo.thumbnailUrl,
-      id: String(result.id),
+      description: providerText(result.summary),
+      downloads: Number(result.downloadCount) || 0,
+      iconUrl: httpsAddress(result.logo && result.logo.thumbnailUrl),
+      id: providerText(result.id),
       serverSide: "unknown",
       // Authors can disable third-party downloads; flag it here so the UI can
       // point at CurseForge instead of offering an install that cannot succeed.
       manualDownloadOnly: result.allowModDistribution === false,
-      pageUrl:
-        result.links && /^https?:\/\//i.test(result.links.websiteUrl || "") ? result.links.websiteUrl : "",
+      pageUrl: httpsAddress(result.links && result.links.websiteUrl),
       provider: "curseforge",
-      slug: result.slug,
-      title: result.name
+      slug: providerText(result.slug),
+      title: providerText(result.name)
     }));
   }
 
   async function search(server, provider, query) {
-    if (!query || !query.trim()) {
+    const text = plainText(query);
+    if (text === null || !text.trim()) {
       return [];
     }
+    // A search box, not an essay.
+    const terms = text.trim().slice(0, 200);
     if (provider === "modrinth") {
-      return await searchModrinth(server, query.trim());
+      return await searchModrinth(server, terms);
     }
     if (provider === "curseforge") {
-      return await searchCurseforge(server, query.trim());
+      return await searchCurseforge(server, terms);
     }
-    throw new Error(`Unsupported provider: ${provider}`);
+    throw invalid("That is not an add-on source the dashboard can search.");
   }
 
   function compareVersions(left, right) {
@@ -340,7 +365,7 @@ function createModManager(serverManager, options = {}) {
 
   async function resolveModrinthVersion(projectId, server) {
     const profile = assertManagedInstallServer(server);
-    const url = new URL(`${MODRINTH_API}/project/${projectId}/version`);
+    const url = new URL(`${MODRINTH_API}/project/${encodeURIComponent(modrinthProjectId(projectId))}/version`);
     url.searchParams.set("loaders", JSON.stringify(profile.queryLoaders));
     url.searchParams.set("game_versions", JSON.stringify([profile.gameVersion]));
     url.searchParams.set("include_changelog", "false");
@@ -360,15 +385,14 @@ function createModManager(serverManager, options = {}) {
 
   async function resolveCurseforgeModPage(modId) {
     try {
-      const payload = await fetchJson(`${CURSEFORGE_API}/mods/${modId}`, {
+      const payload = await fetchJson(`${CURSEFORGE_API}/mods/${encodeURIComponent(curseforgeModId(modId))}`, {
         headers: await curseforgeHeaders()
       });
-      const data = payload.data || {};
-      const websiteUrl = (data.links && data.links.websiteUrl) || "";
+      const data = (payload && payload.data) || {};
       return {
-        modName: data.name || "",
-        // Only ever hand an http(s) link back; this value ends up in an href.
-        websiteUrl: /^https?:\/\//i.test(websiteUrl) ? websiteUrl : ""
+        modName: providerText(data.name),
+        // Only ever hand an https link back; this value ends up in an href.
+        websiteUrl: httpsAddress(data.links && data.links.websiteUrl)
       };
     } catch {
       return { modName: "", websiteUrl: "" };
@@ -377,8 +401,12 @@ function createModManager(serverManager, options = {}) {
 
   async function manualDownloadRequiredError(modId, file) {
     const { modName, websiteUrl } = await resolveCurseforgeModPage(modId);
-    const pageUrl = websiteUrl ? `${websiteUrl}/files/${file.id}` : "";
-    const label = modName || file.fileName || `CurseForge project ${modId}`;
+    // What CurseForge said about the file, as text: this is shown to whoever
+    // asked, and offered to them as a link.
+    const fileId = providerText(file.id);
+    const fileName = providerText(file.fileName);
+    const pageUrl = websiteUrl && fileId ? httpsAddress(`${websiteUrl.replace(/\/+$/, "")}/files/${encodeURIComponent(fileId)}`) : "";
+    const label = modName || fileName || `CurseForge project ${modId}`;
     const error = new Error(
       `${label} cannot be installed automatically because its author disabled third-party downloads on CurseForge. ` +
         (pageUrl
@@ -388,8 +416,8 @@ function createModManager(serverManager, options = {}) {
     error.statusCode = 409;
     error.code = "CURSEFORGE_MANUAL_DOWNLOAD_REQUIRED";
     error.manualDownload = {
-      fileId: String(file.id),
-      fileName: file.fileName || "",
+      fileId,
+      fileName,
       modId: String(modId),
       modName: label,
       pageUrl,
@@ -405,9 +433,12 @@ function createModManager(serverManager, options = {}) {
 
     let payload;
     try {
-      payload = await fetchJson(`${CURSEFORGE_API}/mods/${modId}/files/${file.id}/download-url`, {
-        headers: await curseforgeHeaders()
-      });
+      payload = await fetchJson(
+        `${CURSEFORGE_API}/mods/${encodeURIComponent(curseforgeModId(modId))}/files/${encodeURIComponent(String(file.id))}/download-url`,
+        {
+          headers: await curseforgeHeaders()
+        }
+      );
     } catch (error) {
       if (error.status === 403 || error.status === 404) {
         throw await manualDownloadRequiredError(modId, file);
@@ -428,7 +459,7 @@ function createModManager(serverManager, options = {}) {
     }
 
     const loaderType = loaderToCurseforgeType(server.loader);
-    const url = new URL(`${CURSEFORGE_API}/mods/${modId}/files`, "https://api.curseforge.com");
+    const url = new URL(`${CURSEFORGE_API}/mods/${encodeURIComponent(curseforgeModId(modId))}/files`, "https://api.curseforge.com");
     if (profile.gameVersion) {
       url.searchParams.set("gameVersion", profile.gameVersion);
     }
@@ -473,7 +504,7 @@ function createModManager(serverManager, options = {}) {
     let details = { clientSide: "unknown", iconUrl: "", pageUrl: "", serverSide: "unknown", title: "" };
     try {
       if (provider === "modrinth") {
-        const project = await fetchJson(`${MODRINTH_API}/project/${encodeURIComponent(sourceId)}`);
+        const project = await fetchJson(`${MODRINTH_API}/project/${encodeURIComponent(modrinthProjectId(sourceId))}`);
         details = {
           clientSide: normalizeSide(project.client_side),
           iconUrl: project.icon_url || "",
@@ -482,7 +513,7 @@ function createModManager(serverManager, options = {}) {
           title: project.title || ""
         };
       } else if (provider === "curseforge") {
-        const payload = await fetchJson(`${CURSEFORGE_API}/mods/${encodeURIComponent(sourceId)}`, {
+        const payload = await fetchJson(`${CURSEFORGE_API}/mods/${encodeURIComponent(curseforgeModId(sourceId))}`, {
           headers: await curseforgeHeaders()
         });
         const data = payload.data || {};
@@ -706,13 +737,23 @@ function createModManager(serverManager, options = {}) {
     let installed;
 
     if (payload.provider === "modrinth") {
-      installed = await installModrinth(serverId, server, payload.projectId || payload.id);
+      installed = await installModrinth(serverId, server, modrinthProjectId(payload.projectId || payload.id));
     } else if (payload.provider === "curseforge") {
-      installed = await installCurseforge(serverId, server, String(payload.modId || payload.id));
+      installed = await installCurseforge(serverId, server, curseforgeModId(payload.modId || payload.id));
     } else if (payload.provider === "direct") {
       assertManualInstallAllowed(server, payload, options);
-      assertJarLikeName(payload.fileName || payload.url);
-      const result = await serverManager.downloadAndInstallFile(serverId, payload.url, payload.fileName);
+      if (typeof payload.url !== "string" || !payload.url.trim()) {
+        throw invalid("An https:// address to download from is required.");
+      }
+      // https, and nothing with a user name in it. Where the address leads is
+      // checked when it is fetched, and again at every redirect.
+      const address = outbound.parseAddress(payload.url);
+      const requestedName = payload.fileName === undefined || payload.fileName === null ? "" : plainText(payload.fileName);
+      if (requestedName === null) {
+        throw invalid("The file name must be text.");
+      }
+      assertJarLikeName(requestedName || address.pathname);
+      const result = await serverManager.downloadAndInstallFile(serverId, address.href, requestedName);
       installed = [
         {
           direct: true,
@@ -720,11 +761,11 @@ function createModManager(serverManager, options = {}) {
           managed: false,
           manual: true,
           provider: "direct",
-          sourceId: payload.url
+          sourceId: address.href
         }
       ];
     } else {
-      throw new Error(`Unsupported install provider: ${payload.provider}`);
+      throw invalid("That is not an add-on source the dashboard can install from.");
     }
 
     const tracked = await serverManager.recordAddonInstalls(
@@ -1049,13 +1090,13 @@ function createModManager(serverManager, options = {}) {
 
       try {
         if (entry.provider === "modrinth") {
-          const project = await fetchJson(`${MODRINTH_API}/project/${entry.sourceId}`);
+          const project = await fetchJson(`${MODRINTH_API}/project/${encodeURIComponent(modrinthProjectId(entry.sourceId))}`);
           item.clientSide = project.client_side || "unknown";
           item.serverSide = project.server_side || "unknown";
           item.title = project.title || entry.fileName;
           item.url = `https://modrinth.com/mod/${project.slug || entry.sourceId}`;
         } else if (entry.provider === "curseforge") {
-          const payload = await fetchJson(`${CURSEFORGE_API}/mods/${entry.sourceId}`, {
+          const payload = await fetchJson(`${CURSEFORGE_API}/mods/${encodeURIComponent(curseforgeModId(entry.sourceId))}`, {
             headers: await curseforgeHeaders()
           });
           const data = payload.data || {};
@@ -1272,8 +1313,9 @@ function createModManager(serverManager, options = {}) {
         tmpDir,
         `${String(manifest.serverName || "modpack").replace(/[^A-Za-z0-9._-]+/g, "-")}.mrpack`
       );
-      // .mrpack is a zip; build it from the staged directory.
-      await runCommand("zip", ["-rq", outputPath, "modrinth.index.json", "overrides"], { cwd: tmpDir });
+      // .mrpack is a zip; build it from the staged directory. -y: like every
+      // zip the dashboard makes, it never follows a symbolic link.
+      await runCommand("zip", ["-ryq", outputPath, "modrinth.index.json", "overrides"], { cwd: tmpDir });
 
       return {
         bundled: files.length,
@@ -1394,12 +1436,18 @@ function createModManager(serverManager, options = {}) {
       throw new Error(plan && plan.blockedReasons && plan.blockedReasons.length ? plan.blockedReasons[0] : "Combined add-on update is not safe to apply.");
     }
 
-    const downloads = await Promise.all(
-      (plan.planEntries || []).map(async (entry) => ({
-        buffer: await downloadBuffer(entry.downloadUrl),
-        entry
-      }))
-    );
+    // Everything is downloaded before anything is removed, as before - but to
+    // temporary files in the add-on folder rather than into memory, each
+    // through the checked fetcher and held to the download limit.
+    const downloads = [];
+    try {
+      for (const entry of plan.planEntries || []) {
+        downloads.push({ entry, file: await serverManager.downloadAddonToTempFile(serverId, entry.downloadUrl) });
+      }
+    } catch (error) {
+      await Promise.all(downloads.map((item) => fsp.rm(item.file.path, { force: true })));
+      throw error;
+    }
 
     const existingManifest = await serverManager.readAddonManifest(serverId);
     await serverManager.removeInstalledFiles(
@@ -1410,7 +1458,7 @@ function createModManager(serverManager, options = {}) {
     const server = await serverManager.getServer(serverId);
     const installedEntries = [];
     for (const item of downloads) {
-      const installedName = await serverManager.installManagedFile(serverId, item.entry.fileName, item.buffer);
+      const installedName = await serverManager.installManagedFileFromPath(serverId, item.entry.fileName, item.file.path);
       installedEntries.push(
         normalizeTrackedEntry(server, {
           ...item.entry,

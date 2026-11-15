@@ -14,6 +14,7 @@ const {
   readJarTextEntry,
   scanLoaderRequirements
 } = require("../src/lib/loader-deps");
+const { buildZip } = require("../test-support/zip");
 
 // Build a real (stored, uncompressed) zip so the reader is exercised against the
 // actual format rather than a stub. Mod jars are just zips with a manifest.
@@ -301,4 +302,132 @@ test("a deflated jar entry is inflated, not just read raw", async (t) => {
   const scan = await scanLoaderRequirements(root, "fabric");
   assert.equal(scan.unreadable.length, 0);
   assert.equal(scan.floor.version, "0.19.3");
+});
+
+// --- jars that are not what they say ------------------------------------------------------
+//
+// A jar is whatever was uploaded. An admin who may manage add-ons chooses every
+// byte of it, and the owner's update panel reads it.
+
+async function modsFolder(t, jars) {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rms-jars-"));
+  t.after(() => fsp.rm(root, { force: true, recursive: true }));
+  for (const [name, bytes] of Object.entries(jars)) {
+    await fsp.writeFile(path.join(root, name), bytes);
+  }
+  return root;
+}
+
+const MANIFEST = JSON.stringify({ depends: { fabricloader: ">=0.15.0" }, id: "bomb", name: "Bomb", version: "1.0.0" });
+
+// Where the list of contents starts in a zip with no comment, and where its
+// one end record is.
+function endRecord(zip) {
+  const at = zip.length - 22;
+  return { at, centralOffset: zip.readUInt32LE(at + 16) };
+}
+
+test("a metadata file that unpacks to far more than a manifest is not unpacked", async (t) => {
+  // Valid JSON all the way: a manifest, then megabytes of spaces. It packs to
+  // a few kilobytes and used to be unpacked whole, however large.
+  const padded = Buffer.concat([Buffer.from(MANIFEST), Buffer.alloc(8 * 1024 * 1024, 0x20)]);
+  const bomb = buildZip([{ data: padded, name: "fabric.mod.json" }]);
+  assert.ok(bomb.length < 16 * 1024, `the jar is ${bomb.length} bytes`);
+  // Stored, not packed: the same limit, met before anything is read.
+  const stored = buildZip([{ data: Buffer.concat([Buffer.from(MANIFEST), Buffer.alloc(1024 * 1024, 0x20)]), method: "store", name: "fabric.mod.json" }]);
+  // Just inside the limit is still read.
+  const large = buildZip([{ data: Buffer.concat([Buffer.from(MANIFEST), Buffer.alloc(1024 * 1024 - MANIFEST.length, 0x20)]), name: "fabric.mod.json" }]);
+
+  const scan = await scanLoaderRequirements(await modsFolder(t, { "bomb.jar": bomb, "large.jar": large, "stored.jar": stored }), "fabric");
+  assert.deepEqual(scan.unreadable, [
+    { fileName: "bomb.jar", reason: "fabric.mod.json is too large to read" },
+    { fileName: "stored.jar", reason: "fabric.mod.json is too large to read" }
+  ]);
+  assert.deepEqual(scan.mods.map((mod) => mod.fileName), ["large.jar"]);
+  assert.equal(scan.floor.version, "0.15.0");
+});
+
+test("a size a jar claims is held against the file before room is made for it", async (t) => {
+  const honest = buildZip([{ data: MANIFEST, name: "fabric.mod.json" }]);
+
+  // The entry says its packed data is 64 MB long, in a jar of a few hundred bytes.
+  const longEntry = Buffer.from(honest);
+  longEntry.writeUInt32LE(64 * 1024 * 1024, endRecord(longEntry).centralOffset + 20);
+
+  // The end record says the list of contents is 32 MB long.
+  const longList = Buffer.from(honest);
+  longList.writeUInt32LE(32 * 1024 * 1024, endRecord(longList).at + 12);
+
+  // And one whose packed data is not packed data at all.
+  const garbage = buildZip([{ data: MANIFEST, method: "store", methodNumber: 8, name: "fabric.mod.json" }]);
+
+  const scan = await scanLoaderRequirements(
+    await modsFolder(t, { "garbage.jar": garbage, "honest.jar": honest, "long-entry.jar": longEntry, "long-list.jar": longList }),
+    "fabric"
+  );
+  assert.deepEqual(scan.unreadable, [
+    { fileName: "garbage.jar", reason: "the archive is damaged: fabric.mod.json cannot be unpacked" },
+    { fileName: "long-entry.jar", reason: "the archive is damaged: fabric.mod.json points outside the file" },
+    { fileName: "long-list.jar", reason: "the archive is damaged: its list of contents points outside the file" }
+  ]);
+  assert.deepEqual(scan.mods.map((mod) => mod.fileName), ["honest.jar"]);
+});
+
+test("a list of contents larger than any mod's is not read", async (t) => {
+  // Three hundred entries with 60,000-byte names: 18 MB of list for one manifest.
+  const entries = Array.from({ length: 300 }, (_unused, index) => ({ name: `${"n".repeat(60_000)}${index}` }));
+  const jar = buildZip([{ data: MANIFEST, name: "fabric.mod.json" }, ...entries]);
+  const scan = await scanLoaderRequirements(await modsFolder(t, { "wide.jar": jar }), "fabric");
+  assert.deepEqual(scan.unreadable, [{ fileName: "wide.jar", reason: "the archive's list of contents is too large to read" }]);
+  assert.deepEqual(scan.mods, []);
+});
+
+test("a bound that is not a version is not treated as one, and nothing long reaches the page", async (t) => {
+  const digits = "9".repeat(100_000);
+  const markup = "<img src=x onerror=alert`1`>";
+  assert.equal(parseFabricPredicate(`>=${digits}`), null);
+  assert.equal(parseFabricPredicate(`>=${"9".repeat(65)}`), null);
+  assert.deepEqual(parseFabricPredicate(`>=${"9".repeat(64)}`), { min: "9".repeat(64), minInclusive: true });
+  // One term that is not a version does not hide the ones that are.
+  assert.equal(parseFabricPredicate(`>=0.15.0 >=${"9".repeat(80)}`).min, "0.15.0");
+  assert.equal(parseFabricPredicate(`>=0.15.0 ${"x ".repeat(400)}`), null);
+  assert.equal(parseMavenRange(`[${markup},)`), null);
+  assert.equal(parseMavenRange(`[47,${markup})`), null);
+  assert.equal(parseMavenRange(`[${digits},)`), null);
+  assert.equal(parseMavenRange(digits), null);
+  for (const notText of [{}, [], true, null, undefined, { toString: () => ">=1" }]) {
+    assert.equal(parseFabricPredicate(notText), null);
+    assert.equal(parseMavenRange(notText), null);
+  }
+  // What people do write is read as before.
+  assert.equal(parseMavenRange("[21.1.1-beta,)").min, "21.1.1-beta");
+  assert.equal(parseMavenRange("[1.20.1-47.2.0,1.21)").exclusiveMax, "1.21");
+  assert.equal(parseFabricPredicate(">=0.16.10 <0.17.0").min, "0.16.10");
+
+  const fabric = await modsFolder(t, {
+    "long.jar": makeJar({
+      "fabric.mod.json": JSON.stringify({ depends: { fabricloader: `>=${digits}`, minecraft: `>=${digits}` }, id: "long", name: "N".repeat(5000), version: "V".repeat(5000) })
+    }),
+    "real.jar": fabricJar("real", "Real", ">=0.16.10", ">=1.20")
+  });
+  const forge = await modsFolder(t, {
+    "markup.jar": makeJar({
+      "META-INF/mods.toml": `[[mods]]\nmodId="x"\ndisplayName="${"D".repeat(4000)}"\nversion="1"\n[[dependencies.x]]\nmodId="forge"\nversionRange="[${markup}${"Z".repeat(3000)},)"\n`
+    }),
+    "real.jar": makeJar({ "META-INF/mods.toml": '[[mods]]\nmodId="real"\nversion="1"\n[[dependencies.real]]\nmodId="forge"\nversionRange="[47.2.0,)"\n' })
+  });
+
+  for (const [folder, loader, floor] of [[fabric, "fabric", "0.16.10"], [forge, "forge", "47.2.0"]]) {
+    const scan = await scanLoaderRequirements(folder, loader);
+    assert.deepEqual(scan.unreadable, []);
+    assert.equal(scan.mods.length, 2);
+    // The jar that names no usable version sets no floor; the other one does.
+    assert.equal(scan.floor.version, floor);
+    assert.deepEqual(scan.floor.requiredBy.map((mod) => mod.fileName), ["real.jar"]);
+    assert.deepEqual(evaluateLoaderCandidate(scan, "0.0.1").conflicts.map((mod) => mod.fileName), ["real.jar"]);
+
+    const longest = (value) =>
+      typeof value === "string" ? value.length : value && typeof value === "object" ? Math.max(0, ...Object.values(value).map(longest)) : 0;
+    assert.ok(longest(scan) <= 200, `${loader}: the longest text in the scan is ${longest(scan)} characters`);
+  }
 });

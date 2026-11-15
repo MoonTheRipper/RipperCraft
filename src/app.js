@@ -14,7 +14,7 @@ const {
   staticFileHeaders
 } = require("./lib/http");
 const { createServerManager } = require("./lib/servers");
-const { createWorldManager } = require("./lib/worlds");
+const { createWorldManager, resolveWorldLimitBytes } = require("./lib/worlds");
 const { createModManager } = require("./lib/mod-sources");
 const { createJobRegistry } = require("./lib/jobs");
 const { clientAddress, isHttpsRequest } = require("./lib/peer");
@@ -58,6 +58,16 @@ function textOf(value) {
 
 function isBlank(value) {
   return !textOf(value).trim();
+}
+
+// The name of an add-on file, as the browser sends it back from the list it
+// was shown. Text, or the request is refused: anything else would be turned
+// into some name or other further in, and acted on.
+function addonFileName(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new HttpError(400, "An add-on file name is required.");
+  }
+  return value;
 }
 
 // Applies to every password that is set from now on: the owner's at setup, a
@@ -141,9 +151,15 @@ async function createApp(rootDir = process.cwd(), options = {}) {
   await store.ensureInitialized();
 
   const sessionManager = createSessionManager(() => store.getAppConfig());
-  const serverManager = createServerManager(store);
-  const worldManager = createWorldManager(serverManager);
+  // options.outbound replaces the fetcher everything remote goes through; the
+  // default is the checked one in lib/outbound.js.
+  const serverManager = createServerManager(store, { outbound: options.outbound });
+  const worldManager = createWorldManager(serverManager, {
+    logger,
+    worldLimitBytes: options.worldLimitBytes || resolveWorldLimitBytes(logger)
+  });
   const modManager = createModManager(serverManager, {
+    outbound: options.outbound,
     readIntegrations: () => store.getIntegrations()
   });
   const jobs = createJobRegistry();
@@ -954,19 +970,8 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               await serverManager.writeServerProperties(serverId, body.propertiesText);
             }
           } else {
-            const addonSettings =
-              body.addonSettings && typeof body.addonSettings === "object" ? body.addonSettings : null;
-            if (addonSettings) {
-              if (!serverManager.userCanManageAddons(context.user, server)) {
-                json(res, 403, { error: "You do not have permission to change add-on settings for this server." });
-                return;
-              }
-              await serverManager.setServerMetadata(serverId, {
-                loader: addonSettings.loader,
-                minecraftVersion: addonSettings.minecraftVersion
-              });
-            }
-
+            // Refused before anything is saved: a request that also carried
+            // add-on settings used to have those applied first.
             if (
               typeof body.propertiesText === "string" ||
               typeof body.passphrase === "string" ||
@@ -983,13 +988,27 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               return;
             }
 
+            const addonSettings =
+              body.addonSettings && typeof body.addonSettings === "object" ? body.addonSettings : null;
             const safeProperties =
               body.safeProperties && typeof body.safeProperties === "object" ? body.safeProperties : null;
             if (!safeProperties && !addonSettings) {
               json(res, 400, { error: "Safe server settings are required." });
               return;
             }
+            if (addonSettings && !serverManager.userCanManageAddons(context.user, server)) {
+              json(res, 403, { error: "You do not have permission to change add-on settings for this server." });
+              return;
+            }
 
+            if (addonSettings) {
+              // The loader and version are checked inside setServerMetadata,
+              // like every other change to a server record.
+              await serverManager.setServerMetadata(serverId, {
+                loader: addonSettings.loader,
+                minecraftVersion: addonSettings.minecraftVersion
+              });
+            }
             if (safeProperties) {
               await serverManager.writeSafeAdminProperties(serverId, safeProperties);
             }
@@ -1183,10 +1202,17 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               return;
             }
             const archivePath = await serverManager.readWorldArchivePath(serverId, archiveName);
-            const sent = await sendFile(res, archivePath, {
-              "Content-Disposition": `attachment; filename="${path.basename(archivePath)}"`,
-              "Content-Type": "application/zip"
-            });
+            // Only a file that is really in the library: a link left there
+            // under an archive's name is not followed to whatever it points at.
+            const sent = await sendFile(
+              res,
+              archivePath,
+              {
+                "Content-Disposition": `attachment; filename="${path.basename(archivePath)}"`,
+                "Content-Type": "application/zip"
+              },
+              { followLinks: false }
+            );
             if (!sent) {
               json(res, 404, { error: "That world archive does not exist." });
             }
@@ -1303,15 +1329,20 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               return;
             }
             const body = await parseJsonBody(req);
-            const names = Array.isArray(body.fileNames)
+            const requested = Array.isArray(body.fileNames)
               ? body.fileNames
               : body.fileName
                 ? [body.fileName]
                 : [];
-            if (!names.length) {
+            if (!requested.length) {
               json(res, 400, { error: "At least one add-on file name is required." });
               return;
             }
+            if (requested.length > 500) {
+              json(res, 400, { error: "That is more add-ons than can be updated in one request." });
+              return;
+            }
+            const names = requested.map(addonFileName);
 
             // Update each independently so one failure does not abandon the rest.
             const results = [];
@@ -1344,7 +1375,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               return;
             }
             const body = await parseJsonBody(req);
-            const removed = await serverManager.removeAddonFiles(serverId, [body.fileName]);
+            const removed = await serverManager.removeAddonFiles(serverId, [addonFileName(body.fileName)]);
             json(res, 200, { mods: await serverManager.listInstalledFiles(serverId), removed });
             return;
           }
@@ -1359,7 +1390,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
               return;
             }
             const body = await parseJsonBody(req);
-            const mods = await serverManager.setAddonEnabled(serverId, body.fileName, body.enabled === true);
+            const mods = await serverManager.setAddonEnabled(serverId, addonFileName(body.fileName), body.enabled === true);
             json(res, 200, { mods });
             return;
           }

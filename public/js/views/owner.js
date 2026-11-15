@@ -19,7 +19,7 @@ export function renderCreateProgress() {
     `
       <p>${escapeHtml(job.step || "working")}…</p>
       <div class="progress-track" role="progressbar" aria-valuenow="${percent}" aria-valuemin="0" aria-valuemax="100">
-        <div class="progress-track__fill" style="width: ${percent}%"></div>
+        <div class="progress-track__fill" data-progress="${percent}"></div>
       </div>
       <p class="muted">${percent}% • forge and neoforge run a real installer, so that step alone takes about 25 seconds. leaving this page does not cancel it.</p>
     `

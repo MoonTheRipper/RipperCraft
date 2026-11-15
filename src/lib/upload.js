@@ -51,6 +51,13 @@ function isUploadTempName(name) {
   return TEMP_NAME.test(name);
 }
 
+// A fresh name for a file that is still arriving in `directory`. A download
+// from another server uses the same names as an upload from a browser, so the
+// two are hidden from listings and cleared up after a crash in the same way.
+function newUploadTempPath(directory) {
+  return path.join(directory, `.upload-${crypto.randomBytes(8).toString("hex")}.part`);
+}
+
 function multipartBoundary(contentType) {
   const header = String(contentType || "");
   if (!/^multipart\/form-data\s*(;|$)/i.test(header)) {
@@ -447,7 +454,7 @@ async function receiveUpload(req, options) {
   async function openTemp() {
     await ensureDir(directory);
     await removeStaleTempFiles(directory);
-    const candidate = path.join(directory, `.upload-${crypto.randomBytes(8).toString("hex")}.part`);
+    const candidate = newUploadTempPath(directory);
     // The default mode, so the finished file ends up with the permissions a
     // plain write gave it before.
     const handle = await fsp.open(candidate, "wx");
@@ -528,7 +535,9 @@ module.exports = {
   MultipartReceiver,
   isUploadTempName,
   multipartBoundary,
+  newUploadTempPath,
   parseContentDisposition,
   receiveUpload,
+  removeStaleTempFiles,
   resolveUploadLimitBytes
 };

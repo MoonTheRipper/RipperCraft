@@ -20,6 +20,59 @@ function readEnv(name, fallbackValue = "") {
   return fallbackValue;
 }
 
+// What a process the dashboard starts is given from the dashboard's own
+// environment. Everything else stays behind.
+//
+// A game server runs mods, and a loader installer is a jar from the internet:
+// both are other people's code. They used to inherit the dashboard's whole
+// environment - the CurseForge key, and whatever else the service was started
+// with - where any mod could read it. So a child gets a list instead: what a
+// program needs to run at all, what Java reads, and the three variables the
+// launch scripts look at to find Java.
+const CHILD_ENVIRONMENT_NAMES = new Set([
+  // Finding programs, the home directory, and who is running.
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "TMPDIR",
+  // Language, character set and time zone. Java takes its file-name encoding
+  // from these; without them a world or a mod with an accent in its name is
+  // mangled.
+  "LANG",
+  "LANGUAGE",
+  "TZ",
+  // Where Java is, as the generated launch scripts and hand-written ones from
+  // before the rename look for it.
+  "JAVA_HOME",
+  `${ENV_PREFIX}JAVA_BIN`,
+  `${LEGACY_ENV_PREFIX}JAVA_BIN`,
+  // Options the JVM itself reads from its environment. Whoever set them for
+  // the service set them for the servers it runs.
+  "JAVA_TOOL_OPTIONS",
+  "JDK_JAVA_OPTIONS",
+  "_JAVA_OPTIONS"
+]);
+// LC_ALL, LC_CTYPE and the rest of the locale family.
+const CHILD_ENVIRONMENT_PREFIXES = ["LC_"];
+
+// The environment for a child process: the listed variables as the dashboard
+// has them, then `extra` - whatever the dashboard sets for this child on
+// purpose, such as a server's own Java.
+function childEnvironment(extra = {}, source = process.env) {
+  const environment = {};
+  for (const [name, value] of Object.entries(source)) {
+    if (value === undefined) {
+      continue;
+    }
+    if (CHILD_ENVIRONMENT_NAMES.has(name) || CHILD_ENVIRONMENT_PREFIXES.some((prefix) => name.startsWith(prefix))) {
+      environment[name] = value;
+    }
+  }
+  return { ...environment, ...extra };
+}
+
 async function ensureDir(targetPath) {
   await fs.mkdir(targetPath, { recursive: true });
 }
@@ -184,11 +237,15 @@ function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+// Runs a program and resolves to what it printed. It is given the minimal
+// environment above, never the dashboard's own: zip reads options from its
+// environment, a Java installer is somebody else's code, and neither has any
+// use for the dashboard's settings.
 async function runCommand(command, args, options = {}) {
   return await new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
-      env: options.env || process.env,
+      env: options.env || childEnvironment(),
       stdio: ["ignore", "pipe", "pipe"]
     });
 
@@ -251,6 +308,7 @@ function withinParent(parentPath, childPath) {
 module.exports = {
   ENV_PREFIX,
   LEGACY_ENV_PREFIX,
+  childEnvironment,
   coerceBoolean,
   createMutex,
   displayNameFromSlug,

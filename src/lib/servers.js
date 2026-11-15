@@ -5,7 +5,8 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 const { hashSecret, verifySecret } = require("./auth");
-const { isUploadTempName } = require("./upload");
+const { getDefaultOutbound } = require("./outbound");
+const { isUploadTempName, newUploadTempPath } = require("./upload");
 const {
   compareVersions,
   evaluateLoaderCandidate,
@@ -16,6 +17,7 @@ const {
 const {
   ENV_PREFIX,
   LEGACY_ENV_PREFIX,
+  childEnvironment,
   coerceBoolean,
   displayNameFromSlug,
   ensureDir,
@@ -30,6 +32,21 @@ const {
   withinParent,
   writeJson
 } = require("./utils");
+const {
+  integerInRange,
+  invalid,
+  isArgFilePath,
+  displayText,
+  httpsAddress,
+  isMemorySetting,
+  isMinecraftVersion,
+  normalizeLoader,
+  normalizeMemory,
+  normalizeMinecraftVersion,
+  plainText,
+  propertyValue,
+  singleLine
+} = require("./validate");
 
 const MOJANG_MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 const PAPER_DOWNLOADS_API = "https://fill.papermc.io/v3";
@@ -50,7 +67,6 @@ const COMBINED_UPDATE_LOADERS = new Set(["vanilla", "paper", "purpur", "fabric",
 // back - without the game version changing at all.
 const LOADER_VERSIONED_LOADERS = new Set(["fabric", "forge", "neoforge"]);
 const FORGE_MAVEN_METADATA_URL = `${FORGE_MAVEN}/maven-metadata.xml`;
-const REMOTE_USER_AGENT = readEnv("USER_AGENT", "RipperCraft/0.1 (https://github.com/MoonTheRipper/RipperCraft)");
 const DEFAULT_EXISTING_START_COMMAND = "./launch-server.sh";
 const DEFAULT_MANAGED_START_COMMAND = "./.rippermoon/launch-server.sh";
 const SAFE_ADMIN_SETTING_DEFINITIONS = [
@@ -72,7 +88,10 @@ const SAFE_ADMIN_SETTING_DEFINITIONS = [
 ];
 const SAFE_ADMIN_SETTING_KEYS = new Set(SAFE_ADMIN_SETTING_DEFINITIONS.map((definition) => definition.key));
 
-function createServerManager(store) {
+function createServerManager(store, options = {}) {
+  // Everything this file fetches from another machine - version lists, server
+  // jars, installers, add-ons - goes through the one checked fetcher.
+  const outbound = options.outbound || getDefaultOutbound();
   const serversRoot = path.join(store.rootDir, "servers");
   const runningChildren = new Map();
   const versionCatalogCache = {
@@ -90,44 +109,16 @@ function createServerManager(store) {
   // that to one request.
   const loaderCatalogCache = new Map();
 
-  function withRemoteHeaders(headers = {}) {
-    return {
-      "User-Agent": REMOTE_USER_AGENT,
-      ...headers
-    };
+  async function fetchJson(url, requestOptions = {}) {
+    return await outbound.fetchJson(url, { headers: requestOptions.headers });
   }
 
-  async function fetchJson(url, options = {}) {
-    const response = await fetch(url, {
-      ...options,
-      headers: withRemoteHeaders(options.headers || {})
-    });
-    if (!response.ok) {
-      throw new Error(`Request failed with status ${response.status}.`);
-    }
-    return await response.json();
+  async function fetchText(url, requestOptions = {}) {
+    return await outbound.fetchText(url, { headers: requestOptions.headers });
   }
 
-  async function fetchText(url, options = {}) {
-    const response = await fetch(url, {
-      ...options,
-      headers: withRemoteHeaders(options.headers || {})
-    });
-    if (!response.ok) {
-      throw new Error(`Request failed with status ${response.status}.`);
-    }
-    return await response.text();
-  }
-
-  async function fetchBuffer(url, options = {}) {
-    const response = await fetch(url, {
-      ...options,
-      headers: withRemoteHeaders(options.headers || {})
-    });
-    if (!response.ok) {
-      throw new Error(`Download failed with status ${response.status}.`);
-    }
-    return Buffer.from(await response.arrayBuffer());
+  async function fetchBuffer(url, requestOptions = {}) {
+    return await outbound.fetchBuffer(url, { headers: requestOptions.headers });
   }
 
   function serializeManagedRuntime(managedRuntime) {
@@ -233,17 +224,35 @@ function createServerManager(store) {
       return coerceBoolean(value) ? "true" : "false";
     }
 
+    // A number or one of a few words, sent as text or as a number. An object
+    // or a list is neither, and is not asked to turn itself into text: one
+    // that could not answered the request with a server fault.
     if (definition.type === "number") {
-      const text = String(value).trim();
+      const text = (plainText(value) ?? "").trim();
       return /^-?\d+$/.test(text) ? text : definition.defaultValue;
     }
 
     if (definition.type === "enum") {
-      const text = String(value).trim().toLowerCase();
+      const text = (plainText(value) ?? "").trim().toLowerCase();
       return definition.options.includes(text) ? text : definition.defaultValue;
     }
 
-    return String(value);
+    // Free text, which is what makes it the one to check: it goes into the
+    // file as typed, and a line break in it would start a line of its own.
+    return propertyValue(value, `The ${definition.key} setting`, { maxLength: 512 });
+  }
+
+  // The first lines of a new server.properties. The name is the owner's, and
+  // has been through the record's checks; it is held to the file's as well,
+  // and a name that cannot be a value there is replaced by the plain id.
+  function initialPropertiesText(name, fallbackName, port = 25565) {
+    let motd;
+    try {
+      motd = propertyValue(name, "The server name");
+    } catch {
+      motd = displayNameFromSlug(safeFilename(fallbackName));
+    }
+    return `motd=${motd}\nserver-port=${integerInRange(port, "The server port", 1, 65535)}\n`;
   }
 
   async function fetchMinecraftVersionManifest() {
@@ -286,11 +295,12 @@ function createServerManager(store) {
   }
 
   async function resolveRequestedReleaseVersion(version) {
+    // The version asked for in an update or an adoption. It goes into request
+    // paths and, once the runtime is installed, into the record; checked here
+    // it is refused before anything is fetched rather than after.
+    const requested = !version || version === "latest" ? "" : normalizeMinecraftVersion(version, "The target Minecraft version");
     const manifest = await fetchMinecraftVersionManifest();
-    if (!version || version === "latest") {
-      return manifest.latest.release;
-    }
-    return String(version).trim();
+    return requested || manifest.latest.release;
   }
 
   async function listServerDirectories() {
@@ -395,6 +405,16 @@ function createServerManager(store) {
 
     return {
       ...withDirectory,
+      // These four are shown in the browser and read all over this file as
+      // text. A record written before they were checked on the way in could
+      // hold anything JSON can, so one that is not text is replaced here.
+      description: typeof withDirectory.description === "string" ? withDirectory.description : "",
+      loader: typeof withDirectory.loader === "string" ? withDirectory.loader : "vanilla",
+      minecraftVersion: typeof withDirectory.minecraftVersion === "string" ? withDirectory.minecraftVersion : "unknown",
+      name:
+        typeof withDirectory.name === "string" && withDirectory.name
+          ? withDirectory.name
+          : displayNameFromSlug(recordId),
       javaBin: String(withDirectory.javaBin || "").trim(),
       logFile: normalizeServerRelativePath(withDirectory, withDirectory.logFile, "logs/latest.log"),
       modsDir: normalizeServerRelativePath(withDirectory, withDirectory.modsDir, "mods"),
@@ -599,7 +619,9 @@ function createServerManager(store) {
       }
 
       const relativeDirectory = path.join("servers", directoryName);
-      const version = await detectVersion(path.join(store.rootDir, relativeDirectory));
+      // Read from the server's own log or jar link, which a mod can write.
+      const detected = await detectVersion(path.join(store.rootDir, relativeDirectory));
+      const version = isMinecraftVersion(detected) ? detected : "unknown";
       records[directoryName] = {
         id: directoryName,
         name: displayNameFromSlug(directoryName),
@@ -801,13 +823,75 @@ function createServerManager(store) {
     return trimmed;
   }
 
+  // Checks a change to a server record, field by field, and returns it ready to
+  // store. Every caller goes through here - the settings route for owners and
+  // admins alike, and this file's own runtime updates - so no route can hand a
+  // record something that was never looked at.
+  //
+  // A field that is absent or undefined is left out of the result, and so
+  // keeps the value the record already has. It used to be written as
+  // undefined, which dropped it from the record: saving only a Minecraft
+  // version erased the loader.
+  function checkMetadataPatch(patch) {
+    const checked = {};
+    for (const [field, value] of Object.entries(patch || {})) {
+      if (value === undefined) {
+        continue;
+      }
+      switch (field) {
+        case "name":
+          checked.name = singleLine(value, "The server name", { maxLength: 80, required: true });
+          break;
+        case "description":
+          checked.description = singleLine(value, "The description", { maxLength: 500 });
+          break;
+        case "loader":
+          checked.loader = normalizeLoader(value);
+          break;
+        case "minecraftVersion":
+          checked.minecraftVersion = normalizeMinecraftVersion(value);
+          break;
+        case "startCommand":
+          checked.startCommand = singleLine(value, "The start command", { maxLength: 1000 });
+          break;
+        case "javaBin":
+          if (plainText(value) === null) {
+            throw invalid("The Java binary must be a path, written as text.");
+          }
+          checked.javaBin = plainText(value);
+          break;
+        case "passphrase":
+          if (typeof value !== "string") {
+            throw invalid("The passphrase must be text.");
+          }
+          checked.passphrase = value;
+          break;
+        // Both are written into the launch script.
+        case "maxMemory":
+          checked.maxMemory = normalizeMemory(value, "Max memory");
+          break;
+        case "minMemory":
+          checked.minMemory = normalizeMemory(value, "Min memory");
+          break;
+        // Written by this file after it has provisioned a runtime, never taken
+        // from a request body.
+        case "managedRuntime":
+          checked.managedRuntime = value;
+          break;
+        default:
+          throw new Error(`Server records have no "${field}" field that can be changed here.`);
+      }
+    }
+    return checked;
+  }
+
   async function setServerMetadata(serverId, patch) {
     const server = await getServer(serverId);
     if (!server) {
       throw new Error("Server not found.");
     }
 
-    const nextPatch = { ...patch };
+    const nextPatch = checkMetadataPatch(patch);
     if (nextPatch.javaBin !== undefined) {
       nextPatch.javaBin = await validateJavaBin(nextPatch.javaBin);
     }
@@ -900,12 +984,16 @@ function createServerManager(store) {
   async function writeSafeAdminProperties(serverId, nextSafeProperties) {
     const propertyMap = parseServerPropertiesText(await readServerProperties(serverId));
 
+    // Every value is checked before the file is touched, so a refused one
+    // leaves all of them as they were.
+    const checked = {};
     for (const definition of SAFE_ADMIN_SETTING_DEFINITIONS) {
-      if (!(definition.key in nextSafeProperties)) {
+      if (!Object.hasOwn(nextSafeProperties, definition.key)) {
         continue;
       }
-      propertyMap[definition.key] = normalizeAdminSettingValue(definition, nextSafeProperties[definition.key]);
+      checked[definition.key] = normalizeAdminSettingValue(definition, nextSafeProperties[definition.key]);
     }
+    Object.assign(propertyMap, checked);
 
     await writeServerProperties(serverId, serializeServerProperties(propertyMap));
     return await readSafeAdminProperties(serverId);
@@ -943,19 +1031,22 @@ function createServerManager(store) {
   // On an online-mode server an offline UUID can never match a real player: the
   // operator silently has no powers. Resolve the real one from Mojang instead.
   async function resolveMojangUuid(name) {
-    const response = await fetch(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(name)}`, {
-      headers: withRemoteHeaders()
-    });
+    const response = await outbound.get(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(name)}`);
     if (response.status === 404 || response.status === 204) {
       throw userFacingError(`No Minecraft account named "${name}" exists. Check the spelling.`, 404);
     }
-    if (!response.ok) {
+    if (response.status < 200 || response.status > 299) {
       throw userFacingError(
         `Could not reach Mojang to look up "${name}" (HTTP ${response.status}). Try again in a moment.`,
         502
       );
     }
-    const payload = await response.json();
+    let payload = {};
+    try {
+      payload = JSON.parse(response.buffer.toString("utf8")) || {};
+    } catch {
+      // Falls through to the "unexpected id" answer below.
+    }
     const raw = String(payload.id || "").replace(/-/g, "");
     if (raw.length !== 32) {
       throw userFacingError(`Mojang returned an unexpected id for "${name}".`, 502);
@@ -970,27 +1061,46 @@ function createServerManager(store) {
     return offlinePlayerUuid(name);
   }
 
+  // One operator out of ops.json. That file is the server's as much as the
+  // dashboard's - the game writes it, and so can anything else the server
+  // runs - and the owner's page draws what is in it. An entry is a record with
+  // a name that is text; anything else in the list is not an operator.
   function normalizeOperator(entry) {
-    const name = String(entry && entry.name ? entry.name : "").trim();
-    const uuid = String(entry && entry.uuid ? entry.uuid : "").trim().toLowerCase();
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return null;
+    }
+    const name = displayText(entry.name, 64);
+    const uuid = displayText(entry.uuid, 64).toLowerCase();
     if (!name) {
       return null;
     }
+    const level = typeof entry.level === "number" || typeof entry.level === "string" ? Number.parseInt(entry.level, 10) : NaN;
     return {
       uuid: uuid || offlinePlayerUuid(name),
       name,
-      level: Math.min(4, Math.max(1, Number.parseInt(entry.level, 10) || 4)),
+      level: Math.min(4, Math.max(1, level || 4)),
       bypassesPlayerLimit: entry.bypassesPlayerLimit === true
     };
   }
 
-  async function listServerOperators(serverId) {
+  // The operators in ops.json. For showing them, a file that cannot be read as
+  // a list counts as an empty one, so that it cannot keep the server's page
+  // from loading. `forChange` is for the routes that go on to write the list
+  // back: they stop instead, and leave a file they could not read as it is.
+  async function listServerOperators(serverId, { forChange = false } = {}) {
     const server = await getServer(serverId);
     if (!server) {
       throw new Error("Server not found.");
     }
     const paths = resolveRecordPaths(server);
-    const payload = await readJson(paths.opsFile, []);
+    let payload = [];
+    try {
+      payload = await readJson(paths.opsFile, []);
+    } catch {
+      if (forChange) {
+        throw userFacingError("This server's ops.json could not be read, so it has been left as it is. Correct or remove the file, then try again.");
+      }
+    }
     const onlineMode = await serverIsOnlineMode(serverId);
     const expected = onlineMode ? "online" : "offline";
     return (Array.isArray(payload) ? payload : [])
@@ -1042,7 +1152,7 @@ function createServerManager(store) {
       throw userFacingError("Choose an op level between 1 and 4 for this operator.", 400);
     }
 
-    const current = await listServerOperators(serverId);
+    const current = await listServerOperators(serverId, { forChange: true });
     // Always derive the uuid from the server's auth mode rather than trusting
     // whatever the caller sent, so the entry can actually match a player.
     const uuid = await resolveOperatorUuid(serverId, name);
@@ -1053,7 +1163,7 @@ function createServerManager(store) {
   // Rewrites existing operators to the uuid form the server's auth mode needs.
   // Fixes entries added before the mode was known or changed afterwards.
   async function repairServerOperators(serverId) {
-    const current = await listServerOperators(serverId);
+    const current = await listServerOperators(serverId, { forChange: true });
     const next = [];
     const failures = [];
     let repaired = 0;
@@ -1078,7 +1188,7 @@ function createServerManager(store) {
 
   async function removeServerOperator(serverId, uuid) {
     const targetUuid = String(uuid || "").trim().toLowerCase();
-    const current = await listServerOperators(serverId);
+    const current = await listServerOperators(serverId, { forChange: true });
     return await writeServerOperators(
       serverId,
       current.filter((operator) => operator.uuid !== targetUuid)
@@ -1122,7 +1232,10 @@ function createServerManager(store) {
     // of a bare filename. Files with no manifest entry were dropped in by hand
     // and stay deliberately bare - there is nothing truthful to show for them.
     const manifest = await readAddonManifest(serverId);
-    const detailsByFileName = new Map(manifest.map((entry) => [entry.fileName, entry]));
+    const detailsByFileName = new Map(manifest.filter(Boolean).map((entry) => [entry.fileName, entry]));
+    // The manifest is a file in the server's folder, and the page draws these
+    // fields. Whatever the file holds, what is sent to the page is text.
+    const text = (value, fallback = "") => (typeof value === "string" && value ? value : fallback);
 
     return [...active, ...disabled]
       .map((entry) => {
@@ -1132,13 +1245,14 @@ function createServerManager(store) {
         }
         return {
           ...entry,
-          clientSide: tracked.clientSide || "unknown",
-          iconUrl: tracked.iconUrl || "",
-          pageUrl: tracked.pageUrl || "",
-          provider: tracked.provider || "",
-          serverSide: tracked.serverSide || "unknown",
-          sourceId: tracked.sourceId || "",
-          title: tracked.title || "",
+          clientSide: text(tracked.clientSide, "unknown"),
+          // A picture the page loads and a link it offers: https, or neither.
+          iconUrl: httpsAddress(tracked.iconUrl),
+          pageUrl: httpsAddress(tracked.pageUrl),
+          provider: text(tracked.provider),
+          serverSide: text(tracked.serverSide, "unknown"),
+          sourceId: text(tracked.sourceId),
+          title: text(tracked.title),
           tracked: true
         };
       })
@@ -1151,8 +1265,25 @@ function createServerManager(store) {
       throw new Error("Server not found.");
     }
     const paths = resolveRecordPaths(server);
-    const payload = await readJson(paths.addonManifestFile, { addons: [] });
-    return Array.isArray(payload.addons) ? payload.addons : [];
+    // A manifest that cannot be read at all tracks nothing: every add-on shows
+    // as one dropped in by hand, and the next install writes the file afresh.
+    let payload = null;
+    try {
+      payload = await readJson(paths.addonManifestFile, null);
+    } catch {
+      payload = null;
+    }
+    const addons = payload && typeof payload === "object" && Array.isArray(payload.addons) ? payload.addons : [];
+    // An entry is the record of one file, and each field of it is a word, a
+    // number or a yes/no. The manifest sits in the server's folder, so it can
+    // hold anything. What is not a record with a file name is not an entry,
+    // and a field holding anything else is left out - here, once, so that no
+    // reader of the manifest (the add-on list, the update check, the update
+    // plan) passes an object on to a page that expects text.
+    const plain = (value) => value === null || typeof value === "string" || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value));
+    return addons
+      .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry) && typeof entry.fileName === "string")
+      .map((entry) => Object.fromEntries(Object.entries(entry).filter(([, value]) => plain(value))));
   }
 
   async function writeAddonManifest(serverId, addons) {
@@ -1273,19 +1404,56 @@ function createServerManager(store) {
     return path.basename(targetFile);
   }
 
-  async function downloadAndInstallFile(serverId, url, fileNameHint) {
-    const response = await fetch(url, { redirect: "follow" });
-    if (!response.ok) {
-      throw new Error(`Download failed with status ${response.status}.`);
+  // Downloads a file into the server's add-on folder under a temporary name and
+  // resolves to { path, size }. The caller renames it into place, or removes it.
+  //
+  // It is written to disk as it arrives and never held in memory, stops at the
+  // download limit, and - like everything fetched from another machine - only
+  // comes from an https address on the public internet.
+  async function downloadAddonToTempFile(serverId, url) {
+    const server = await getServer(serverId);
+    if (!server) {
+      throw new Error("Server not found.");
     }
-    const buffer = Buffer.from(await response.arrayBuffer());
-    const parsedUrl = new URL(url);
+    const paths = resolveRecordPaths(server);
+    await ensureDir(paths.modsDir);
+    const tempPath = newUploadTempPath(paths.modsDir);
+    let sink = null;
+    try {
+      // The file is only created once there is a response to put in it.
+      const size = await outbound.download(url, () => {
+        sink = fs.createWriteStream(tempPath, { flags: "wx" });
+        return sink;
+      });
+      return { path: tempPath, size };
+    } catch (error) {
+      if (sink) {
+        // Removed after the stream has let go of it, not before it exists.
+        sink.destroy();
+        if (!sink.closed) {
+          await new Promise((resolve) => sink.once("close", resolve));
+        }
+        await fsp.rm(tempPath, { force: true });
+      }
+      throw error;
+    }
+  }
+
+  async function downloadAndInstallFile(serverId, url, fileNameHint) {
+    // Refused here, before anything is created, if it is not an https address.
+    const parsedUrl = outbound.parseAddress(url);
     const fallbackName = path.basename(parsedUrl.pathname) || "download.jar";
-    const installedName = await installManagedFile(serverId, fileNameHint || fallbackName, buffer);
-    return {
-      fileName: installedName,
-      size: buffer.length
-    };
+    const downloaded = await downloadAddonToTempFile(serverId, parsedUrl.href);
+    try {
+      const installedName = await installManagedFileFromPath(serverId, fileNameHint || fallbackName, downloaded.path);
+      return {
+        fileName: installedName,
+        size: downloaded.size
+      };
+    } catch (error) {
+      await fsp.rm(downloaded.path, { force: true });
+      throw error;
+    }
   }
 
   async function resolveVanillaRuntime(version) {
@@ -1803,7 +1971,29 @@ function createServerManager(store) {
     );
   }
 
-  function buildLaunchScript(minMemory = "2G", maxMemory = "4G", launch = null) {
+  // Three values are written into the script: the two memory sizes and, for
+  // Forge and NeoForge, the path of the argfile. All three sit inside double
+  // quotes in a bash script, where a quote, a "$(...)" or a backtick in the
+  // value would be a command. The settings route checks the memory sizes on
+  // the way in; this checks all three again on the way out, so a record that
+  // was written before that - or edited by hand - cannot put anything else
+  // into a script that is about to be run. Nothing is escaped: a value is
+  // either of the right shape or the script is not written.
+  function buildLaunchScript(minMemoryValue, maxMemoryValue, launch = null) {
+    const minMemory = minMemoryValue || "2G";
+    const maxMemory = maxMemoryValue || "4G";
+    for (const [label, value] of [["min memory", minMemory], ["max memory", maxMemory]]) {
+      if (!isMemorySetting(value)) {
+        throw userFacingError(
+          `This server's ${label} setting is not a memory size the dashboard will write into a launch script. Set it to a whole number followed by K, M or G, such as 4G, in the server's settings.`
+        );
+      }
+    }
+    if (launch && launch.kind === "argfile" && launch.argFile && !isArgFilePath(launch.argFile)) {
+      throw userFacingError(
+        "This server's recorded loader argfile is not a plain path inside the server folder, so no launch script was written for it. Reinstall the loader from the update panel."
+      );
+    }
     const launchLine = buildLaunchLine(launch);
     return `#!/usr/bin/env bash
 
@@ -1915,11 +2105,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     }
 
     if (!(await exists(paths.propertiesFile))) {
-      await fsp.writeFile(
-        paths.propertiesFile,
-        `motd=${server.name || displayNameFromSlug(server.id)}\nserver-port=25565\n`,
-        "utf8"
-      );
+      await fsp.writeFile(paths.propertiesFile, initialPropertiesText(server.name, server.id), "utf8");
     }
 
     await fsp.writeFile(paths.managedLaunchScript, getManagedLaunchScriptContents(server), "utf8");
@@ -2007,9 +2193,26 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     };
   }
 
+  // A field of the create-server form read as text. Left blank it is "", and
+  // the caller supplies the default; given as anything but text it is refused.
+  function optionalText(value, label) {
+    if (value === undefined || value === null || value === "") {
+      return "";
+    }
+    const text = plainText(value);
+    if (text === null) {
+      throw invalid(`${label} must be text.`);
+    }
+    return text.trim();
+  }
+
   async function createServer(spec, actor, options = {}) {
     const reportProgress = typeof options.onProgress === "function" ? options.onProgress : () => {};
-    const serverId = safeFilename(spec.serverId || spec.directoryName || spec.name);
+    const serverId = safeFilename(
+      optionalText(spec.serverId, "The server id") ||
+        optionalText(spec.directoryName, "The directory name") ||
+        optionalText(spec.name, "The server name")
+    );
     if (!serverId) {
       throw new Error("A server name is required.");
     }
@@ -2017,7 +2220,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       throw new Error("A server with that id already exists.");
     }
 
-    const directoryName = safeFilename(spec.directoryName || serverId);
+    const directoryName = safeFilename(optionalText(spec.directoryName, "The directory name") || serverId);
     const relativeDirectory = path.join("servers", directoryName);
     const serverDir = path.resolve(store.rootDir, relativeDirectory);
     if (!withinParent(serversRoot, serverDir)) {
@@ -2025,11 +2228,39 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     }
 
     const mode = spec.mode === "existing" ? "existing" : "managed";
-    const requestedLoader = String(spec.loader || "vanilla").trim().toLowerCase() || "vanilla";
+    // The whole request body arrives here as `spec`. Everything in it that is
+    // stored in the record or written into a file is checked now, before any
+    // folder is created or anything is downloaded.
+    const details = checkMetadataPatch({
+      description: optionalText(spec.description, "The description"),
+      loader: optionalText(spec.loader, "The loader") || "vanilla",
+      maxMemory: optionalText(spec.maxMemory, "Max memory") || "4G",
+      minMemory: optionalText(spec.minMemory, "Min memory") || "2G",
+      minecraftVersion: optionalText(spec.minecraftVersion, "The Minecraft version"),
+      name: optionalText(spec.name, "The server name") || displayNameFromSlug(serverId),
+      startCommand: optionalText(spec.startCommand, "The start command")
+    });
+    const requestedLoader = details.loader;
+    const port = optionalText(spec.port, "The server port")
+      ? integerInRange(spec.port, "The server port", 1, 65535)
+      : 25565;
+    const filePaths = {
+      logFile: optionalText(spec.logFile, "The log file") || "logs/latest.log",
+      modsDir: optionalText(spec.modsDir, "The add-on folder") || "mods",
+      serverPropertiesFile: optionalText(spec.serverPropertiesFile, "The properties file") || "server.properties",
+      worldDir: optionalText(spec.worldDir, "The world folder") || "world"
+    };
+    for (const [field, value] of Object.entries(filePaths)) {
+      filePaths[field] = singleLine(value, `The ${field} path`, { maxLength: 200 });
+    }
+    if (spec.passphrase !== undefined && spec.passphrase !== null && typeof spec.passphrase !== "string") {
+      throw invalid("The passphrase must be text.");
+    }
     // Validate before provisioning: Forge and NeoForge run their installer with
     // this JDK, so a bad path should fail before anything is downloaded.
-    const javaBin = await validateJavaBin(spec.javaBin);
-    const effectiveLoader = mode === "existing" ? requestedLoader : requestedLoader;
+    const javaBin = await validateJavaBin(optionalText(spec.javaBin, "The Java binary"));
+    let minecraftVersion = details.minecraftVersion;
+    let managedRuntime = null;
     if (mode === "existing") {
       if (!(await exists(serverDir))) {
         throw new Error(`Existing server directory not found: ${relativeDirectory}`);
@@ -2047,25 +2278,30 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       await ensureDir(path.join(serverDir, "plugins"));
       await ensureDir(path.join(serverDir, ".rippermoon"));
       await fsp.writeFile(path.join(serverDir, "eula.txt"), "eula=false\n", "utf8");
-      await fsp.writeFile(path.join(serverDir, "server.properties"), `motd=${spec.name || displayNameFromSlug(serverId)}\nserver-port=${spec.port || 25565}\n`, "utf8");
+      await fsp.writeFile(path.join(serverDir, "server.properties"), initialPropertiesText(details.name, serverId, port), "utf8");
       // Provision first: the launch script shape depends on what the loader
       // produced (a server.jar, or Forge/NeoForge argfiles).
       const runtime = await createJarManagedRuntime(
         requestedLoader,
-        spec.minecraftVersion || "latest",
+        minecraftVersion || "latest",
         serverDir,
         { javaBin, onProgress: reportProgress }
       );
-      spec.minecraftVersion = runtime.targetVersion;
-      spec.managedRuntime = runtime;
+      minecraftVersion = runtime.targetVersion;
+      managedRuntime = runtime;
       reportProgress("writing launch script");
       const launchScriptPath = path.join(serverDir, ".rippermoon", "launch-server.sh");
       await fsp.writeFile(
         launchScriptPath,
-        buildLaunchScript(spec.minMemory, spec.maxMemory, runtime.launch),
+        buildLaunchScript(details.minMemory, details.maxMemory, runtime.launch),
         "utf8"
       );
       await fsp.chmod(launchScriptPath, 0o755);
+    }
+
+    if (!minecraftVersion) {
+      const detected = await detectVersion(serverDir);
+      minecraftVersion = isMinecraftVersion(detected) ? detected : "unknown";
     }
 
     reportProgress("registering the server");
@@ -2073,32 +2309,33 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       id: serverId,
       createdAt: nowIso(),
       createdBy: actor.username,
-      description: spec.description || "",
+      description: details.description,
       directory: relativeDirectory,
       javaBin,
-      loader: effectiveLoader,
-      logFile: spec.logFile || "logs/latest.log",
-      maxMemory: spec.maxMemory || "4G",
+      loader: requestedLoader,
+      logFile: filePaths.logFile,
+      maxMemory: details.maxMemory,
       managedRuntime:
         mode === "existing"
           ? null
           : {
-              kind: spec.managedRuntime?.kind || requestedLoader,
+              kind: managedRuntime.kind || requestedLoader,
               // The launch shape must survive into the record; the managed
               // launch script is regenerated from it on every start.
-              launch: spec.managedRuntime?.launch || { kind: "jar" },
-              loaderVersion: spec.managedRuntime?.loaderVersion || null,
-              source: spec.managedRuntime?.source || requestedLoader,
+              launch: managedRuntime.launch || { kind: "jar" },
+              loaderVersion: managedRuntime.loaderVersion || null,
+              source: managedRuntime.source || requestedLoader,
               updatedAt: nowIso()
             },
-      minMemory: spec.minMemory || "2G",
-      minecraftVersion: spec.minecraftVersion || (await detectVersion(serverDir)),
-      modsDir: spec.modsDir || "mods",
-      name: spec.name || displayNameFromSlug(serverId),
-      passphraseHash: spec.passphrase ? await hashSecret(String(spec.passphrase)) : null,
-      serverPropertiesFile: spec.serverPropertiesFile || "server.properties",
-      startCommand: spec.startCommand || (mode === "existing" ? DEFAULT_EXISTING_START_COMMAND : DEFAULT_MANAGED_START_COMMAND),
-      worldDir: spec.worldDir || "world"
+      minMemory: details.minMemory,
+      minecraftVersion,
+      modsDir: filePaths.modsDir,
+      name: details.name,
+      passphraseHash: spec.passphrase ? await hashSecret(spec.passphrase) : null,
+      serverPropertiesFile: filePaths.serverPropertiesFile,
+      startCommand:
+        details.startCommand || (mode === "existing" ? DEFAULT_EXISTING_START_COMMAND : DEFAULT_MANAGED_START_COMMAND),
+      worldDir: filePaths.worldDir
     }));
 
     return record;
@@ -2167,7 +2404,16 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     const runtimeLog = fs.createWriteStream(paths.runtimeLog, { flags: "a" });
     runtimeLog.write(`\n[${nowIso()}] Starting ${server.name} as ${actor.username}\n`);
 
-    const launchSpec = await resolveLaunchCommand(serverId, server);
+    let launchSpec;
+    try {
+      launchSpec = await resolveLaunchCommand(serverId, server);
+    } catch (error) {
+      // The log was opened above. Say why nothing started, and close it: left
+      // open, every refused start kept a file handle for good.
+      runtimeLog.write(`[${nowIso()}] Start failed: ${error.message}\n`);
+      runtimeLog.end();
+      throw error;
+    }
     const command = launchSpec.command;
     const spawnDirectly = shouldSpawnDirectly(command);
     const directCommandPath = spawnDirectly ? path.resolve(paths.serverDir, command) : null;
@@ -2180,9 +2426,13 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     }
 
     const shellCommand = resolveShellCommand();
+    // The server gets a short list of variables, not the dashboard's own
+    // environment: it runs mods, and they have no business with the
+    // dashboard's keys. See childEnvironment() in utils.js for the list.
+    //
     // The launch script already prefers the JAVA_BIN override, so a per-server
     // override only needs to reach this child's environment.
-    const childEnv = { ...process.env };
+    const childEnv = childEnvironment();
     if (server.javaBin) {
       childEnv[`${ENV_PREFIX}JAVA_BIN`] = server.javaBin;
       // Hand-written launch scripts in existing server folders read the
@@ -2378,7 +2628,24 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       throw new Error("Server not found.");
     }
     const paths = resolveRecordPaths(server);
-    return await readJson(paths.worldMetadataFile, { activeWorldName: null });
+    // What the dashboard remembers about a server's worlds: what the live one
+    // is called and when that was set. The file is in the server's folder,
+    // where the server - and any mod it runs - can write, and both fields are
+    // drawn on the page. So a name comes back as a short piece of text or as
+    // nothing, a time as a time or as nothing, and a file that cannot be read
+    // counts as one that is not there.
+    let stored = null;
+    try {
+      stored = await readJson(paths.worldMetadataFile, null);
+    } catch {
+      stored = null;
+    }
+    const fields = stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {};
+    const updatedAt = typeof fields.updatedAt === "string" ? Date.parse(fields.updatedAt) : Number.NaN;
+    return {
+      activeWorldName: displayText(fields.activeWorldName) || null,
+      updatedAt: Number.isFinite(updatedAt) ? new Date(updatedAt).toISOString() : null
+    };
   }
 
   async function writeWorldMetadata(serverId, metadata) {
@@ -2956,7 +3223,11 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     }
 
     const paths = resolveRecordPaths(server);
-    const targetVersion = String(options.minecraftVersion || server.minecraftVersion || "").trim();
+    const asked = options.minecraftVersion;
+    const targetVersion =
+      asked === undefined || asked === null || asked === ""
+        ? String(server.minecraftVersion || "").trim()
+        : normalizeMinecraftVersion(asked, "The target Minecraft version");
     if (!targetVersion || targetVersion === "unknown") {
       throw userFacingError(
         `Set the Minecraft version for ${server.name} in server settings before adopting its runtime - the dashboard needs to know which build to install.`
@@ -3114,6 +3385,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     scanServerLoaderRequirements,
     addServerOperator,
     deleteServer,
+    downloadAddonToTempFile,
     downloadAndInstallFile,
     ensureManagedServerArtifacts,
     ensureServerStopped,

@@ -1,0 +1,135 @@
+// Stands in for the network in tests.
+//
+// The dashboard reaches other machines through lib/outbound.js, which resolves
+// a host name, checks the address, and opens a TLS connection to it. Tests
+// replace the last two steps and keep everything else: the https-only rule,
+// the redirect handling, the size limits and the error wording all still run.
+const { Readable } = require("node:stream");
+const { createOutbound, setDefaultOutboundForTests } = require("../src/lib/outbound");
+
+// An address on the public internet for names that do not need a particular one.
+const PUBLIC_ADDRESS = "93.184.215.14";
+
+// The fetch this process started with: the one that really goes out.
+const builtInFetch = globalThis.fetch;
+
+// A transport that asks globalThis.fetch for the response, so a test can keep
+// describing the outside world by replacing fetch. The stand-in may answer
+// with a real Response or with an object that has only the parts a test
+// bothered to write: { ok, status, json(), text(), arrayBuffer() }.
+//
+// It asks a stand-in and nothing else. A test that has not replaced fetch gets
+// a refused connection, not a request to whatever the address really is.
+async function fetchTransport({ headers, url }) {
+  if (globalThis.fetch === builtInFetch) {
+    throw Object.assign(new Error(`A test asked for ${url.href} without a stand-in for fetch. Tests do not use the network.`), {
+      code: "ECONNREFUSED"
+    });
+  }
+  const response = await globalThis.fetch(url.href, { headers, redirect: "manual" });
+  const status = typeof response.status === "number" ? response.status : response.ok === false ? 500 : 200;
+  let bytes = Buffer.alloc(0);
+  if (typeof response.arrayBuffer === "function") {
+    bytes = Buffer.from(await response.arrayBuffer());
+  } else if (typeof response.text === "function") {
+    bytes = Buffer.from(await response.text());
+  } else if (typeof response.json === "function") {
+    bytes = Buffer.from(JSON.stringify(await response.json()));
+  }
+  const responseHeaders = {};
+  if (response.headers && typeof response.headers.forEach === "function") {
+    response.headers.forEach((value, name) => {
+      // The stand-in has already decoded the body, whatever it says.
+      if (name.toLowerCase() !== "content-encoding" && name.toLowerCase() !== "content-length") {
+        responseHeaders[name.toLowerCase()] = value;
+      }
+    });
+  }
+  return { body: Readable.from([bytes]), headers: responseHeaders, status };
+}
+
+// A fetcher whose requests are answered by globalThis.fetch.
+function fetchBackedOutbound(overrides = {}) {
+  return createOutbound({
+    lookup: async () => [{ address: PUBLIC_ADDRESS, family: 4 }],
+    transport: fetchTransport,
+    ...overrides
+  });
+}
+
+// Makes every server and add-on manager created from now on, in this test
+// file, use fetch-backed requests unless it is handed a fetcher of its own.
+function useFetchForOutbound() {
+  setDefaultOutboundForTests(fetchBackedOutbound());
+}
+
+// A fetcher wired to hand-written answers, for tests about the fetcher itself.
+//
+//   scriptedOutbound({
+//     addresses: { "files.example": ["93.184.215.14"] },
+//     respond: ({ url, address, headers }) => ({ status: 200, body: "hello" })
+//   })
+//
+// `respond` may return { status, headers, body } with a string, a Buffer or a
+// stream for a body, or throw. Every call is recorded in `calls`, every name
+// looked up in `lookups`.
+function scriptedOutbound(script = {}, overrides = {}) {
+  const calls = [];
+  const lookups = [];
+  const outbound = createOutbound({
+    lookup: async (hostname) => {
+      lookups.push(hostname);
+      const answer = typeof script.addresses === "function" ? await script.addresses(hostname, lookups.length) : (script.addresses || {})[hostname];
+      if (!answer) {
+        throw Object.assign(new Error(`getaddrinfo ENOTFOUND ${hostname}`), { code: "ENOTFOUND" });
+      }
+      return answer.map((address) => ({ address, family: address.includes(":") ? 6 : 4 }));
+    },
+    transport: async (request) => {
+      calls.push({ address: request.address, connectTimeoutMs: request.connectTimeoutMs, headers: request.headers, url: request.url.href });
+      const answer = await script.respond(request, calls.length);
+      const body = answer.body === undefined ? "" : answer.body;
+      return {
+        body: typeof body === "string" || Buffer.isBuffer(body) ? Readable.from([Buffer.from(body)]) : body,
+        headers: answer.headers || {},
+        status: answer.status === undefined ? 200 : answer.status
+      };
+    },
+    ...overrides
+  });
+  return { calls, lookups, outbound };
+}
+
+// A fetcher that does everything the dashboard's does up to the point of
+// connecting, and then connects to nothing: each connection it would have made
+// is recorded in `dialled` and refused. For tests of what the dashboard will
+// not contact. Such a test probes with the addresses of real things - a home
+// router, a cloud metadata service - and if the check it is testing is ever
+// broken, it has to fail here, not go and knock on them.
+function unconnectedOutbound(overrides = {}) {
+  const dialled = [];
+  const outbound = createOutbound({
+    transport: async (request) => {
+      dialled.push({ address: request.address, url: request.url.href });
+      throw Object.assign(new Error("Tests do not connect to anything."), { code: "ECONNREFUSED" });
+    },
+    ...overrides
+  });
+  return { dialled, outbound };
+}
+
+// From the moment a test file loads this module, nothing in it reaches the
+// network by leaving something out. A server or add-on manager that is not
+// handed a fetcher falls back to a shared one, and for the dashboard that is
+// the real thing; here it is one that looks no name up and connects to
+// nothing. A test that wants an answer says what the answer is, with
+// scriptedOutbound() or useFetchForOutbound().
+setDefaultOutboundForTests(unconnectedOutbound({ lookup: async () => [{ address: PUBLIC_ADDRESS, family: 4 }] }).outbound);
+
+module.exports = {
+  PUBLIC_ADDRESS,
+  fetchBackedOutbound,
+  scriptedOutbound,
+  unconnectedOutbound,
+  useFetchForOutbound
+};

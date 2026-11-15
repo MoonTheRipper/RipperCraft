@@ -16,7 +16,7 @@ Current feature set:
 - Add-on install from Modrinth
 - Optional CurseForge install support, configured in Owner → Integrations or by `CURSEFORGE_API_KEY`
 - Guided manual download when a CurseForge author disables third-party downloads
-- Direct URL installs and local file uploads for anything else
+- Direct URL installs (from `https://` addresses on the public internet) and local file uploads for anything else
 - Managed provisioning for vanilla, Paper, Purpur, Fabric, Forge, and NeoForge
 - Existing server folder registration for any other loader
 - Per-server Java binary override for servers that need a different JDK
@@ -78,9 +78,71 @@ Requests that change anything must come from the dashboard's own page: the brows
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `RIPPERCRAFT_MAX_UPLOAD_MB` | `4096` | Largest world archive or add-on jar that can be uploaded, in megabytes. Uploads are written straight to the server's folder, not held in memory. Cloudflare's own limit (100 MB on the free plan) applies first to uploads made through a tunnel. |
+| `RIPPERCRAFT_MAX_WORLD_MB` | `32768` | Largest world, measured unpacked, that can be restored from an archive, in megabytes. See [Worlds](#worlds). |
+| `RIPPERCRAFT_MAX_DOWNLOAD_MB` | `1024` | Largest add-on the dashboard will download from a URL or a provider, in megabytes. See [Downloads](#downloads). |
 | `RIPPERCRAFT_TRUSTED_ORIGINS` | none | Comma-separated origins, such as `https://example.com,https://www.example.com`, to accept in addition to the one in the `Host` header. Only for a proxy that rewrites `Host`. |
 
 Other request bodies are limited to 1 MB.
+
+## What an admin can do
+
+An admin is someone the owner trusts with one or a few servers: to start and stop them, change the everyday settings, manage worlds and install add-ons. An admin is not trusted with the machine, with the other servers, or with the owner's account, and the dashboard is built to hold that line. The parts of it an operator will notice are below.
+
+One thing it does not hold yet: an add-on is code, and a server that loads it runs it as the same system user as the dashboard. Give admin accounts to people you would let install a mod on your machine.
+
+### Server settings
+
+- The **loader** is one of `vanilla`, `fabric`, `forge`, `neoforge`, `quilt`, `paper`, `purpur`, `folia`, `spigot`, `bukkit` or `custom`.
+- A **Minecraft version** is letters, digits, dots, hyphens, underscores and plus signs, as every version Mojang has published is: `1.20.1`, `26.1.2`, `26.4-snapshot-8`, `24w14a`.
+- **Names, descriptions and start commands** are one line of text.
+- **Memory** is a whole number followed by `K`, `M` or `G`, such as `4G` or `512M`. A server whose stored memory setting is anything else will not start until it is corrected in Settings; the dashboard no longer writes it into the launch script as it stands.
+- The settings an admin can change in **`server.properties`** take one line of text each, and the message of the day cannot end in a backslash (Minecraft would read the next setting as part of it). `\n` between the two lines of a message and `\u00a7` colour codes are written as before. The **world type** is one of Minecraft's own (`minecraft:normal`, `minecraft:flat`, `minecraft:large_biomes`, `minecraft:amplified`, `minecraft:single_biome_surface`, or the names older versions used); a world type added by a mod is set by the owner in the full `server.properties` editor, which still writes the file exactly as typed.
+
+### Worlds
+
+A world archive is a zip, and a zip can hold more than files.
+
+- **Restoring** reads the archive itself rather than handing it to `unzip`, and creates only folders and regular files. An archive that holds a symbolic link, a path that leads out of the world folder (`../`), or an entry that turns out larger than its header says is refused, and says why. So is an encrypted archive and one compressed with anything but the standard `store` and `deflate` methods (Deflate64, which Windows uses for files over 2 GB, is the one you might meet): zip it again with another tool.
+- A world may unpack to at most `RIPPERCRAFT_MAX_WORLD_MB` (32 GB by default), and never to more than the disk has free less 1 GB. Raise the limit if your worlds are larger than that. Folders count: each is charged 4 KB against the limit, an archive may hold at most 200,000 files and folders together, and a path in it may be at most 64 names long (63 folders and the file). No world Minecraft writes comes near either.
+- The archive is unpacked into a folder beside the world folder (`.rippercraft-restore-…`, removed afterwards) and moved into place when all of it has been checked. Nothing is unpacked in `/tmp` any more. If the dashboard is killed part-way, the leftover folder is cleared by the next restore once it is a day old.
+- The live world is archived before a restore or a new world replaces it. If that backup cannot be made, the restore stops and the world stays; it used to carry on. Why it could not be made is in the dashboard's log.
+- Backups, restores, exports, new worlds and archive uploads for one server are done **one at a time**, in the order they were asked for, and restores one at a time across all servers. A second request waits for the first instead of running through it; the same restore clicked twice used to be able to lose the world.
+- **Backing up and exporting** store a symbolic link found inside a world as a link, not as the files it points to. Such a backup cannot be restored from the dashboard, so keep worlds free of links.
+- If the **world folder itself is a symbolic link** (some people keep worlds on another disk that way), the dashboard will not back it up, export it or replace it. Move the real folder into the server folder, or mount the other disk instead of linking to it - on the **server folder**, not on the world folder.
+- If another disk is **mounted on the world folder**, backups, exports and new worlds work (a new world empties the folder and leaves it in place), but an archive is not restored into it: restoring swaps the folder for another, and a folder with a disk mounted on it cannot be swapped. Mount the disk on the server folder to have everything work.
+
+`zip` has to be installed. `unzip` is no longer needed.
+
+### Downloads
+
+Everything the dashboard fetches from another machine - an add-on from a URL, from Modrinth or CurseForge, a server jar, a loader installer, a version list - goes through one set of rules:
+
+- The address has to be `https://`, with no user name or password in it.
+- It has to lead to the public internet. An address on this machine, on a private network (`10.x`, `172.16-31.x`, `192.168.x`), on a tailnet (`100.64.0.0/10`), link-local or otherwise reserved is refused, for IPv4 and IPv6 alike, and so is a host name that resolves to one. To install a jar you host at home, upload the file instead.
+- Redirects are followed at most five times, and each has to pass the same checks.
+- An add-on may be at most `RIPPERCRAFT_MAX_DOWNLOAD_MB` (1 GB by default) and has 15 minutes to arrive.
+- An address that does not answer within 5 seconds is given up on and the host's next address is tried, IPv4 after IPv6 or the other way round. A machine with a broken IPv6 route no longer waits out the whole request on it.
+
+Add-on artwork and project links are passed to the page only when they are `https://` addresses.
+
+The dashboard makes these requests directly. It does not use an HTTP proxy from the environment.
+
+### Add-ons and the files beside them
+
+- What a jar says about itself - its name, its version, the loader builds it accepts - is read from the metadata file inside it, and no more than 1 MB of that. A jar whose metadata is larger, or whose sizes do not add up, is listed in the update panel among the jars that could not be checked.
+- `ops.json` and the dashboard's own files in a server's folder (`.rippermoon/worlds.json`, `.rippermoon/addons.json`) are read as what they should hold. An operator without a name that is text, or an add-on record without a file name, is not listed; nothing else in those files can stop the server's page from loading.
+
+### What a game server is started with
+
+A game server, and anything else the dashboard runs, is started with a short list of environment variables rather than everything the dashboard itself was started with: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `JAVA_HOME`, `RIPPERCRAFT_JAVA_BIN`, `RIPPERMOONSTASH_JAVA_BIN`, `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS` and `_JAVA_OPTIONS`. `CURSEFORGE_API_KEY` and the rest of the service's settings are no longer passed to mods.
+
+That is not the same as mods being unable to get them. A game server runs as the same system user as the dashboard, and on Linux a process may read the environment of any other process of its own user from `/proc`. A mod that goes looking can still find the key there, until game servers run under a user of their own.
+
+If a start script of your own reads some other variable that you set for the service, set it in the script, or have the script read it from a file.
+
+### In the browser
+
+Every response carries a `Content-Security-Policy` that lets the page load scripts and styles from the dashboard only, images from the dashboard and from `https://` addresses (add-on artwork), and connect to nothing but the dashboard. If you put the dashboard behind a proxy that injects a script or a stylesheet into pages, that injection will be blocked.
 
 ## Notes
 

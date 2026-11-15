@@ -20,6 +20,35 @@ const CENTRAL_SIGNATURE = 0x02014b50;
 const LOCAL_SIGNATURE = 0x04034b50;
 const MAX_COMMENT_LENGTH = 0xffff;
 
+// A jar is whatever somebody uploaded, and every size written in it is that
+// somebody's claim. What is wanted out of it is one small text file, so that
+// is all that is ever read: a list of contents no longer than this, and a
+// metadata file no larger than this, packed or unpacked. A 261 KB jar whose
+// fabric.mod.json unpacked to 1.1 GB used to be unpacked, in one piece, every
+// time the owner opened the server's update panel.
+const MAX_CENTRAL_DIRECTORY_BYTES = 16 * 1024 * 1024;
+const MAX_METADATA_BYTES = 1024 * 1024;
+
+// A version as a loader or the game writes one: 0.16.10, 47.4.10, 1.20.1,
+// 21.1.1-beta. A bound that is anything else - a hundred thousand digits, a
+// line of markup - is not a bound, and is not compared or shown as one.
+const VERSION_TEXT = /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$/;
+// No range anyone writes by hand comes near this.
+const MAX_RANGE_LENGTH = 512;
+
+function usableBound(bound) {
+  if (!bound) {
+    return null;
+  }
+  for (const key of ["min", "exclusiveMax", "inclusiveMax"]) {
+    const value = bound[key];
+    if (value !== undefined && value !== null && !(typeof value === "string" && VERSION_TEXT.test(value))) {
+      return null;
+    }
+  }
+  return bound;
+}
+
 // Which metadata file and dependency key each loader uses.
 const LOADER_METADATA = {
   fabric: { entry: "fabric.mod.json", format: "json", loaderKey: "fabricloader" },
@@ -90,13 +119,14 @@ function bumpMajor(version) {
 // Fabric's own predicate syntax: *, 1.2.3, >=1.2.3, ~1.2.3, ^1.2.3, 1.2.x.
 // Space- or comma-separated terms are ANDed, so the strictest lower bound wins.
 function parseFabricPredicate(value) {
-  const raw = String(value || "").trim();
-  if (!raw || raw === "*") {
+  const raw = typeof value === "string" || typeof value === "number" ? String(value).trim() : "";
+  if (!raw || raw === "*" || raw.length > MAX_RANGE_LENGTH) {
     return null;
   }
 
   let bound = null;
-  const consider = (candidate) => {
+  const consider = (found) => {
+    const candidate = usableBound(found);
     if (candidate && candidate.min && (!bound || compareVersions(candidate.min, bound.min) > 0)) {
       bound = candidate;
     }
@@ -147,8 +177,8 @@ function parseFabricPredicate(value) {
 // Maven version ranges, used by Forge and NeoForge: [47,) (1.0,2.0) [1.0,2.0].
 // A bare "47" is Maven's "soft" requirement, which Forge treats as a minimum.
 function parseMavenRange(value) {
-  const raw = String(value || "").trim();
-  if (!raw || raw === "*") {
+  const raw = typeof value === "string" || typeof value === "number" ? String(value).trim() : "";
+  if (!raw || raw === "*" || raw.length > MAX_RANGE_LENGTH) {
     return null;
   }
 
@@ -158,21 +188,21 @@ function parseMavenRange(value) {
     if (!low.trim()) {
       return null;
     }
-    return {
+    return usableBound({
       exclusiveMax: closeBracket === ")" && high.trim() ? high.trim() : null,
       inclusiveMax: closeBracket === "]" && high.trim() ? high.trim() : null,
       min: low.trim(),
       minInclusive: openBracket === "["
-    };
+    });
   }
 
   const exact = raw.match(/^[[(]\s*([^,\])]+)\s*[\])]$/);
   if (exact) {
-    return { inclusiveMax: exact[1].trim(), min: exact[1].trim(), minInclusive: true };
+    return usableBound({ inclusiveMax: exact[1].trim(), min: exact[1].trim(), minInclusive: true });
   }
 
   if (/^[0-9]/.test(raw)) {
-    return { min: raw, minInclusive: true };
+    return usableBound({ min: raw, minInclusive: true });
   }
 
   return null;
@@ -237,6 +267,14 @@ async function readJarEntries(jarPath, wantedEntries) {
       // than saying so.
       throw new Error("zip64 archives are not supported");
     }
+    // Room is made for what a header says before any of it is read, so what a
+    // header says is held against the file first.
+    if (centralOffset + centralSize > size) {
+      throw new Error("the archive is damaged: its list of contents points outside the file");
+    }
+    if (centralSize > MAX_CENTRAL_DIRECTORY_BYTES) {
+      throw new Error("the archive's list of contents is too large to read");
+    }
 
     const central = await readBytes(handle, centralOffset, centralSize);
     const wanted = new Set(wantedEntries);
@@ -270,11 +308,25 @@ async function readJarEntries(jarPath, wantedEntries) {
       }
       const dataOffset =
         entry.localOffset + 30 + localHeader.readUInt16LE(26) + localHeader.readUInt16LE(28);
+      if (dataOffset + entry.compressedSize > size) {
+        throw new Error(`the archive is damaged: ${name} points outside the file`);
+      }
+      if (entry.compressedSize > MAX_METADATA_BYTES) {
+        throw new Error(`${name} is too large to read`);
+      }
       const raw = await readBytes(handle, dataOffset, entry.compressedSize);
       if (entry.compressionMethod === 0) {
         results[name] = raw.toString("utf8");
       } else if (entry.compressionMethod === 8) {
-        results[name] = zlib.inflateRawSync(raw).toString("utf8");
+        try {
+          results[name] = zlib.inflateRawSync(raw, { maxOutputLength: MAX_METADATA_BYTES }).toString("utf8");
+        } catch (error) {
+          // Stopped at the limit, with that much unpacked and no more.
+          if (error.code === "ERR_BUFFER_TOO_LARGE") {
+            throw new Error(`${name} is too large to read`);
+          }
+          throw new Error(`the archive is damaged: ${name} cannot be unpacked`);
+        }
       }
     }
 
@@ -297,26 +349,47 @@ function firstDependencyValue(value) {
   return parseFabricPredicate(value);
 }
 
+// A jar describes itself - its name, its version, the ranges it accepts - and
+// the owner's page shows what it says. Anyone who can upload a jar writes that
+// description, and in a JSON file a "name" can as easily be an object or a
+// megabyte of text. What is passed on is a short piece of text, or nothing.
+const METADATA_TEXT_LIMIT = 200;
+
+function metadataText(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value !== "string" || !value) {
+    return null;
+  }
+  return value.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, METADATA_TEXT_LIMIT);
+}
+
+// A declared range, as written, for display.
+function rangeText(value) {
+  return value === undefined ? null : metadataText(typeof value === "string" ? value : JSON.stringify(value));
+}
+
 function parseFabricMetadata(text, loaderKey) {
-  const manifest = JSON.parse(text);
-  const depends = manifest.depends || {};
+  const manifest = JSON.parse(text) || {};
+  const depends = manifest.depends && typeof manifest.depends === "object" ? manifest.depends : {};
   const rawLoader = depends[loaderKey];
   const rawMinecraft = depends.minecraft;
 
   return {
     loaderBound: firstDependencyValue(rawLoader),
-    loaderRaw: rawLoader === undefined ? null : JSON.stringify(rawLoader),
+    loaderRaw: rawLoader === undefined ? null : rangeText(JSON.stringify(rawLoader)),
     minecraftBound: firstDependencyValue(rawMinecraft),
-    minecraftRaw: rawMinecraft === undefined ? null : JSON.stringify(rawMinecraft),
-    modId: manifest.id || null,
-    name: manifest.name || manifest.id || null,
-    version: manifest.version || null
+    minecraftRaw: rawMinecraft === undefined ? null : rangeText(JSON.stringify(rawMinecraft)),
+    modId: metadataText(manifest.id),
+    name: metadataText(manifest.name) || metadataText(manifest.id),
+    version: metadataText(manifest.version)
   };
 }
 
 function parseQuiltMetadata(text, loaderKey) {
-  const manifest = JSON.parse(text);
-  const quiltLoader = manifest.quilt_loader || {};
+  const manifest = JSON.parse(text) || {};
+  const quiltLoader = manifest.quilt_loader && typeof manifest.quilt_loader === "object" ? manifest.quilt_loader : {};
   const depends = Array.isArray(quiltLoader.depends) ? quiltLoader.depends : [];
   const find = (id) =>
     depends.find((entry) => entry && typeof entry === "object" && entry.id === id) ||
@@ -327,12 +400,12 @@ function parseQuiltMetadata(text, loaderKey) {
 
   return {
     loaderBound: loaderEntry ? firstDependencyValue(loaderEntry.versions) : null,
-    loaderRaw: loaderEntry ? JSON.stringify(loaderEntry.versions) : null,
+    loaderRaw: loaderEntry ? rangeText(JSON.stringify(loaderEntry.versions)) : null,
     minecraftBound: minecraftEntry ? firstDependencyValue(minecraftEntry.versions) : null,
-    minecraftRaw: minecraftEntry ? JSON.stringify(minecraftEntry.versions) : null,
-    modId: quiltLoader.id || null,
-    name: (quiltLoader.metadata && quiltLoader.metadata.name) || quiltLoader.id || null,
-    version: quiltLoader.version || null
+    minecraftRaw: minecraftEntry ? rangeText(JSON.stringify(minecraftEntry.versions)) : null,
+    modId: metadataText(quiltLoader.id),
+    name: metadataText(quiltLoader.metadata && quiltLoader.metadata.name) || metadataText(quiltLoader.id),
+    version: metadataText(quiltLoader.version)
   };
 }
 
@@ -372,12 +445,12 @@ function parseForgeMetadata(text, loaderKey) {
 
   return {
     loaderBound,
-    loaderRaw,
+    loaderRaw: rangeText(loaderRaw === null ? undefined : loaderRaw),
     minecraftBound,
-    minecraftRaw,
-    modId,
-    name: readString(modsBlock, "displayName") || modId,
-    version: readString(modsBlock, "version")
+    minecraftRaw: rangeText(minecraftRaw === null ? undefined : minecraftRaw),
+    modId: metadataText(modId),
+    name: metadataText(readString(modsBlock, "displayName")) || metadataText(modId),
+    version: metadataText(readString(modsBlock, "version"))
   };
 }
 
@@ -443,7 +516,7 @@ async function scanLoaderRequirements(modsDir, loader, options = {}) {
       }
       mods.push({ fileName, ...requirements });
     } catch (error) {
-      unreadable.push({ fileName, reason: error.message });
+      unreadable.push({ fileName, reason: metadataText(error.message) || "unreadable" });
     }
   }
 

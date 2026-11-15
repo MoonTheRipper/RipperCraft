@@ -1,4 +1,4 @@
-import { escapeHtml, icon, labelWithIcon, renderSelectOptions, renderValue } from "./html.js";
+import { escapeHtml, icon, labelWithIcon, renderSelectOptions, renderValue, safeUrl } from "./html.js";
 import { state } from "./state.js";
 
 export function renderSafeSettingField(definition, value) {
@@ -145,26 +145,32 @@ export function renderAddonSideBadge(clientSide, serverSide) {
 //
 // The glyph is always present and the image is stacked over it in the same grid
 // cell, so a missing icon and one whose CDN fails both land on the placeholder
-// rather than an empty bordered box. `onerror` only has to remove the image;
-// what shows through is already there.
+// rather than an empty bordered box. A failed image only has to be removed;
+// what shows through is already there. removeFailedAddonIcon() in
+// actions/media.js does that - it used to be an onerror attribute here, which
+// is inline script and is not allowed by the Content-Security-Policy.
 //
 // The alt is empty on purpose: the add-on's name sits next to it as real text,
 // so describing the artwork again would just be read out twice.
+//
+// The picture is loaded only from an absolute web address. Escaping keeps an
+// address inside its attribute and says nothing about where it leads: a path
+// on this dashboard would be fetched with the viewer's own session.
 export function renderAddonIcon(iconUrl, title) {
   const fallback = `<span class="addon-icon__fallback">${icon("mods")}</span>`;
-  if (!iconUrl) {
+  const address = safeUrl(iconUrl);
+  if (!address) {
     return `<span class="addon-icon">${fallback}</span>`;
   }
   return `
     <span class="addon-icon">
       ${fallback}
       <img
-        src="${escapeHtml(iconUrl)}"
+        src="${escapeHtml(address)}"
         alt=""
         loading="lazy"
         decoding="async"
         referrerpolicy="no-referrer"
-        onerror="this.remove()"
       />
     </span>
   `;

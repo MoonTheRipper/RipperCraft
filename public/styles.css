@@ -1086,10 +1086,16 @@ textarea {
   background: var(--c-surface-2);
 }
 
+/* The width is set from script, from the element's data-progress (see
+   js/progress.js). Until that has run the bar is empty, not full.
+
+   No transition on the width. The page is redrawn while a job runs, and each
+   redraw puts a new, empty bar here for the script to fill: with a transition
+   the bar swept up from nothing every time, instead of standing where it was. */
 .progress-track__fill {
+  width: 0;
   height: 100%;
   background: var(--c-accent-fill);
-  transition: width var(--motion-base) var(--ease);
 }
 
 /* --- code and logs ------------------------------------------------------ */
