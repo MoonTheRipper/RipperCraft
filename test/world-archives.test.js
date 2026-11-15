@@ -282,6 +282,199 @@ test("unpacking folders left by a crash are cleared out by the next restore, rec
   assert.equal(fs.existsSync(unrelated), true);
 });
 
+// --- more than one request at a time ---------------------------------------------------------
+
+// A server with a world, straight on the managers, for tests that need to hold
+// the clock still or stand in for the disk.
+async function managedWorld(t, options = {}) {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "rippercraft-worlds-"));
+  t.after(() => fsp.rm(root, { force: true, maxRetries: 10, recursive: true, retryDelay: 50 }));
+  const serverDir = path.join(root, "servers", "DemoServer");
+  const library = path.join(serverDir, ".rippermoon", "world-library");
+  await fsp.mkdir(path.join(serverDir, "world", "region"), { recursive: true });
+  await fsp.mkdir(library, { recursive: true });
+  await fsp.writeFile(path.join(serverDir, "world", "level.dat"), "original");
+  await fsp.writeFile(path.join(serverDir, "world", "region", "r.0.0.mca"), Buffer.alloc(300_000, 7));
+
+  const store = createStore(root);
+  await store.ensureInitialized();
+  const serverManager = createServerManager(store);
+  await serverManager.syncDiscoveredServers();
+  if (options.record) {
+    await store.updateServerRecord("DemoServer", { ...(await serverManager.getServer("DemoServer")), ...options.record });
+  }
+  const logged = [];
+  const logger = { error: (message, details) => logged.push({ details, message }) };
+  const worldManager = createWorldManager(serverManager, { logger, ...(options.manager || {}) });
+  const levelIn = (archiveName) => execFileSync("unzip", ["-p", path.join(library, archiveName), "world/level.dat"]).toString();
+  return { library, levelIn, logged, names: () => fs.readdirSync(library).sort(), root, serverDir, serverManager, worldManager };
+}
+
+test("the same restore sent twice at once is done twice, in turn, and loses nothing", async (t) => {
+  // A double click. The two requests used to run through each other: both
+  // archived the live world under one name, and the one that lost the race
+  // deleted the other's finished archive after the world itself was gone.
+  for (let round = 0; round < 6; round += 1) {
+    const world = await managedWorld(t);
+    await fsp.writeFile(path.join(world.library, "incoming.zip"), goodWorld("incoming"));
+
+    const outcomes = await Promise.allSettled([
+      world.worldManager.activateWorldArchive("DemoServer", "incoming.zip"),
+      world.worldManager.activateWorldArchive("DemoServer", "incoming.zip")
+    ]);
+    assert.deepEqual(outcomes.map((outcome) => outcome.status), ["fulfilled", "fulfilled"], String(outcomes.find((outcome) => outcome.reason)?.reason));
+
+    assert.equal(await fsp.readFile(path.join(world.serverDir, "world", "level.dat"), "utf8"), "incoming");
+    // One archive of the world that was live, and one of the world the first
+    // restore put there - each made before the folder it describes was removed.
+    const backups = world.names().filter((name) => name.includes("pre-activate"));
+    assert.deepEqual(backups.map(world.levelIn).sort(), ["incoming", "original"], `round ${round}`);
+    assert.deepEqual(fs.readdirSync(world.serverDir).filter((name) => name.startsWith(".rippercraft-restore-")), []);
+  }
+});
+
+test("backups, restores and new worlds asked for together all happen, one after another", async (t) => {
+  const world = await managedWorld(t);
+  await fsp.writeFile(path.join(world.library, "incoming.zip"), goodWorld("incoming"));
+
+  const outcomes = await Promise.allSettled([
+    world.worldManager.captureActiveWorld("DemoServer", "one"),
+    world.worldManager.activateWorldArchive("DemoServer", "incoming.zip"),
+    world.worldManager.captureActiveWorld("DemoServer", "two"),
+    world.worldManager.createExportArchive("DemoServer"),
+    world.worldManager.createNewWorld("DemoServer", { name: "fresh" }),
+    world.worldManager.captureActiveWorld("DemoServer", "three")
+  ]);
+  // In the order they were asked for: the last backup finds no world left.
+  assert.deepEqual(outcomes.map((outcome) => outcome.status), ["fulfilled", "fulfilled", "fulfilled", "fulfilled", "fulfilled", "rejected"]);
+  assert.match(outcomes[5].reason.message, /no world to back up/);
+  await outcomes[3].value.cleanup();
+
+  const levels = world.names().filter((name) => name !== "incoming.zip").map((name) => [name.replace(/^[^Z]*Z-/, ""), world.levelIn(name)]);
+  assert.deepEqual(levels.map(([, level]) => level).sort(), ["incoming", "incoming", "original", "original"]);
+  assert.equal(levels.find(([name]) => name.startsWith("one"))[1], "original");
+  assert.equal(levels.find(([name]) => name.startsWith("two"))[1], "incoming");
+  assert.equal(fs.existsSync(path.join(world.serverDir, "world")), false);
+});
+
+test("two backups made in the same millisecond are two archives", async (t) => {
+  const world = await managedWorld(t);
+  t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-11-15T12:00:00.000Z") });
+
+  const first = await world.worldManager.captureActiveWorld("DemoServer", "same");
+  await fsp.writeFile(path.join(world.serverDir, "world", "level.dat"), "changed since");
+  const second = await world.worldManager.captureActiveWorld("DemoServer", "same");
+
+  assert.equal(first.archiveName, "2026-11-15T12-00-00-000Z-same.zip");
+  assert.equal(second.archiveName, "2026-11-15T12-00-00-000Z-same-2.zip");
+  assert.equal(world.levelIn(first.archiveName), "original");
+  assert.equal(world.levelIn(second.archiveName), "changed since");
+
+  // An upload with the name of an archive that is already there goes beside it.
+  const upload = path.join(world.library, ".upload-0123456789abcdef.part");
+  await fsp.writeFile(upload, goodWorld("uploaded"));
+  const imported = await world.worldManager.importWorldArchiveFile("DemoServer", "same.zip", upload);
+  assert.equal(imported.archiveName, "2026-11-15T12-00-00-000Z-same-3.zip");
+  assert.equal(world.levelIn(first.archiveName), "original");
+});
+
+test("a backup that fails removes its own unfinished file and no other archive", async (t) => {
+  if (process.getuid && process.getuid() === 0) {
+    t.skip("root can read every file, so the backup below would not fail");
+    return;
+  }
+  const world = await managedWorld(t);
+  t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-11-15T12:00:00.000Z") });
+
+  const kept = await world.worldManager.captureActiveWorld("DemoServer", "same");
+  // A file zip cannot read: it gives up on the archive.
+  const unreadable = path.join(world.serverDir, "world", "locked.dat");
+  await fsp.writeFile(unreadable, "x", { mode: 0o000 });
+  t.after(() => fsp.chmod(unreadable, 0o644).catch(() => {}));
+
+  // The same moment and the same label: the name the failed backup would have
+  // taken is the name of the archive made a moment ago.
+  await assert.rejects(world.worldManager.captureActiveWorld("DemoServer", "same"), {
+    message: /could not be archived \(zip stopped with code \d+\)/,
+    statusCode: 500
+  });
+  // What zip said goes to the operator's log, and only there.
+  assert.equal(world.logged.length, 1);
+  assert.equal(world.logged[0].message, "Archiving a world failed");
+  assert.match(world.logged[0].details.output, /Permission denied/);
+  assert.match(world.logged[0].details.error, /world-library/);
+  assert.deepEqual(world.names(), [kept.archiveName]);
+  assert.equal(world.levelIn(kept.archiveName), "original");
+
+  // And a restore that cannot archive the live world first leaves it, and every archive, alone.
+  await fsp.writeFile(path.join(world.library, "incoming.zip"), goodWorld("incoming"));
+  const failure = await world.worldManager.activateWorldArchive("DemoServer", "incoming.zip").catch((error) => error);
+  assert.equal(failure.statusCode, 500);
+  // The message is the dashboard's own: no command line, no path on this machine.
+  assert.equal(failure.message.includes(world.root), false);
+  assert.doesNotMatch(failure.message, /zip -|world-library/);
+  assert.equal(await fsp.readFile(path.join(world.serverDir, "world", "level.dat"), "utf8"), "original");
+  assert.deepEqual(world.names(), [kept.archiveName, "incoming.zip"].sort());
+});
+
+test("a world folder another disk is mounted on is not swapped out", async (t) => {
+  // Removing a mounted folder empties it and then fails, and the move into its
+  // place fails after that: the server would be left with no world at all.
+  const world = await managedWorld(t, { manager: { isMountPoint: async (folder) => folder.endsWith(`${path.sep}world`) } });
+  await fsp.writeFile(path.join(world.library, "incoming.zip"), goodWorld("incoming"));
+
+  await assert.rejects(world.worldManager.activateWorldArchive("DemoServer", "incoming.zip"), { message: /another disk is mounted/, statusCode: 409 });
+  assert.equal(await fsp.readFile(path.join(world.serverDir, "world", "level.dat"), "utf8"), "original");
+  // Refused before the live world was archived: asking again does not fill the library.
+  assert.deepEqual(world.names(), ["incoming.zip"]);
+  assert.deepEqual(fs.readdirSync(world.serverDir).filter((name) => name.startsWith(".rippercraft-restore-")), []);
+
+  // Backing it up and exporting it only read, and work as anywhere else.
+  assert.match((await world.worldManager.captureActiveWorld("DemoServer", "mounted")).archiveName, /mounted\.zip$/);
+  await (await world.worldManager.createExportArchive("DemoServer")).cleanup();
+
+  // A new world needs the folder empty, not gone: what is in it is archived
+  // and removed, and the folder - the disk - stays where it is.
+  await world.worldManager.createNewWorld("DemoServer", { name: "fresh" });
+  assert.deepEqual(fs.readdirSync(path.join(world.serverDir, "world")), []);
+  const archived = world.names().filter((name) => name.includes("pre-new-world"));
+  assert.equal(archived.length, 1);
+  assert.equal(world.levelIn(archived[0]), "original");
+});
+
+test("the dashboard's own check finds no disk mounted on an ordinary world folder", async (t) => {
+  // The check itself, not a stand-in for it: on one disk, everything goes on as before.
+  const world = await managedWorld(t);
+  await fsp.writeFile(path.join(world.library, "incoming.zip"), goodWorld("incoming"));
+  await world.worldManager.activateWorldArchive("DemoServer", "incoming.zip");
+  assert.equal(await fsp.readFile(path.join(world.serverDir, "world", "level.dat"), "utf8"), "incoming");
+  await world.worldManager.createNewWorld("DemoServer", { name: "fresh" });
+  assert.equal(fs.existsSync(path.join(world.serverDir, "world")), false);
+});
+
+test("a world folder reached through a link out of the server folder is not written to", async (t) => {
+  // The world configured a level down, and that level swapped for a link.
+  const world = await managedWorld(t, { record: { worldDir: "saves/world" } });
+  const outside = await fsp.mkdtemp(path.join(os.tmpdir(), "rippercraft-outside-"));
+  t.after(() => fsp.rm(outside, { force: true, recursive: true }));
+  await fsp.symlink(outside, path.join(world.serverDir, "saves"));
+  await fsp.writeFile(path.join(world.library, "incoming.zip"), goodWorld("incoming"));
+
+  // There is no world there yet, so nothing is archived first: only the check
+  // on where the folder is stands between the archive and the link's target.
+  await assert.rejects(world.worldManager.activateWorldArchive("DemoServer", "incoming.zip"), { message: /leads outside the server folder/, statusCode: 409 });
+  await assert.rejects(world.worldManager.createNewWorld("DemoServer", { name: "fresh" }), { message: /leads outside the server folder/, statusCode: 409 });
+  assert.deepEqual(fs.readdirSync(outside), []);
+
+  // With a world behind the link, it is neither archived nor exported.
+  await fsp.mkdir(path.join(outside, "world"));
+  await fsp.writeFile(path.join(outside, "world", "level.dat"), CANARY);
+  await assert.rejects(world.worldManager.captureActiveWorld("DemoServer", "through"), { statusCode: 409 });
+  await assert.rejects(world.worldManager.createExportArchive("DemoServer"), { statusCode: 409 });
+  assert.deepEqual(world.names(), ["incoming.zip"]);
+  assert.deepEqual(fs.readdirSync(outside), ["world"]);
+});
+
 // --- backing up, exporting and downloading ---------------------------------------------------
 
 test("a backup stores a link in the world as a link, never as what it points to", async (t) => {

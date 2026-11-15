@@ -3,9 +3,10 @@ const path = require("node:path");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const { HttpError, describeBytes } = require("./http");
-const { ensureDir, nowIso, readEnv, runCommand, safeFilename, withinParent } = require("./utils");
+const { newUploadTempPath, removeStaleTempFiles } = require("./upload");
+const { createMutex, ensureDir, nowIso, readEnv, runCommand, safeFilename, withinParent } = require("./utils");
 const { invalid, normalizeLevelType, propertyValue, singleLine } = require("./validate");
-const { assertPlainTree, extractZip, inspectZip } = require("./zip-extract");
+const { assertPlainTree, extractZip } = require("./zip-extract");
 
 // The largest world, measured unpacked, that an archive may hold. A zip can be
 // tiny and still unpack to more than the disk has room for.
@@ -38,8 +39,43 @@ function resolveWorldLimitBytes(logger) {
 
 function createWorldManager(serverManager, options = {}) {
   const worldLimitBytes = options.worldLimitBytes || DEFAULT_WORLD_LIMIT_MB * 1024 * 1024;
+  const logger = options.logger || { error() {} };
   // How full the disk is. Replaceable so a test can describe a full one.
   const statfs = options.statfs || fsp.statfs;
+  // Whether a folder is where another disk is mounted. Replaceable for the
+  // same reason: a test cannot mount one.
+  const isMountPoint = options.isMountPoint || folderIsMountPoint;
+
+  // One thing at a time happens to a server's worlds. Backing up, restoring,
+  // exporting and starting a new world each take a while and each assume the
+  // world folder and the library hold still meanwhile. They did not: the same
+  // restore sent twice (a double click) had both requests archive the live
+  // world under one name, and the request that lost the race deleted the
+  // archive the other had just finished - after the world itself was gone.
+  const queues = new Map();
+  async function oneAtATime(serverId, task) {
+    const key = String(serverId);
+    let queue = queues.get(key);
+    if (!queue) {
+      queue = { run: createMutex(), waiting: 0 };
+      queues.set(key, queue);
+    }
+    queue.waiting += 1;
+    try {
+      return await queue.run(task);
+    } finally {
+      queue.waiting -= 1;
+      // Nothing is kept for a server that has nothing going on.
+      if (queue.waiting === 0) {
+        queues.delete(key);
+      }
+    }
+  }
+  // Unpacking is queued across every server as well, so that the free space
+  // one restore was promised is not being used up by another on the same disk.
+  // It is always taken second, with the server's own queue already held, and
+  // nothing waits for a server's queue while holding it.
+  const unpacking = createMutex();
 
   // Bad input from the browser should surface as a 4xx, not a 500 that logs as
   // a server fault.
@@ -101,9 +137,82 @@ function createWorldManager(serverManager, options = {}) {
   // backup. "--" keeps a folder name that begins with a dash from being read
   // as an option.
   async function zipWorld(paths, targetArchive) {
-    await runCommand("zip", ["-ryq", targetArchive, "--", path.basename(paths.worldDir)], {
-      cwd: path.dirname(paths.worldDir)
-    });
+    try {
+      await runCommand("zip", ["-ryq", targetArchive, "--", path.basename(paths.worldDir)], {
+        cwd: path.dirname(paths.worldDir)
+      });
+    } catch (error) {
+      // Said in the dashboard's words. The command's own failure names the
+      // full path of the library on this machine, which is the operator's
+      // business and nobody else's: it goes to the log, not to the browser.
+      logger.error("Archiving a world failed", {
+        code: error.code,
+        error: error.message,
+        output: String(error.stderr || "").slice(-2000)
+      });
+      if (error.code === "ENOENT") {
+        throw worldError("The world could not be archived: the zip command is not installed on this machine.", 500);
+      }
+      const how = typeof error.code === "number" ? `zip stopped with code ${error.code}` : "zip was stopped before it finished";
+      throw worldError(
+        `The world could not be archived (${how}). Check that the disk has room and that every file in the world can be read. The dashboard's log has the details.`,
+        500
+      );
+    }
+  }
+
+  // A name in the library that nothing has yet: the one asked for, or the same
+  // with a number after it.
+  async function freeArchivePath(directory, stem) {
+    for (let attempt = 1; ; attempt += 1) {
+      const candidate = path.join(directory, `${stem}${attempt === 1 ? "" : `-${attempt}`}.zip`);
+      if (!(await fsp.lstat(candidate).catch(() => null))) {
+        return candidate;
+      }
+    }
+  }
+
+  // A folder another disk is mounted on is on a different device from the
+  // folder it is in. (A folder of the same disk mounted a second time is not
+  // told apart this way.)
+  async function folderIsMountPoint(directory) {
+    try {
+      const [own, parent] = await Promise.all([fsp.stat(directory), fsp.stat(path.dirname(directory))]);
+      return own.dev !== parent.dev;
+    } catch {
+      return false;
+    }
+  }
+
+  async function worldFolderIsMounted(paths) {
+    return (await worldFolderKind(paths)) === "folder" && (await isMountPoint(paths.worldDir));
+  }
+
+  // Restoring a world means removing its folder and moving another into its
+  // place. A folder another disk is mounted on cannot be removed - only
+  // emptied, after which the move fails too, and the server is left with no
+  // world. The archive is also unpacked beside the world folder, which is then
+  // the wrong disk to have measured. So that is refused before anything is
+  // touched.
+  async function assertWorldFolderCanBeSwapped(paths) {
+    if (await worldFolderIsMounted(paths)) {
+      throw worldError(
+        "This server's world folder is where another disk is mounted, and the dashboard cannot swap a different world into it. Unpack the archive onto that disk by hand, or mount the disk on the server folder instead of on the world folder."
+      );
+    }
+  }
+
+  // Removes the live world, for a new one to be generated in its place. Where
+  // another disk is mounted on the folder, the folder stays and what is in it
+  // goes.
+  async function removeLiveWorld(paths) {
+    if (await worldFolderIsMounted(paths)) {
+      for (const name of await fsp.readdir(paths.worldDir)) {
+        await fsp.rm(path.join(paths.worldDir, name), { recursive: true, force: true });
+      }
+      return;
+    }
+    await fsp.rm(paths.worldDir, { recursive: true, force: true });
   }
 
   function parseServerPropertiesText(contents) {
@@ -133,7 +242,11 @@ function createWorldManager(serverManager, options = {}) {
     return await serverManager.listWorldEntries(serverId);
   }
 
-  async function updateWorldRules(serverId, options = {}) {
+  function updateWorldRules(serverId, options = {}) {
+    return oneAtATime(serverId, () => writeWorldRules(serverId, options));
+  }
+
+  async function writeWorldRules(serverId, options) {
     // Checked before the file is read, let alone written: the world type goes
     // into server.properties, and is one of a fixed list.
     let levelType = null;
@@ -160,31 +273,44 @@ function createWorldManager(serverManager, options = {}) {
     };
   }
 
-  async function captureActiveWorld(serverId, label) {
+  function captureActiveWorld(serverId, label) {
+    return oneAtATime(serverId, () => archiveLiveWorld(serverId, label));
+  }
+
+  // Zips the live world into the library. Called with the server's queue held.
+  //
+  // The archive is written under a temporary name and given its real one only
+  // when it is complete, so a backup that failed is never mistaken for one
+  // that did not - and so that clearing up after a failure removes this call's
+  // own file and cannot remove anybody else's.
+  async function archiveLiveWorld(serverId, label) {
     const server = await serverManager.getServer(serverId);
     const paths = serverManager.resolveRecordPaths(server);
     await ensureDir(paths.worldLibraryDir);
 
     // A label is text, or left out. Anything else is not turned into a name.
     const labelText = typeof label === "string" || typeof label === "number" ? String(label) : "";
-    const archiveName = `${new Date().toISOString().replace(/[:.]/g, "-")}-${safeFilename(labelText || "world")}.zip`;
-    const targetArchive = path.join(paths.worldLibraryDir, archiveName);
+    const stem = `${new Date().toISOString().replace(/[:.]/g, "-")}-${safeFilename(labelText || "world")}`;
     await serverManager.ensureServerStopped(serverId);
     if ((await worldFolderKind(paths)) === "missing") {
       throw worldError("This server has no world to back up yet. Start it once to generate one.");
     }
     await assertWorldFolderIsOurs(paths);
+
+    // What a backup that was cut short left behind, a day or more ago.
+    await removeStaleTempFiles(paths.worldLibraryDir);
+    const unfinished = newUploadTempPath(paths.worldLibraryDir);
     try {
-      await zipWorld(paths, targetArchive);
+      await zipWorld(paths, unfinished);
+      const targetArchive = await freeArchivePath(paths.worldLibraryDir, stem);
+      await fsp.rename(unfinished, targetArchive);
+      return {
+        archiveName: path.basename(targetArchive)
+      };
     } catch (error) {
-      // Not half an archive under a name that looks like a backup.
-      await fsp.rm(targetArchive, { force: true });
+      await fsp.rm(unfinished, { force: true });
       throw error;
     }
-
-    return {
-      archiveName
-    };
   }
 
   // Archives the world that is live now, ahead of something that is about to
@@ -196,22 +322,25 @@ function createWorldManager(serverManager, options = {}) {
     if ((await worldFolderKind(paths)) === "missing") {
       return;
     }
-    await captureActiveWorld(serverId, label);
+    await archiveLiveWorld(serverId, label);
   }
 
   // Files an uploaded archive in the world library. The upload was received
   // into that directory, so the archive appears under its final name complete
   // or not at all.
-  async function importWorldArchiveFile(serverId, fileName, sourcePath) {
-    const server = await serverManager.getServer(serverId);
-    const paths = serverManager.resolveRecordPaths(server);
-    await ensureDir(paths.worldLibraryDir);
-    const archiveName = `${new Date().toISOString().replace(/[:.]/g, "-")}-${safeFilename(fileName || "world.zip")}`;
-    const targetFile = path.join(paths.worldLibraryDir, archiveName.endsWith(".zip") ? archiveName : `${archiveName}.zip`);
-    await fsp.rename(sourcePath, targetFile);
-    return {
-      archiveName: path.basename(targetFile)
-    };
+  function importWorldArchiveFile(serverId, fileName, sourcePath) {
+    return oneAtATime(serverId, async () => {
+      const server = await serverManager.getServer(serverId);
+      const paths = serverManager.resolveRecordPaths(server);
+      await ensureDir(paths.worldLibraryDir);
+      const stem = `${new Date().toISOString().replace(/[:.]/g, "-")}-${safeFilename(fileName || "world.zip")}`.replace(/\.zip$/, "");
+      // Never over an archive that is already there.
+      const targetFile = await freeArchivePath(paths.worldLibraryDir, stem);
+      await fsp.rename(sourcePath, targetFile);
+      return {
+        archiveName: path.basename(targetFile)
+      };
+    });
   }
 
   async function resolveArchiveSource(tmpDir) {
@@ -272,7 +401,10 @@ function createWorldManager(serverManager, options = {}) {
   // not an archive, and removing it is what "create new world" is for.
   async function deleteWorldArchive(serverId, archiveName) {
     const requested = archiveNameFrom(archiveName);
+    return await oneAtATime(serverId, () => removeArchive(serverId, requested));
+  }
 
+  async function removeArchive(serverId, requested) {
     const server = await serverManager.getServer(serverId);
     if (!server) {
       throw worldError("Server not found.", 404);
@@ -310,6 +442,10 @@ function createWorldManager(serverManager, options = {}) {
   // Nothing about the live world changes until then.
   async function activateWorldArchive(serverId, archiveName) {
     const requested = archiveNameFrom(archiveName);
+    return await oneAtATime(serverId, () => unpacking(() => restoreArchive(serverId, requested)));
+  }
+
+  async function restoreArchive(serverId, requested) {
     const server = await serverManager.getServer(serverId);
     const paths = serverManager.resolveRecordPaths(server);
     const archivePath = await serverManager.readWorldArchivePath(serverId, requested);
@@ -323,31 +459,35 @@ function createWorldManager(serverManager, options = {}) {
     }
     await serverManager.ensureServerStopped(serverId);
     await assertWorldFolderIsOurs(paths);
+    await assertWorldFolderCanBeSwapped(paths);
 
-    // Decided from the archive's own list of contents, before anything is
-    // unpacked: is it readable, is all of it files and folders, does it fit.
-    const contents = await inspectZip(archivePath, { maxBytes: worldLimitBytes });
     const stagingParent = path.dirname(paths.worldDir);
     await ensureDir(stagingParent);
-    const allowance = await unpackAllowance(stagingParent);
-    if (contents.totalBytes > allowance) {
-      throw worldError(
-        `There is not enough free disk space to unpack this world: it needs ${describeBytes(contents.totalBytes)}, and ${describeBytes(allowance)} can be used (1 GB is always left free).`,
-        507
-      );
-    }
-
     await removeStaleStaging(stagingParent);
     const stagingDir = path.join(stagingParent, `${STAGING_PREFIX}${crypto.randomBytes(8).toString("hex")}`);
     await fsp.mkdir(stagingDir, { mode: 0o700 });
     try {
-      // Stops at what was just checked: an entry that holds more than its
-      // header declares ends the unpacking.
-      await extractZip(archivePath, stagingDir, { maxBytes: allowance });
+      // The archive's own list of contents decides, before anything is
+      // unpacked: is it readable, is all of it files and folders, does it fit
+      // the limit - and then, here, does the disk have room for it. Unpacking
+      // stops at what was checked: an entry that holds more than its header
+      // declares ends it.
+      await extractZip(archivePath, stagingDir, {
+        beforeWriting: async (contents) => {
+          const allowance = await unpackAllowance(stagingParent);
+          if (contents.weight > allowance) {
+            throw worldError(
+              `There is not enough free disk space to unpack this world: it needs ${describeBytes(contents.weight)}, and ${describeBytes(allowance)} can be used (1 GB is always left free).`,
+              507
+            );
+          }
+        },
+        maxBytes: worldLimitBytes
+      });
       // The extractor only ever creates files and folders. This looks at what
       // is actually on disk anyway, so that the rule holds for whatever is
       // about to become the world, however it got there.
-      await assertPlainTree(stagingDir, { maxBytes: allowance });
+      await assertPlainTree(stagingDir, { maxBytes: worldLimitBytes });
 
       const extractedRoot = await resolveArchiveSource(stagingDir);
       const levelDat = await fsp.lstat(path.join(extractedRoot, "level.dat")).catch(() => null);
@@ -365,7 +505,11 @@ function createWorldManager(serverManager, options = {}) {
     }
   }
 
-  async function createExportArchive(serverId) {
+  function createExportArchive(serverId) {
+    return oneAtATime(serverId, () => zipLiveWorldForDownload(serverId));
+  }
+
+  async function zipLiveWorldForDownload(serverId) {
     const server = await serverManager.getServer(serverId);
     const paths = serverManager.resolveRecordPaths(server);
     await serverManager.ensureServerStopped(serverId);
@@ -389,7 +533,11 @@ function createWorldManager(serverManager, options = {}) {
     };
   }
 
-  async function createNewWorld(serverId, options = {}) {
+  function createNewWorld(serverId, options = {}) {
+    return oneAtATime(serverId, () => startNewWorld(serverId, options));
+  }
+
+  async function startNewWorld(serverId, options) {
     const server = await serverManager.getServer(serverId);
     const paths = serverManager.resolveRecordPaths(server);
     // What was asked for is checked first. The seed and the world type are
@@ -417,7 +565,7 @@ function createWorldManager(serverManager, options = {}) {
     await serverManager.writeServerProperties(serverId, serializeServerProperties(properties));
     await serverManager.setActiveWorldName(serverId, name);
 
-    await fsp.rm(paths.worldDir, { recursive: true, force: true });
+    await removeLiveWorld(paths);
 
     return {
       nextWorld: {

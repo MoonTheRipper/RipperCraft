@@ -538,5 +538,6 @@ module.exports = {
   newUploadTempPath,
   parseContentDisposition,
   receiveUpload,
+  removeStaleTempFiles,
   resolveUploadLimitBytes
 };

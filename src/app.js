@@ -155,6 +155,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
   // default is the checked one in lib/outbound.js.
   const serverManager = createServerManager(store, { outbound: options.outbound });
   const worldManager = createWorldManager(serverManager, {
+    logger,
     worldLimitBytes: options.worldLimitBytes || resolveWorldLimitBytes(logger)
   });
   const modManager = createModManager(serverManager, {
