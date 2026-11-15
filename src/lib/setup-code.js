@@ -27,7 +27,9 @@ function generateSetupCode() {
 // Forgives what does not matter when copying a code by hand: case, the dashes,
 // stray spaces, and the letters that look like digits.
 function normalizeSetupCode(value) {
-  return String(value === undefined || value === null ? "" : value)
+  // Only text can be a code. Anything else a JSON body might hold is no code
+  // at all, rather than whatever String() would make of it.
+  return (typeof value === "string" ? value : "")
     .toUpperCase()
     .replace(/O/g, "0")
     .replace(/[IL]/g, "1")

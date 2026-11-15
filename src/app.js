@@ -44,8 +44,20 @@ function sanitizeUser(user) {
   };
 }
 
+// A field of a JSON body read as text: a string as it is, a number in its
+// usual spelling, and anything else - an object, a list, true, null - as
+// nothing. String() would instead turn {} into "[object Object]", and on a
+// list nested a few thousand deep it overflows the stack, which on the login
+// route was a 500 anybody could ask for.
+function textOf(value) {
+  if (typeof value === "string") {
+    return value;
+  }
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : "";
+}
+
 function isBlank(value) {
-  return !value || !String(value).trim();
+  return !textOf(value).trim();
 }
 
 // Applies to every password that is set from now on: the owner's at setup, a
@@ -56,7 +68,7 @@ const PASSWORD_MIN_LENGTH = 12;
 // Returns the reason a new password is not acceptable, or "" when it is.
 // Length is counted in characters, not UTF-16 units, so an emoji counts once.
 function newPasswordProblem(password) {
-  if ([...String(password)].length < PASSWORD_MIN_LENGTH) {
+  if ([...textOf(password)].length < PASSWORD_MIN_LENGTH) {
     return `Password must be at least ${PASSWORD_MIN_LENGTH} characters.`;
   }
   return "";
@@ -534,7 +546,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
 
         // One at a time: two requests that both passed the checks above must
         // not both create an owner.
-        const ownerUsername = String(body.username).trim();
+        const ownerUsername = textOf(body.username).trim();
         const outcome = await createOwnerExclusively(async () => {
           const users = await store.getUsers();
           if (users.some((user) => user.role === "owner")) {
@@ -545,8 +557,8 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           }
           const created = await store.createUser({
             username: ownerUsername,
-            displayName: String(body.displayName || body.username).trim(),
-            passwordHash: await hashSecret(String(body.password)),
+            displayName: textOf(body.displayName).trim() || ownerUsername,
+            passwordHash: await hashSecret(textOf(body.password)),
             permissions: normalizeUserPermissions(body.permissions),
             role: "owner",
             servers: []
@@ -580,8 +592,8 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           return;
         }
         const body = await parseJsonBody(req);
-        const username = String(body.username || "").trim().toLowerCase();
-        const password = String(body.password || "");
+        const username = textOf(body.username).trim().toLowerCase();
+        const password = textOf(body.password);
 
         // Counted against the address and the username exactly as typed, real
         // account or not, so being refused says nothing about the username.
@@ -813,7 +825,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           let valid = false;
           try {
             const body = await parseJsonBody(req);
-            valid = await serverManager.verifyServerPassphrase(serverId, String(body.passphrase || ""));
+            valid = await serverManager.verifyServerPassphrase(serverId, textOf(body.passphrase));
           } catch (error) {
             attempt.cancelled();
             throw error;
@@ -1528,7 +1540,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         const user = await store.createUser({
           username,
           displayName: String(body.displayName || username).trim(),
-          passwordHash: await hashSecret(String(body.password)),
+          passwordHash: await hashSecret(textOf(body.password)),
           permissions: access.permissions,
           role: body.role === "owner" ? "owner" : "admin",
           servers: access.servers
@@ -1562,7 +1574,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         }
 
         const updated = await store.updateUser(userId, {
-          passwordHash: await hashSecret(String(body.password))
+          passwordHash: await hashSecret(textOf(body.password))
         });
         // Whoever was logged in with the old password - which may be the very
         // reason for the reset - is logged out. The owner doing the reset
@@ -1622,7 +1634,7 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           username: nextUsername
         };
         if (!isBlank(body.password)) {
-          patch.passwordHash = await hashSecret(String(body.password));
+          patch.passwordHash = await hashSecret(textOf(body.password));
         }
 
         const updated = await store.updateUser(userId, patch);

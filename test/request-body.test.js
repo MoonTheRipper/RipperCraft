@@ -189,6 +189,58 @@ test("bodies that are not a JSON object are client errors, not server faults", a
   assert.equal(app.logs.some((entry) => entry.level === "error"), false);
 });
 
+test("fields of the wrong JSON type are read as empty, not turned into server faults", async (t) => {
+  const app = await startApp(t);
+  const nested = (depth) => `${"[".repeat(depth)}${"]".repeat(depth)}`;
+  let visitor = 0;
+  const post = (path, body, cookie) => {
+    visitor += 1;
+    return app.request({
+      body,
+      headers: { "CF-Connecting-IP": `198.51.100.${visitor}`, "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}) },
+      method: "POST",
+      path
+    });
+  };
+
+  // First run: a setup code that is not text is simply not the code. A list
+  // nested this deep overflows the stack if anything tries to print it.
+  for (const code of [nested(50_000), '{"toString":1}', "true", "12345", '["x"]', "null"]) {
+    const response = await post("/api/setup-owner", `{"setupCode":${code},"username":"owner","password":"a-long-password-1"}`);
+    assert.equal(response.status, 403, code.slice(0, 30));
+  }
+  const owner = await app.setupOwner({ password: "123456789012" });
+
+  // Login: the same for a username or a password. Wrong, and nothing more.
+  for (const [username, password] of [
+    [nested(50_000), '"x"'],
+    ['"owner"', nested(50_000)],
+    ['{"toString":1}', '{"length":99}'],
+    ['["owner"]', '["123456789012"]'],
+    ["true", "false"],
+    ["null", "null"]
+  ]) {
+    const response = await post("/api/login", `{"username":${username},"password":${password}}`);
+    assert.equal(response.status, 401, `${username.slice(0, 30)} / ${password.slice(0, 30)}`);
+    assert.deepEqual(response.json, { error: "Invalid username or password." });
+  }
+  // A number is still read as its digits, as it always was.
+  assert.equal((await post("/api/login", '{"username":"owner","password":123456789012}')).status, 200);
+
+  // A new password that is not text is no password, not the text "[object Object]".
+  for (const password of ["{}", '["a-long-password-1"]', "true", nested(50_000)]) {
+    const response = await post("/api/users", `{"username":"lane","password":${password}}`, owner.cookie());
+    assert.equal(response.status, 400, password.slice(0, 30));
+    assert.deepEqual(response.json, { error: "Username and password are required." });
+  }
+  assert.deepEqual(
+    (await owner("GET", "/api/users")).json.users.map((user) => user.username),
+    ["owner"]
+  );
+
+  assert.equal(app.logs.some((entry) => entry.level === "error"), false);
+});
+
 test("a request that is refused before its body is read does not get to keep sending", async (t) => {
   const app = await startApp(t);
   await app.setupOwner();
