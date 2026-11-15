@@ -10,11 +10,22 @@ const { createOutbound, setDefaultOutboundForTests } = require("../src/lib/outbo
 // An address on the public internet for names that do not need a particular one.
 const PUBLIC_ADDRESS = "93.184.215.14";
 
+// The fetch this process started with: the one that really goes out.
+const builtInFetch = globalThis.fetch;
+
 // A transport that asks globalThis.fetch for the response, so a test can keep
 // describing the outside world by replacing fetch. The stand-in may answer
 // with a real Response or with an object that has only the parts a test
 // bothered to write: { ok, status, json(), text(), arrayBuffer() }.
+//
+// It asks a stand-in and nothing else. A test that has not replaced fetch gets
+// a refused connection, not a request to whatever the address really is.
 async function fetchTransport({ headers, url }) {
+  if (globalThis.fetch === builtInFetch) {
+    throw Object.assign(new Error(`A test asked for ${url.href} without a stand-in for fetch. Tests do not use the network.`), {
+      code: "ECONNREFUSED"
+    });
+  }
   const response = await globalThis.fetch(url.href, { headers, redirect: "manual" });
   const status = typeof response.status === "number" ? response.status : response.ok === false ? 500 : 200;
   let bytes = Buffer.alloc(0);
@@ -106,6 +117,14 @@ function unconnectedOutbound(overrides = {}) {
   });
   return { dialled, outbound };
 }
+
+// From the moment a test file loads this module, nothing in it reaches the
+// network by leaving something out. A server or add-on manager that is not
+// handed a fetcher falls back to a shared one, and for the dashboard that is
+// the real thing; here it is one that looks no name up and connects to
+// nothing. A test that wants an answer says what the answer is, with
+// scriptedOutbound() or useFetchForOutbound().
+setDefaultOutboundForTests(unconnectedOutbound({ lookup: async () => [{ address: PUBLIC_ADDRESS, family: 4 }] }).outbound);
 
 module.exports = {
   PUBLIC_ADDRESS,

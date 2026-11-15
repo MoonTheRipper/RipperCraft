@@ -12,11 +12,12 @@ const { Readable, Writable } = require("node:stream");
 const {
   MAX_REDIRECTS,
   createOutbound,
+  getDefaultOutbound,
   httpsTransport,
   isPublicAddress,
   resolveDownloadLimitBytes
 } = require("../src/lib/outbound");
-const { PUBLIC_ADDRESS, scriptedOutbound } = require("../test-support/outbound");
+const { PUBLIC_ADDRESS, fetchBackedOutbound, scriptedOutbound, unconnectedOutbound } = require("../test-support/outbound");
 
 const OTHER_PUBLIC_ADDRESS = "151.101.1.69";
 
@@ -799,3 +800,77 @@ test("the download limit comes from RIPPERCRAFT_MAX_DOWNLOAD_MB, and defaults to
   }
   assert.equal(warnings.length, 3);
 });
+
+// --- the tests themselves ------------------------------------------------------------------------------------------
+//
+// A test that forgets to say what the network answers must not find out by
+// asking it.
+
+test("in a test, a manager that is handed no fetcher gets one that connects to nothing", async () => {
+  // What a server or add-on manager falls back to. Loading test-support
+  // replaced the real one; no name is looked up and nothing is dialled.
+  const fallback = getDefaultOutbound();
+  const startedAt = Date.now();
+  await assert.rejects(fallback.fetchJson("https://nothing.invalid/versions.json"), {
+    message: "Could not connect to nothing.invalid.",
+    statusCode: 502
+  });
+  assert.ok(Date.now() - startedAt < 2000);
+  // It is still the dashboard's fetcher in every other way.
+  await assert.rejects(fallback.fetchJson("http://nothing.invalid/versions.json"), { statusCode: 400 });
+  await assert.rejects(fallback.fetchJson("https://127.0.0.1/versions.json"), { statusCode: 400 });
+
+  // One made by hand says what it would have dialled.
+  const { dialled, outbound } = unconnectedOutbound({ lookup: async () => [{ address: PUBLIC_ADDRESS, family: 4 }] });
+  await assert.rejects(outbound.fetchBuffer("https://files.example/a.jar"), { statusCode: 502 });
+  assert.deepEqual(dialled, [{ address: PUBLIC_ADDRESS, url: "https://files.example/a.jar" }]);
+});
+
+test("in a test, a fetcher that asks fetch asks a stand-in or nobody", async (t) => {
+  // Something on this machine that would hear a real request being made.
+  let heard = 0;
+  const listener = net.createServer((socket) => {
+    heard += 1;
+    socket.on("error", () => {});
+    socket.destroy();
+  });
+  await new Promise((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => listener.close(resolve)));
+  const address = `https://localhost:${listener.address().port}/a.jar`;
+
+  // fetch has not been replaced here, so nothing is asked.
+  await assert.rejects(fetchBackedOutbound().fetchBuffer(address), { statusCode: 502 });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(heard, 0);
+
+  // With a stand-in, the stand-in is what answers.
+  const builtIn = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = builtIn;
+  });
+  globalThis.fetch = async () => new Response("from the stand-in");
+  assert.equal((await fetchBackedOutbound().fetchBuffer(address)).toString(), "from the stand-in");
+  assert.equal(heard, 0);
+});
+
+test("every test file that can reach the fetcher loads the stand-ins for it", () => {
+  // The fallback above is only in place in a file that loaded test-support.
+  // A file that drives the app, a server manager or an add-on manager without
+  // it would be one forgotten answer away from the real network.
+  const reachesTheFetcher = /require\("\.\.\/src\/(app|lib\/(servers|mod-sources|worlds|outbound))"\)/;
+  const loadsTheStandIns = /require\("\.\.\/test-support\/(app|lane|pages|outbound)"\)/;
+  const forgetful = fs
+    .readdirSync(__dirname)
+    .filter((name) => name.endsWith(".test.js"))
+    .filter((name) => {
+      const source = fs.readFileSync(path.join(__dirname, name), "utf8");
+      return reachesTheFetcher.test(source) && !loadsTheStandIns.test(source);
+    });
+  assert.deepEqual(forgetful, []);
+  // And those that do load them get the fallback through any of the four.
+  for (const name of ["app", "lane", "pages"]) {
+    const source = fs.readFileSync(path.join(__dirname, "..", "test-support", `${name}.js`), "utf8");
+    assert.match(source, /require\("\.\/(outbound|app|lane)"\)/, name);
+  }
+});
+

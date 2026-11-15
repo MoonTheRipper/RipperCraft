@@ -6,6 +6,9 @@ const os = require("node:os");
 const path = require("node:path");
 const { hashSecret, setHashCostForTests } = require("../src/lib/auth");
 const { createServerManager } = require("../src/lib/servers");
+// Loaded for what it does on the way in: the server manager below is given a
+// fetcher that connects to nothing.
+require("../test-support/outbound");
 const { createStore } = require("../src/lib/store");
 const { childEnvironment, runCommand } = require("../src/lib/utils");
 

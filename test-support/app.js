@@ -8,6 +8,9 @@ const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const { createApp } = require("../src/app");
+// Loaded for what it does on the way in: apps started here are given a
+// fetcher that connects to nothing unless a test hands them another.
+require("./outbound");
 
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
 
