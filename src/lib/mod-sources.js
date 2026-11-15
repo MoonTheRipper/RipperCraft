@@ -4,7 +4,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { getDefaultOutbound } = require("./outbound");
 const { ensureDir, nowIso, runCommand, safeFilename } = require("./utils");
-const { invalid, plainText } = require("./validate");
+const { httpsAddress, invalid, plainText } = require("./validate");
 
 const MODRINTH_API = "https://api.modrinth.com/v2";
 const CURSEFORGE_API = "https://api.curseforge.com/v1";
@@ -206,7 +206,7 @@ function createModManager(serverManager, options = {}) {
       compatibilityLabel: `${profile.loader} • ${profile.gameVersion} • ${profile.projectType}`,
       description: providerText(result.description),
       downloads: Number(result.downloads) || 0,
-      iconUrl: providerText(result.icon_url),
+      iconUrl: httpsAddress(result.icon_url),
       id: providerText(result.project_id),
       pageUrl: providerText(result.slug) ? `https://modrinth.com/mod/${encodeURIComponent(providerText(result.slug))}` : "",
       provider: "modrinth",
@@ -317,14 +317,13 @@ function createModManager(serverManager, options = {}) {
       compatibilityLabel: `${profile.loader} • ${profile.gameVersion} • mod`,
       description: providerText(result.summary),
       downloads: Number(result.downloadCount) || 0,
-      iconUrl: providerText(result.logo && result.logo.thumbnailUrl),
+      iconUrl: httpsAddress(result.logo && result.logo.thumbnailUrl),
       id: providerText(result.id),
       serverSide: "unknown",
       // Authors can disable third-party downloads; flag it here so the UI can
       // point at CurseForge instead of offering an install that cannot succeed.
       manualDownloadOnly: result.allowModDistribution === false,
-      pageUrl:
-        result.links && /^https?:\/\//i.test(providerText(result.links.websiteUrl)) ? result.links.websiteUrl : "",
+      pageUrl: httpsAddress(result.links && result.links.websiteUrl),
       provider: "curseforge",
       slug: providerText(result.slug),
       title: providerText(result.name)
@@ -389,12 +388,11 @@ function createModManager(serverManager, options = {}) {
       const payload = await fetchJson(`${CURSEFORGE_API}/mods/${encodeURIComponent(curseforgeModId(modId))}`, {
         headers: await curseforgeHeaders()
       });
-      const data = payload.data || {};
-      const websiteUrl = (data.links && data.links.websiteUrl) || "";
+      const data = (payload && payload.data) || {};
       return {
-        modName: data.name || "",
-        // Only ever hand an http(s) link back; this value ends up in an href.
-        websiteUrl: /^https?:\/\//i.test(websiteUrl) ? websiteUrl : ""
+        modName: providerText(data.name),
+        // Only ever hand an https link back; this value ends up in an href.
+        websiteUrl: httpsAddress(data.links && data.links.websiteUrl)
       };
     } catch {
       return { modName: "", websiteUrl: "" };
@@ -403,8 +401,12 @@ function createModManager(serverManager, options = {}) {
 
   async function manualDownloadRequiredError(modId, file) {
     const { modName, websiteUrl } = await resolveCurseforgeModPage(modId);
-    const pageUrl = websiteUrl ? `${websiteUrl}/files/${file.id}` : "";
-    const label = modName || file.fileName || `CurseForge project ${modId}`;
+    // What CurseForge said about the file, as text: this is shown to whoever
+    // asked, and offered to them as a link.
+    const fileId = providerText(file.id);
+    const fileName = providerText(file.fileName);
+    const pageUrl = websiteUrl && fileId ? httpsAddress(`${websiteUrl.replace(/\/+$/, "")}/files/${encodeURIComponent(fileId)}`) : "";
+    const label = modName || fileName || `CurseForge project ${modId}`;
     const error = new Error(
       `${label} cannot be installed automatically because its author disabled third-party downloads on CurseForge. ` +
         (pageUrl
@@ -414,8 +416,8 @@ function createModManager(serverManager, options = {}) {
     error.statusCode = 409;
     error.code = "CURSEFORGE_MANUAL_DOWNLOAD_REQUIRED";
     error.manualDownload = {
-      fileId: String(file.id),
-      fileName: file.fileName || "",
+      fileId,
+      fileName,
       modId: String(modId),
       modName: label,
       pageUrl,

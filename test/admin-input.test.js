@@ -16,6 +16,22 @@ const MARKUP = "<img src=x onerror=alert(1)>";
 // Everything JSON can put where a name was expected.
 const NOT_TEXT = [{ __html: MARKUP }, [MARKUP], { toString: "x" }, true, 7, null, undefined, "", "   "];
 
+// Addresses a page must not be handed as a picture or a link: they are not
+// absolute https addresses. The first few would be fetched from this dashboard
+// with the viewer's own session.
+const NOT_A_WEB_ADDRESS = [
+  "/api/servers/DemoServer/worlds/export",
+  "api/logout",
+  "//files.example/icon.png",
+  "javascript:alert(1)",
+  "data:image/svg+xml,<svg onload=alert(1)>",
+  "http://files.example/icon.png",
+  "https://someone:secret@files.example/icon.png",
+  "file:///etc/hostname",
+  `https://files.example/${"a".repeat(2100)}.png`,
+  "not an address"
+];
+
 // Every value in a response, however deep, with the path it was found at.
 function leaves(value, at = "") {
   if (Array.isArray(value)) {
@@ -80,7 +96,8 @@ test("a world archive is named by text or not at all", async (t) => {
 test("the add-on list is sent as text, whatever the manifest file holds", async (t) => {
   const { admin, app, owner } = await startWithAdmin(t);
   const serverDir = path.join(app.root, "servers", "DemoServer");
-  for (const name of ["hostile.jar", "honest.jar", "untracked.jar"]) {
+  const pictured = NOT_A_WEB_ADDRESS.map((_address, index) => `pictured-${index}.jar`);
+  for (const name of ["hostile.jar", "honest.jar", "untracked.jar", ...pictured]) {
     await fsp.writeFile(path.join(serverDir, "mods", name), "jar");
   }
   await fsp.mkdir(path.join(serverDir, ".rippermoon"), { recursive: true });
@@ -108,7 +125,8 @@ test("the add-on list is sent as text, whatever the manifest file holds", async 
           serverSide: "optional",
           sourceId: "abc",
           title: "An Honest Mod"
-        }
+        },
+        ...NOT_A_WEB_ADDRESS.map((address, index) => ({ fileName: pictured[index], iconUrl: address, pageUrl: address, provider: "modrinth", sourceId: "abc", title: "Pictured" }))
       ]
     })
   );
@@ -132,8 +150,18 @@ test("the add-on list is sent as text, whatever the manifest file holds", async 
         title: "",
         tracked: true
       });
-      assert.equal(mods.find((entry) => entry.fileName === "honest.jar").title, "An Honest Mod");
+      const honest = mods.find((entry) => entry.fileName === "honest.jar");
+      assert.equal(honest.title, "An Honest Mod");
+      assert.equal(honest.iconUrl, "https://cdn.modrinth.com/data/abc/icon.png");
+      assert.equal(honest.pageUrl, "https://modrinth.com/mod/abc");
       assert.equal(mods.find((entry) => entry.fileName === "untracked.jar").tracked, false);
+      // A picture or a link that is not an https address is not passed on.
+      for (const fileName of pictured) {
+        const entry = mods.find((candidate) => candidate.fileName === fileName);
+        assert.equal(entry.title, "Pictured");
+        assert.equal(entry.iconUrl, "", fileName);
+        assert.equal(entry.pageUrl, "", fileName);
+      }
     }
     assert.doesNotMatch(JSON.stringify(snapshot.mods), /onerror|javascript:/);
 
@@ -143,7 +171,7 @@ test("the add-on list is sent as text, whatever the manifest file holds", async 
     for (const [at, value] of leaves(updates.json)) {
       assert.ok(value === null || ["string", "boolean", "number"].includes(typeof value), `updates${at} is ${JSON.stringify(value)}`);
     }
-    assert.deepEqual(updates.json.entries.map((entry) => entry.fileName).sort(), ["honest.jar", "hostile.jar", "untracked.jar"]);
+    assert.deepEqual(updates.json.entries.map((entry) => entry.fileName).sort(), ["honest.jar", "hostile.jar", ...pictured, "untracked.jar"].sort());
     assert.doesNotMatch(updates.text, /onerror|javascript:/);
   }
 });
@@ -204,7 +232,8 @@ test("search results reach the page as text and numbers, whatever the provider s
             slug: { __html: MARKUP },
             title: { __html: MARKUP }
           },
-          { author: "someone", client_side: "required", description: "A mod", downloads: 1234, icon_url: "https://cdn.modrinth.com/i.png", project_id: "AANobbMI", server_side: "optional", slug: "a mod/../x", title: "A Mod" }
+          { author: "someone", client_side: "required", description: "A mod", downloads: 1234, icon_url: "https://cdn.modrinth.com/i.png", project_id: "AANobbMI", server_side: "optional", slug: "a mod/../x", title: "A Mod" },
+          ...NOT_A_WEB_ADDRESS.map((icon_url, index) => ({ icon_url, project_id: `picture${index}`, slug: `picture-${index}`, title: "Picture" }))
         ]
       })
     })
@@ -213,7 +242,12 @@ test("search results reach the page as text and numbers, whatever the provider s
 
   const response = await admin("POST", "/api/servers/DemoServer/mods/search", { json: { provider: "modrinth", query: "sodium" } });
   assert.equal(response.status, 200, response.text);
-  assert.equal(response.json.results.length, 2);
+  assert.equal(response.json.results.length, 2 + NOT_A_WEB_ADDRESS.length);
+  // Artwork is loaded by the page of whoever is looking. An address that is
+  // not an https one - a path on this dashboard, say - is not passed on.
+  for (const result of response.json.results.slice(2)) {
+    assert.equal(result.iconUrl, "", JSON.stringify(result));
+  }
   for (const [at, value] of leaves(response.json.results)) {
     assert.ok(["string", "number"].includes(typeof value), `${at} is ${JSON.stringify(value)}`);
   }

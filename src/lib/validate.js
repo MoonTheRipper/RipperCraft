@@ -67,6 +67,24 @@ function hasControlCharacters(text) {
   return CONTROL_CHARACTERS.test(text);
 }
 
+// An address a page may link to or load a picture from: an absolute https://
+// one, with no user name in it. Add-on artwork and project pages are all of
+// that kind. Anything else comes back as "" - a path on this dashboard, which
+// a browser would fetch with the viewer's own session; a javascript: or data:
+// address; plain http; something that is not text.
+function httpsAddress(value) {
+  if (typeof value !== "string" || value.length > 2000) {
+    return "";
+  }
+  let url;
+  try {
+    url = new URL(value.trim());
+  } catch {
+    return "";
+  }
+  return url.protocol === "https:" && !url.username && !url.password ? url.href : "";
+}
+
 const EVERY_CONTROL_CHARACTER = new RegExp(CONTROL_CHARACTERS.source, "g");
 
 // Text read back from a file that is not the dashboard's alone to write - one
@@ -231,6 +249,7 @@ module.exports = {
   MINECRAFT_VERSION_MAX_LENGTH,
   displayText,
   hasControlCharacters,
+  httpsAddress,
   integerInRange,
   invalid,
   isArgFilePath,

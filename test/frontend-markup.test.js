@@ -106,6 +106,20 @@ test("escaping never throws, whatever it is handed", async () => {
   }
 });
 
+test("add-on artwork is loaded from a web address or not at all", async () => {
+  const { renderAddonIcon } = await loadPublicModule("js/components.js");
+
+  assert.match(renderAddonIcon("https://cdn.modrinth.com/data/abc/icon.png", "A Mod"), /<img\s+src="https:\/\/cdn\.modrinth\.com\/data\/abc\/icon\.png"/);
+  // A path here would be fetched from the dashboard itself, as whoever is looking.
+  for (const address of ["/api/servers/DemoServer/worlds/export", "api/logout", "//files.example/icon.png", "javascript:alert(1)", "data:image/svg+xml,<svg>", "", null, {}, ["https://files.example/a.png"]]) {
+    const markup = renderAddonIcon(address, "A Mod");
+    assert.doesNotMatch(markup, /<img/, JSON.stringify(address));
+    assert.match(markup, /addon-icon__fallback/, JSON.stringify(address));
+  }
+  // An address that is one is still text inside an attribute.
+  assert.doesNotMatch(renderAddonIcon(`https://files.example/"><b data-marker="x">`, "A Mod"), /<b data-marker/);
+});
+
 test("a time is shown as a time or as unknown, and never breaks the page", async () => {
   const { formatDate } = await loadPublicModule("js/format.js");
 

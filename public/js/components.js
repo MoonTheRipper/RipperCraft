@@ -1,4 +1,4 @@
-import { escapeHtml, icon, labelWithIcon, renderSelectOptions, renderValue } from "./html.js";
+import { escapeHtml, icon, labelWithIcon, renderSelectOptions, renderValue, safeUrl } from "./html.js";
 import { state } from "./state.js";
 
 export function renderSafeSettingField(definition, value) {
@@ -152,16 +152,21 @@ export function renderAddonSideBadge(clientSide, serverSide) {
 //
 // The alt is empty on purpose: the add-on's name sits next to it as real text,
 // so describing the artwork again would just be read out twice.
+//
+// The picture is loaded only from an absolute web address. Escaping keeps an
+// address inside its attribute and says nothing about where it leads: a path
+// on this dashboard would be fetched with the viewer's own session.
 export function renderAddonIcon(iconUrl, title) {
   const fallback = `<span class="addon-icon__fallback">${icon("mods")}</span>`;
-  if (!iconUrl) {
+  const address = safeUrl(iconUrl);
+  if (!address) {
     return `<span class="addon-icon">${fallback}</span>`;
   }
   return `
     <span class="addon-icon">
       ${fallback}
       <img
-        src="${escapeHtml(iconUrl)}"
+        src="${escapeHtml(address)}"
         alt=""
         loading="lazy"
         decoding="async"

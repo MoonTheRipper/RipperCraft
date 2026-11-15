@@ -37,6 +37,7 @@ const {
   invalid,
   isArgFilePath,
   displayText,
+  httpsAddress,
   isMemorySetting,
   isMinecraftVersion,
   normalizeLoader,
@@ -1234,8 +1235,9 @@ function createServerManager(store, options = {}) {
         return {
           ...entry,
           clientSide: text(tracked.clientSide, "unknown"),
-          iconUrl: text(tracked.iconUrl),
-          pageUrl: text(tracked.pageUrl),
+          // A picture the page loads and a link it offers: https, or neither.
+          iconUrl: httpsAddress(tracked.iconUrl),
+          pageUrl: httpsAddress(tracked.pageUrl),
           provider: text(tracked.provider),
           serverSide: text(tracked.serverSide, "unknown"),
           sourceId: text(tracked.sourceId),
