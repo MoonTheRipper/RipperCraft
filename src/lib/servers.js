@@ -35,8 +35,11 @@ const {
 const {
   integerInRange,
   invalid,
+  isArgFilePath,
+  isMemorySetting,
   isMinecraftVersion,
   normalizeLoader,
+  normalizeMemory,
   normalizeMinecraftVersion,
   plainText,
   propertyValue,
@@ -857,11 +860,12 @@ function createServerManager(store, options = {}) {
           }
           checked.passphrase = value;
           break;
+        // Both are written into the launch script.
         case "maxMemory":
-          checked.maxMemory = singleLine(value, "Max memory", { maxLength: 16 });
+          checked.maxMemory = normalizeMemory(value, "Max memory");
           break;
         case "minMemory":
-          checked.minMemory = singleLine(value, "Min memory", { maxLength: 16 });
+          checked.minMemory = normalizeMemory(value, "Min memory");
           break;
         // Written by this file after it has provisioned a runtime, never taken
         // from a request body.
@@ -1921,7 +1925,29 @@ function createServerManager(store, options = {}) {
     );
   }
 
-  function buildLaunchScript(minMemory = "2G", maxMemory = "4G", launch = null) {
+  // Three values are written into the script: the two memory sizes and, for
+  // Forge and NeoForge, the path of the argfile. All three sit inside double
+  // quotes in a bash script, where a quote, a "$(...)" or a backtick in the
+  // value would be a command. The settings route checks the memory sizes on
+  // the way in; this checks all three again on the way out, so a record that
+  // was written before that - or edited by hand - cannot put anything else
+  // into a script that is about to be run. Nothing is escaped: a value is
+  // either of the right shape or the script is not written.
+  function buildLaunchScript(minMemoryValue, maxMemoryValue, launch = null) {
+    const minMemory = minMemoryValue || "2G";
+    const maxMemory = maxMemoryValue || "4G";
+    for (const [label, value] of [["min memory", minMemory], ["max memory", maxMemory]]) {
+      if (!isMemorySetting(value)) {
+        throw userFacingError(
+          `This server's ${label} setting is not a memory size the dashboard will write into a launch script. Set it to a whole number followed by K, M or G, such as 4G, in the server's settings.`
+        );
+      }
+    }
+    if (launch && launch.kind === "argfile" && launch.argFile && !isArgFilePath(launch.argFile)) {
+      throw userFacingError(
+        "This server's recorded loader argfile is not a plain path inside the server folder, so no launch script was written for it. Reinstall the loader from the update panel."
+      );
+    }
     const launchLine = buildLaunchLine(launch);
     return `#!/usr/bin/env bash
 

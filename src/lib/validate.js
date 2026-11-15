@@ -36,6 +36,14 @@ const KNOWN_LOADER_SET = new Set(KNOWN_LOADERS);
 const MINECRAFT_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._+-]*(?: [A-Za-z0-9][A-Za-z0-9._+-]*)*$/;
 const MINECRAFT_VERSION_MAX_LENGTH = 64;
 
+// What the JVM takes after -Xms and -Xmx: a whole number and a unit.
+const MEMORY_PATTERN = /^[0-9]{1,6}[KMG]$/i;
+
+// The path of a Forge or NeoForge argfile inside a server folder, such as
+// libraries/net/minecraftforge/forge/1.20.1-47.4.10/unix_args.txt: plain names
+// separated by slashes, none of them starting with a dot.
+const ARG_FILE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._+-]*(?:\/[A-Za-z0-9][A-Za-z0-9._+-]*)*$/;
+
 // C0 and C1 control characters, DEL, and the two Unicode line separators. None
 // of them belongs in a name, a description or a one-line setting, and several
 // of them start a new line in whatever file or log the value ends up in.
@@ -111,6 +119,25 @@ function normalizeMinecraftVersion(value, label = "The Minecraft version") {
     );
   }
   return version;
+}
+
+function isMemorySetting(value) {
+  return typeof value === "string" && MEMORY_PATTERN.test(value);
+}
+
+// A JVM memory size, such as 4G or 512M. Blank is allowed and means "use the
+// default". Both end up inside a shell script, so nothing else is.
+function normalizeMemory(value, label) {
+  const text = plainText(value);
+  const memory = text === null ? null : text.trim();
+  if (memory === null || (memory && !MEMORY_PATTERN.test(memory))) {
+    throw invalid(`${label} must be a whole number followed by K, M or G, such as 4G or 512M.`);
+  }
+  return memory;
+}
+
+function isArgFilePath(value) {
+  return typeof value === "string" && value.length <= 300 && ARG_FILE_PATTERN.test(value);
 }
 
 // A value for server.properties.
@@ -192,9 +219,12 @@ module.exports = {
   hasControlCharacters,
   integerInRange,
   invalid,
+  isArgFilePath,
+  isMemorySetting,
   isMinecraftVersion,
   normalizeLevelType,
   normalizeLoader,
+  normalizeMemory,
   normalizeMinecraftVersion,
   plainText,
   propertyValue,
