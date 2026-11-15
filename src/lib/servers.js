@@ -1083,13 +1083,24 @@ function createServerManager(store, options = {}) {
     };
   }
 
-  async function listServerOperators(serverId) {
+  // The operators in ops.json. For showing them, a file that cannot be read as
+  // a list counts as an empty one, so that it cannot keep the server's page
+  // from loading. `forChange` is for the routes that go on to write the list
+  // back: they stop instead, and leave a file they could not read as it is.
+  async function listServerOperators(serverId, { forChange = false } = {}) {
     const server = await getServer(serverId);
     if (!server) {
       throw new Error("Server not found.");
     }
     const paths = resolveRecordPaths(server);
-    const payload = await readJson(paths.opsFile, []);
+    let payload = [];
+    try {
+      payload = await readJson(paths.opsFile, []);
+    } catch {
+      if (forChange) {
+        throw userFacingError("This server's ops.json could not be read, so it has been left as it is. Correct or remove the file, then try again.");
+      }
+    }
     const onlineMode = await serverIsOnlineMode(serverId);
     const expected = onlineMode ? "online" : "offline";
     return (Array.isArray(payload) ? payload : [])
@@ -1141,7 +1152,7 @@ function createServerManager(store, options = {}) {
       throw userFacingError("Choose an op level between 1 and 4 for this operator.", 400);
     }
 
-    const current = await listServerOperators(serverId);
+    const current = await listServerOperators(serverId, { forChange: true });
     // Always derive the uuid from the server's auth mode rather than trusting
     // whatever the caller sent, so the entry can actually match a player.
     const uuid = await resolveOperatorUuid(serverId, name);
@@ -1152,7 +1163,7 @@ function createServerManager(store, options = {}) {
   // Rewrites existing operators to the uuid form the server's auth mode needs.
   // Fixes entries added before the mode was known or changed afterwards.
   async function repairServerOperators(serverId) {
-    const current = await listServerOperators(serverId);
+    const current = await listServerOperators(serverId, { forChange: true });
     const next = [];
     const failures = [];
     let repaired = 0;
@@ -1177,7 +1188,7 @@ function createServerManager(store, options = {}) {
 
   async function removeServerOperator(serverId, uuid) {
     const targetUuid = String(uuid || "").trim().toLowerCase();
-    const current = await listServerOperators(serverId);
+    const current = await listServerOperators(serverId, { forChange: true });
     return await writeServerOperators(
       serverId,
       current.filter((operator) => operator.uuid !== targetUuid)
@@ -1254,7 +1265,14 @@ function createServerManager(store, options = {}) {
       throw new Error("Server not found.");
     }
     const paths = resolveRecordPaths(server);
-    const payload = await readJson(paths.addonManifestFile, null);
+    // A manifest that cannot be read at all tracks nothing: every add-on shows
+    // as one dropped in by hand, and the next install writes the file afresh.
+    let payload = null;
+    try {
+      payload = await readJson(paths.addonManifestFile, null);
+    } catch {
+      payload = null;
+    }
     const addons = payload && typeof payload === "object" && Array.isArray(payload.addons) ? payload.addons : [];
     // An entry is the record of one file, and each field of it is a word, a
     // number or a yes/no. The manifest sits in the server's folder, so it can

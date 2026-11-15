@@ -365,6 +365,21 @@ test("the operator list is drawn from text and numbers, whatever ops.json holds"
   assert.ok([200, 201].includes(added.status), added.text);
   const kept = JSON.parse(await fsp.readFile(path.join(serverDir, "ops.json"), "utf8"));
   assert.deepEqual(kept.map((operator) => operator.name).sort(), ["Alex line two", "Moon", "N".repeat(64), "Steve"]);
+
+  // A file that is not JSON, or not a list, shows as no operators and does not
+  // keep the page from loading.
+  for (const contents of ["{{{{", "", "null", "7", '{"name":"Steve"}']) {
+    await fsp.writeFile(path.join(serverDir, "ops.json"), contents);
+    const page = await owner("GET", "/api/servers/DemoServer");
+    assert.equal(page.status, 200, `${contents}: ${page.text.slice(0, 200)}`);
+    assert.deepEqual(page.json.operators, [], contents);
+  }
+  // One that cannot be read at all is not written over by adding to it.
+  await fsp.writeFile(path.join(serverDir, "ops.json"), '[{"name":"Steve","level":4,');
+  const refused = await owner("POST", "/api/servers/DemoServer/operators", { json: { level: 1, name: "Moon" } });
+  assert.equal(refused.status, 409, refused.text);
+  assert.match(refused.json.error, /ops\.json could not be read/);
+  assert.equal(await fsp.readFile(path.join(serverDir, "ops.json"), "utf8"), '[{"name":"Steve","level":4,');
 });
 
 test("an add-on manifest that is not a manifest lists nothing as tracked and breaks nothing", async (t) => {
@@ -373,7 +388,7 @@ test("an add-on manifest that is not a manifest lists nothing as tracked and bre
   await fsp.writeFile(path.join(serverDir, "mods", "untracked.jar"), "jar");
   await fsp.mkdir(path.join(serverDir, ".rippermoon"), { recursive: true });
 
-  for (const contents of ["null", "7", '"text"', "[]", '{"addons":null}', '{"addons":{"0":{"fileName":"untracked.jar"}}}', '{"addons":[null,7,"untracked.jar",["untracked.jar"],{"fileName":{"toString":"x"}},{"title":"no file"}]}']) {
+  for (const contents of ["{{{{", "", "null", "7", '"text"', "[]", '{"addons":null}', '{"addons":{"0":{"fileName":"untracked.jar"}}}', '{"addons":[null,7,"untracked.jar",["untracked.jar"],{"fileName":{"toString":"x"}},{"title":"no file"}]}']) {
     await fsp.writeFile(path.join(serverDir, ".rippermoon", "addons.json"), contents);
     const snapshot = await admin("GET", "/api/servers/DemoServer");
     assert.equal(snapshot.status, 200, `${contents}: ${snapshot.text}`);
