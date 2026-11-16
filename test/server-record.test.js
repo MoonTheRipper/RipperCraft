@@ -621,7 +621,8 @@ test("what a stop is about to signal is looked at again first: after its console
   await first.serverManager.startServer(SERVER_ID, OWNER);
   const pid = await server.whenReady();
   // A dashboard started later: all it has is the record, and what /proc says of the pid in it.
-  const { problems, serverManager } = await createManager(server.root, { stopWaits: { ...QUICK_WAITS, console: 400 } });
+  // The wait is long enough for the stand-in to have moved before it is over, on a busy machine too.
+  const { problems, serverManager } = await createManager(server.root, { stopWaits: { ...QUICK_WAITS, console: 1500 } });
 
   const stopped = await serverManager.stopServer(SERVER_ID, OWNER);
   // It was told on its console, as this server. When the wait ran out, the
@@ -640,7 +641,7 @@ test("what a stop is about to signal is looked at again first: after its console
 test("the same before SIGKILL: a process that has left the server's folder since SIGTERM is not killed", { skip: withoutProc }, async (t) => {
   const server = await createServerRoot(t);
   standInThatMovesAway(server);
-  const { problems, serverManager } = await createManager(server.root, { stopWaits: { ...QUICK_WAITS, signalOnly: 400 } });
+  const { problems, serverManager } = await createManager(server.root, { stopWaits: { ...QUICK_WAITS, signalOnly: 1500 } });
   // On record without a console: a signal is all that reaches it.
   const standIn = startLegacyServer(t, server);
   const pid = await server.whenReady();

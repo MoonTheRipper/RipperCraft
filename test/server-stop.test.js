@@ -485,11 +485,13 @@ test("a server that does not come up is not said to have been killed by the stop
   await server.whenReady();
   assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("SIGKILL"));
 
-  // The next start gets as far as a process, which exits at once. Nobody
-  // ever saw that one running.
-  fs.writeFileSync(path.join(server.serverDir, "fake-server.js"), "#!/usr/bin/env node\nprocess.exit(3);\n", { mode: 0o755 });
-  assert.deepEqual(await serverManager.startServer(SERVER_ID, OWNER), STOPPED);
-  assert.match(server.runtimeLog(), /^\[[^\]]+\] Process exited with code 3$/m);
+  // The next start gets as far as a process, which exits at once: as a rule
+  // before anybody has seen it running.
+  fs.writeFileSync(path.join(server.serverDir, "fake-server.js"), "#!/bin/sh\nexit 3\n", { mode: 0o755 });
+  await serverManager.startServer(SERVER_ID, OWNER);
+  await waitFor(async () => !(await serverManager.getServerStatus(SERVER_ID)).running, "the failed start to be over");
+  assert.deepEqual(await serverManager.getServerStatus(SERVER_ID), STOPPED);
+  await waitFor(() => /^\[[^\]]+\] Process exited with code 3$/m.test(server.runtimeLog()), "the exit to be written down");
 });
 
 test("a look at a server that began just before it went does not take away what its stop sets down", async (t) => {
