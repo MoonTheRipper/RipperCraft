@@ -363,12 +363,15 @@ async function createApp(rootDir = process.cwd(), options = {}) {
         configured: providers.curseforge,
         // An environment variable outranks the stored value. The key can still
         // be saved here, but it stays dormant until the variable is removed -
-        // so tell the owner exactly where to go and what to change.
+        // so tell the owner exactly where to go and what to change. Which file
+        // and which unit that is depends on how the dashboard was installed:
+        // rippercraft.service says so in its environment, and a dashboard that
+        // is told nothing is one still running under the unit's earlier name.
         envOverride:
           providers.curseforgeSource === "environment"
             ? {
-                envFile: process.env.RIPPERMOONSTASH_ENV_FILE || "/etc/rippermoonstash.env",
-                service: "rippermoonstash",
+                envFile: readEnv("ENV_FILE", "/etc/rippermoonstash.env"),
+                service: readEnv("SERVICE", "rippermoonstash"),
                 variable: "CURSEFORGE_API_KEY"
               }
             : null,

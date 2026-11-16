@@ -3,6 +3,8 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 
+const { startApp } = require("../test-support/app");
+
 // infra/systemd/rippercraft.service: what the unit promises, read off the
 // template itself. What systemd then makes of it can only be seen by running
 // it as root, which the migration script does on the machine it is run on
@@ -118,6 +120,40 @@ test("the unit carries every restriction it is meant to, and none that breaks Ja
   for (const key of ["MemoryDenyWriteExecute", "ProcSubset", "PrivateUsers", "PrivateNetwork", "IPAddressDeny", "RemoveIPC"]) {
     assert.deepEqual(valuesOf(key), [], key);
   }
+});
+
+test("the Owner page names the unit and the file the dashboard was started from", async (t) => {
+  const names = ["CURSEFORGE_API_KEY", "RIPPERCRAFT_ENV_FILE", "RIPPERCRAFT_SERVICE", "RIPPERMOONSTASH_ENV_FILE"];
+  const before = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  t.after(() => {
+    for (const name of names) {
+      if (before[name] === undefined) {
+        delete process.env[name];
+      } else {
+        process.env[name] = before[name];
+      }
+    }
+  });
+  for (const name of names) {
+    delete process.env[name];
+  }
+  process.env.CURSEFORGE_API_KEY = "a-key-from-the-environment";
+
+  const app = await startApp(t);
+  const owner = await app.setupOwner();
+  const hint = async () => (await owner("GET", "/api/settings/integrations")).json.integrations.curseforge.envOverride;
+
+  // Told nothing, it is running under the unit's earlier name.
+  assert.deepEqual(await hint(), { envFile: "/etc/rippermoonstash.env", service: "rippermoonstash", variable: "CURSEFORGE_API_KEY" });
+
+  // rippercraft.service says what it is, in these two variables.
+  for (const line of valuesOf("Environment")) {
+    const [name, ...value] = line.split("=");
+    if (name.startsWith("RIPPERCRAFT_")) {
+      process.env[name] = value.join("=");
+    }
+  }
+  assert.deepEqual(await hint(), { envFile: "/etc/rippercraft.env", service: "rippercraft", variable: "CURSEFORGE_API_KEY" });
 });
 
 test("npm test runs the tests in test/ and no file from anywhere else", () => {
