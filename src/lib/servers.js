@@ -872,6 +872,38 @@ function createServerManager(store, options = {}) {
     return turn(task);
   }
 
+  const fromRoot = (target) => path.relative(store.rootDir, target);
+
+  // Whether a server has the folder the dashboard keeps its record and its
+  // log in, .rippermoon in the server's own folder.
+  //
+  // The files in it are opened without following a link, but that guards the
+  // last step of the path only. With the folder itself swapped for a link to
+  // another server's, a stop wrote its lines into that server's log and
+  // cleared that server's record away. So the folder has to be a folder, in
+  // the place it is looked for; anything else there is refused out loud, and
+  // nothing is read, written or removed through it.
+  async function runtimeDirIsThere(paths) {
+    let stats;
+    try {
+      stats = await fsp.lstat(paths.runtimeDir);
+    } catch (error) {
+      if (error.code === "ENOENT" || error.code === "ENOTDIR") {
+        return false;
+      }
+      throw new Error(`${fromRoot(paths.runtimeDir)} could not be looked at (${error.code || error.message}). Nothing in it has been touched.`);
+    }
+    const [real, realServerDir] = stats.isDirectory()
+      ? await Promise.all([fsp.realpath(paths.runtimeDir), fsp.realpath(paths.serverDir)])
+      : [null, null];
+    if (!stats.isDirectory() || real !== path.join(realServerDir, path.basename(paths.runtimeDir))) {
+      throw new Error(
+        `${fromRoot(paths.runtimeDir)} is ${stats.isSymbolicLink() ? "a link" : "not a folder of the server's own"}. The dashboard keeps this server's record and log there, and reads, writes and removes nothing through it as it is. Put a folder there, or remove what is there.`
+      );
+    }
+    return true;
+  }
+
   // Opens a server's runtime log to add to the end of it. Never through a
   // link, and never waiting: a named pipe left at this path would hold a plain
   // open until something read from it. O_NONBLOCK means nothing on the regular
@@ -906,13 +938,14 @@ function createServerManager(store, options = {}) {
     return await takeTurn(runtimeLogTurns, paths.runtimeLog, async () => {
       let handle = null;
       try {
+        await runtimeDirIsThere(paths);
         handle = await openRuntimeLog(paths.runtimeLog);
         await handle.write(text);
         return true;
       } catch (error) {
         logger.warn("Could not write to a server's runtime log", {
           error: OPEN_FAILURES[error.code] || error.message,
-          file: path.relative(store.rootDir, paths.runtimeLog)
+          file: fromRoot(paths.runtimeLog)
         });
         return false;
       } finally {
@@ -973,26 +1006,56 @@ function createServerManager(store, options = {}) {
     }
   }
 
-  // Reads pid.json. `exists` says something is at that path; `info` is what it
-  // holds when that can be believed, and null otherwise.
-  async function readPidFile(pidFile) {
+  // Reads a server's pid.json.
+  //
+  //   { exists: false }             there is none
+  //   { exists: true, info }        what it holds, when that can be believed
+  //   { exists: true, why }         it is there and cannot be a record: a link,
+  //                                 not a file, or holding nothing parsePidInfo()
+  //                                 lets through
+  //
+  // Anything else that goes wrong - no permission, a disk error, no file
+  // handles left - says nothing about the record, and is thrown. The record
+  // of a running server was once cleared away on the strength of an EACCES;
+  // what cannot be read is now left exactly as it is.
+  async function readPidFile(paths) {
+    if (!(await runtimeDirIsThere(paths))) {
+      return { exists: false };
+    }
+    const unreadable = (error) =>
+      Object.assign(
+        new Error(
+          `${fromRoot(paths.pidFile)} could not be read (${error.code || error.message}). Whether this server is running is not known, and nothing has been removed.`
+        ),
+        { code: error.code }
+      );
     let handle;
     try {
       // Not through a link, and without waiting on a named pipe left there.
-      handle = await fsp.open(pidFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+      handle = await fsp.open(paths.pidFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     } catch (error) {
-      return { exists: error.code !== "ENOENT" && error.code !== "ENOTDIR", info: null };
+      if (error.code === "ENOENT" || error.code === "ENOTDIR") {
+        return { exists: false };
+      }
+      if (error.code === "ELOOP") {
+        return { exists: true, why: OPEN_FAILURES.ELOOP };
+      }
+      throw unreadable(error);
     }
     try {
       const stats = await handle.stat();
-      if (!stats.isFile() || stats.size > PID_FILE_MAX_BYTES) {
-        return { exists: true, info: null };
+      if (!stats.isFile()) {
+        return { exists: true, why: "it is not a regular file" };
+      }
+      if (stats.size > PID_FILE_MAX_BYTES) {
+        return { exists: true, why: "it is far too large to be a pid file" };
       }
       const buffer = Buffer.alloc(PID_FILE_MAX_BYTES);
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-      return { exists: true, info: parsePidInfo(buffer.toString("utf8", 0, bytesRead)) };
-    } catch {
-      return { exists: true, info: null };
+      const info = parsePidInfo(buffer.toString("utf8", 0, bytesRead));
+      return info ? { exists: true, info } : { exists: true, why: "it does not hold a game server's pid" };
+    } catch (error) {
+      throw unreadable(error);
     } finally {
       await handle.close().catch(() => {});
     }
@@ -1034,45 +1097,75 @@ function createServerManager(store, options = {}) {
 
   // The process a server is running as: this dashboard's own child, or the one
   // an earlier dashboard process recorded in pid.json and that is still there.
-  // `stale` says pid.json holds something else: a process that has gone, or
-  // nothing that can be believed.
+  // `stale` says why pid.json holds something else: a process that has gone,
+  // or nothing that can be a record. Throws when the record cannot be read.
   async function findServerProcess(serverId) {
     const own = ownProcess(serverId);
     if (own) {
-      return { process: own, stale: false };
+      return { process: own, stale: null };
     }
     const server = await getServer(serverId);
     if (!server) {
-      return { process: null, stale: false };
+      return { process: null, stale: null };
     }
-    const recorded = await readPidFile(resolveRecordPaths(server).pidFile);
+    const recorded = await readPidFile(resolveRecordPaths(server));
+    if (!recorded.exists) {
+      return { process: null, stale: null };
+    }
     if (recorded.info && isProcessAlive(recorded.info.pid)) {
-      return { process: { ...recorded.info, child: null }, stale: false };
+      return { process: { ...recorded.info, child: null }, stale: null };
     }
-    return { process: null, stale: recorded.exists };
+    return { process: null, stale: recorded.info ? "its process has gone" : recorded.why };
   }
 
   // Removes the record and the console of a server that is no longer running.
   // Run in the server's turn, and it looks again before it removes anything:
-  // by now the record may be that of a server that has just been started. The
-  // pid file goes after the console, so that once it has gone the console has
-  // too.
+  // by now the record may be that of a server that has just been started. A
+  // record that cannot be read is not removed: this throws, like the read.
+  // The pid file goes after the console, so that once it has gone the console
+  // has too.
   async function clearProcessRecord(serverId, paths, { announce = false } = {}) {
     if (ownProcess(serverId)) {
       return;
     }
-    const recorded = await readPidFile(paths.pidFile);
+    const recorded = await readPidFile(paths);
     if (recorded.info && isProcessAlive(recorded.info.pid)) {
       return;
     }
     await removeConsolePipe(paths.consoleFile);
+    if (!recorded.exists) {
+      return;
+    }
     const removed = await removeWithoutFollowing(paths.pidFile);
-    if (announce && recorded.info && removed) {
+    if (!removed) {
+      return;
+    }
+    if (!recorded.info) {
+      // Not a record at all. Said, because something put it there.
+      logger.warn("Removed a server's pid file that could not be a record", {
+        file: fromRoot(paths.pidFile),
+        reason: recorded.why,
+        serverId
+      });
+    } else if (announce) {
       // A server an earlier dashboard process started. Its exit code went to
       // that process, so all there is to say is that it is gone. Said once:
       // only when the record went with it.
       logger.info("A recorded server process is no longer running", { pid: recorded.info.pid, serverId });
       await appendRuntimeLog(paths, `\n[${nowIso()}] Process ${recorded.info.pid} is no longer running\n`);
+    }
+  }
+
+  // The same for a server that is known to have gone: one this process
+  // started, or one it has just stopped. Its console goes whatever becomes of
+  // its record. A record that cannot be read or reached stays where it is,
+  // and that is said.
+  async function forgetServer(serverId, paths, options) {
+    try {
+      await clearProcessRecord(serverId, paths, options);
+    } catch (error) {
+      await removeConsolePipe(paths.consoleFile);
+      logger.warn("A server has gone, and its record could not be cleared", { error: error.message, serverId });
     }
   }
 
@@ -1518,7 +1611,9 @@ function createServerManager(store, options = {}) {
     }
     const paths = resolveRecordPaths(server);
     const latestLog = await tailTextFile(paths.logFile, 180_000);
-    const runtimeLog = await tailTextFile(paths.runtimeLog, 60_000);
+    // Not through a runtime folder that is a link to somewhere else: that
+    // would show another server's log as this one's.
+    const runtimeLog = (await runtimeDirIsThere(paths).catch(() => false)) ? await tailTextFile(paths.runtimeLog, 60_000) : "";
     return {
       latestLog,
       runtimeLog
@@ -2807,7 +2902,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
         paths,
         `\n[${nowIso()}] ${code === null ? `Process was ended by ${signal}` : `Process exited with code ${code}`}\n`
       );
-      await clearProcessRecord(serverId, paths);
+      await forgetServer(serverId, paths);
     }).catch((error) => {
       logger.error("Clearing up after a server that exited failed", { error: error.message, serverId, stack: error.stack });
     });
@@ -2849,6 +2944,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     // this process. It is then still written down after a dashboard restart,
     // where a pipe would have been closed under the server, and a dashboard
     // that has stalled can never hold a server up on a pipe that is full.
+    await runtimeDirIsThere(paths);
     let logHandle;
     try {
       logHandle = await openRuntimeLog(paths.runtimeLog);
@@ -3110,7 +3206,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     const stopped = async () => {
       // The record of a server this process did not start is cleared here.
       // One it did start has been cleared by its exit already, a turn ahead.
-      await takeTurn(lifecycleTurns, serverId, () => clearProcessRecord(serverId, paths, { announce: true }));
+      await takeTurn(lifecycleTurns, serverId, () => forgetServer(serverId, paths, { announce: true }));
       logger.info("Server stopped", { pid, serverId, waitedSeconds: waitedSeconds() });
     };
 

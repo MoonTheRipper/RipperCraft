@@ -24,7 +24,7 @@ const {
 
 test("a pid file that does not hold a game server's pid is never signalled", async (t) => {
   const server = await createServerRoot(t);
-  const { problems, serverManager } = await createManager(server.root);
+  const { logs, problems, serverManager } = await createManager(server.root);
   fs.mkdirSync(server.runtimeDir, { recursive: true });
 
   // A process of this account that has nothing to do with the dashboard, in a
@@ -52,26 +52,29 @@ test("a pid file that does not hold a game server's pid is never signalled", asy
   const believable = `${JSON.stringify({ pid: bystander.pid, startedAt: "2026-11-16T09:00:00.000Z", startedBy: "owner" }, null, 2)}\n`;
   fs.writeFileSync(elsewhere, believable);
   const write = (contents) => () => fs.writeFileSync(server.pidFile, contents);
+  const NO_PID = "it does not hold a game server's pid";
+  const NOT_A_FILE = "it is not a regular file";
   const records = [
-    ["a pid written as text", write(JSON.stringify({ pid: String(bystander.pid) }))],
-    ["a pid with a fraction", write(`{"pid": ${bystander.pid}.5}`)],
-    ["a negative pid, which is a whole process group", write(JSON.stringify({ pid: -bystander.pid }))],
-    ["pid 1, which is init", write(JSON.stringify({ pid: 1 }))],
-    ["pid 0, which is the dashboard's own process group", write(JSON.stringify({ pid: 0 }))],
-    ["pid -1, which is every process of the account", write(JSON.stringify({ pid: -1 }))],
-    ["the dashboard's own pid", write(JSON.stringify({ pid: process.pid }))],
-    ["a pid past the largest there is", write(JSON.stringify({ pid: bystander.pid + 2 ** 32 }))],
-    ["a pid that is true", write(JSON.stringify({ pid: true }))],
-    ["no pid", write(JSON.stringify({ startedBy: "owner" }))],
-    ["a list", write(JSON.stringify([bystander.pid]))],
-    ["a bare number", write(String(bystander.pid))],
-    ["not JSON", write(`pid=${bystander.pid}`)],
-    ["nothing", write("")],
-    ["a real record with a megabyte after it", write(`${believable}${" ".repeat(1024 * 1024)}`)],
-    ["a link to a real record somewhere else", () => fs.symlinkSync(elsewhere, server.pidFile)],
-    ["a named pipe", () => plantPipe(server.pidFile)],
+    ["a pid written as text", NO_PID, write(JSON.stringify({ pid: String(bystander.pid) }))],
+    ["a pid with a fraction", NO_PID, write(`{"pid": ${bystander.pid}.5}`)],
+    ["a negative pid, which is a whole process group", NO_PID, write(JSON.stringify({ pid: -bystander.pid }))],
+    ["pid 1, which is init", NO_PID, write(JSON.stringify({ pid: 1 }))],
+    ["pid 0, which is the dashboard's own process group", NO_PID, write(JSON.stringify({ pid: 0 }))],
+    ["pid -1, which is every process of the account", NO_PID, write(JSON.stringify({ pid: -1 }))],
+    ["the dashboard's own pid", NO_PID, write(JSON.stringify({ pid: process.pid }))],
+    ["a pid past the largest there is", NO_PID, write(JSON.stringify({ pid: bystander.pid + 2 ** 32 }))],
+    ["a pid that is true", NO_PID, write(JSON.stringify({ pid: true }))],
+    ["no pid", NO_PID, write(JSON.stringify({ startedBy: "owner" }))],
+    ["a list", NO_PID, write(JSON.stringify([bystander.pid]))],
+    ["a bare number", NO_PID, write(String(bystander.pid))],
+    ["not JSON", NO_PID, write(`pid=${bystander.pid}`)],
+    ["nothing", NO_PID, write("")],
+    ["a real record with a megabyte after it", "it is far too large to be a pid file", write(`${believable}${" ".repeat(1024 * 1024)}`)],
+    ["a link to a real record somewhere else", "a link is in its place", () => fs.symlinkSync(elsewhere, server.pidFile)],
+    ["a named pipe", NOT_A_FILE, () => plantPipe(server.pidFile)],
     [
       "a named pipe with a real record waiting in it",
+      NOT_A_FILE,
       () => {
         plantPipe(server.pidFile);
         const writer = fs.openSync(server.pidFile, fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
@@ -81,7 +84,7 @@ test("a pid file that does not hold a game server's pid is never signalled", asy
     ]
   ];
 
-  for (const [label, plant] of records) {
+  for (const [label, reason, plant] of records) {
     plant();
     const answers = await unlessItHangs(
       (async () => [await serverManager.getServerStatus(SERVER_ID), await serverManager.stopServer(SERVER_ID, OWNER)])()
@@ -90,9 +93,16 @@ test("a pid file that does not hold a game server's pid is never signalled", asy
     // Not signalled, and not so much as looked for.
     assert.deepEqual(sent, [], label);
     assert.equal(stillThere(), true, label);
-    // What cannot be believed is cleared away, without following it.
+    // What cannot be a record is cleared away, without following it, and
+    // the dashboard's log says that it was and why.
     assert.equal(isThere(server.pidFile), false, label);
     assert.equal(fs.readFileSync(elsewhere, "utf8"), believable, label);
+    assert.deepEqual(
+      problems().splice(0).map((entry) => [entry.level, entry.message, entry.meta]),
+      [["warn", "Removed a server's pid file that could not be a record", { file: "servers/DemoServer/.rippermoon/pid.json", reason, serverId: SERVER_ID }]],
+      label
+    );
+    logs.length = 0;
   }
 
   // A folder cannot be cleared away. It is still no server.
@@ -112,6 +122,195 @@ test("a pid file that does not hold a game server's pid is never signalled", asy
   assert.equal(bystander.signalCode, "SIGTERM");
   assert.equal(sent.some(([pid, signal]) => pid === bystander.pid && signal === "SIGTERM"), true);
   assert.equal(sent.every(([pid]) => pid === bystander.pid), true);
+});
+
+test("a pid file that cannot be read is left as it is, with the server and its console", async (t) => {
+  const fsp = require("node:fs/promises");
+  const server = await createServerRoot(t);
+  const first = await createManager(server.root);
+  await first.serverManager.startServer(SERVER_ID, OWNER);
+  const pid = await server.whenReady();
+  // The dashboard after a restart: all it has is what is on disk.
+  const later = await createManager(server.root);
+  const manager = later.serverManager;
+  const owner = { id: "usr_owner", role: "owner", servers: [], username: "owner" };
+  assert.equal((await manager.getServerStatus(SERVER_ID)).pid, pid);
+  const record = fs.readFileSync(server.pidFile, "utf8");
+
+  // Whatever is asked about the server is answered with the failure, and
+  // nothing is done on a guess: not stopped, not started, not cleared away.
+  const everyAnswer = async (code) => {
+    const asked = {
+      delete: () => manager.deleteServer(SERVER_ID),
+      list: () => manager.listServersForUser(owner),
+      needsStopped: () => manager.ensureServerStopped(SERVER_ID),
+      page: () => manager.getServerSnapshot(SERVER_ID, owner, true),
+      requestStop: () => manager.requestStop(SERVER_ID, OWNER),
+      start: () => manager.startServer(SERVER_ID, OWNER),
+      status: () => manager.getServerStatus(SERVER_ID),
+      stop: () => manager.stopServer(SERVER_ID, OWNER)
+    };
+    for (const [what, ask] of Object.entries(asked)) {
+      await assert.rejects(
+        ask(),
+        {
+          code,
+          message: `servers/DemoServer/.rippermoon/pid.json could not be read (${code}). Whether this server is running is not known, and nothing has been removed.`
+        },
+        `${what}, ${code}`
+      );
+    }
+    assert.equal(isAlive(pid), true, code);
+    assert.equal(fs.lstatSync(server.consoleFile).isFIFO(), true, code);
+    assert.equal(fs.existsSync(server.serverDir), true, code);
+    assert.deepEqual(server.received(), [], code);
+    assert.equal(server.fakePid(), pid, code);
+  };
+
+  // No permission. (Not something root can be refused.)
+  if (process.getuid() !== 0) {
+    fs.chmodSync(server.pidFile, 0o000);
+    await everyAnswer("EACCES");
+    fs.chmodSync(server.pidFile, 0o644);
+    assert.equal(fs.readFileSync(server.pidFile, "utf8"), record);
+  }
+
+  // A disk that fails in the middle of the read, and a dashboard that has
+  // run out of file handles: made to happen for this one file.
+  const realOpen = fsp.open;
+  t.after(() => {
+    fsp.open = realOpen;
+  });
+  fsp.open = async (file, ...rest) => {
+    const handle = await realOpen.call(fsp, file, ...rest);
+    if (file === server.pidFile) {
+      handle.read = async () => {
+        throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
+      };
+    }
+    return handle;
+  };
+  await everyAnswer("EIO");
+  for (const code of ["EMFILE", "ESTALE"]) {
+    fsp.open = async (file, ...rest) => {
+      if (file === server.pidFile) {
+        throw Object.assign(new Error(`${code}: open`), { code });
+      }
+      return await realOpen.call(fsp, file, ...rest);
+    };
+    await everyAnswer(code);
+  }
+  fsp.open = realOpen;
+  assert.equal(fs.readFileSync(server.pidFile, "utf8"), record);
+  assert.deepEqual(later.problems(), []);
+
+  // Readable again, it is the same server as before, and stops as one.
+  assert.equal((await manager.getServerStatus(SERVER_ID)).pid, pid);
+  assert.deepEqual(await manager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
+});
+
+for (const who of ["the dashboard that started it", "a dashboard started later"]) {
+  test(`with the dashboard's folder for a server swapped for a link to another server's, ${who} reads, writes and removes nothing through it`, async (t) => {
+    const server = await createServerRoot(t);
+    const owner = { id: "usr_owner", role: "owner", servers: [], username: "owner" };
+    // Another server's folder, with a record and a log of its own.
+    const other = path.join(server.root, "servers", "Other", ".rippermoon");
+    fs.mkdirSync(other, { recursive: true });
+    const otherRecord = `${JSON.stringify({ pid: process.ppid, startedAt: "2026-11-16T09:00:00.000Z", startedBy: "someone" }, null, 2)}\n`;
+    fs.writeFileSync(path.join(other, "pid.json"), otherRecord);
+    fs.writeFileSync(path.join(other, "runtime.log"), "the other server's log\n");
+    const otherIsUntouched = () => {
+      assert.deepEqual(fs.readdirSync(other).sort(), ["pid.json", "runtime.log"]);
+      assert.equal(fs.readFileSync(path.join(other, "pid.json"), "utf8"), otherRecord);
+      assert.equal(fs.readFileSync(path.join(other, "runtime.log"), "utf8"), "the other server's log\n");
+    };
+
+    let dashboard = await createManager(server.root);
+    const started = await dashboard.serverManager.startServer(SERVER_ID, OWNER);
+    const pid = await server.whenReady();
+    const own = who === "the dashboard that started it";
+    if (!own) {
+      dashboard = await createManager(server.root);
+    }
+    const manager = dashboard.serverManager;
+
+    // What a mod has to do: one rename and one link. No file in the folder is a link.
+    fs.renameSync(server.runtimeDir, `${server.runtimeDir}.real`);
+    fs.symlinkSync(other, server.runtimeDir);
+    const refused = {
+      message:
+        "servers/DemoServer/.rippermoon is a link. The dashboard keeps this server's record and log there, and reads, writes and removes nothing through it as it is. Put a folder there, or remove what is there."
+    };
+
+    if (own) {
+      // It started the server, and knows it by its process, not by the folder.
+      assert.deepEqual(await manager.getServerStatus(SERVER_ID), started);
+      // The log it shows is not the other server's.
+      assert.equal((await manager.getServerLog(SERVER_ID)).runtimeLog, "");
+      // "stop" goes to this server's own console, which is not in the folder.
+      // Once the server has gone, all that is left to go on is the folder,
+      // and that is refused.
+      await assert.rejects(manager.stopServer(SERVER_ID, OWNER), refused);
+      assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
+      assert.equal(isAlive(pid), false);
+      assert.equal(isThere(server.consoleFile), false);
+      assert.equal(
+        dashboard.problems().every((entry) => ["Could not write to a server's runtime log", "A server has gone, and its record could not be cleared"].includes(entry.message)),
+        true,
+        JSON.stringify(dashboard.problems())
+      );
+      assert.equal(dashboard.problems().some((entry) => entry.message === "A server has gone, and its record could not be cleared"), true);
+    } else {
+      // All it has is the folder, and it will not go through the link: not
+      // to say whether the server runs, not to stop it, not to start another.
+      for (const ask of [
+        () => manager.getServerStatus(SERVER_ID),
+        () => manager.listServersForUser(owner),
+        () => manager.stopServer(SERVER_ID, OWNER),
+        () => manager.requestStop(SERVER_ID, OWNER),
+        () => manager.startServer(SERVER_ID, OWNER),
+        () => manager.deleteServer(SERVER_ID)
+      ]) {
+        await assert.rejects(ask(), refused);
+      }
+      assert.equal((await manager.getServerLog(SERVER_ID)).runtimeLog, "");
+      assert.equal(isAlive(pid), true);
+      assert.deepEqual(server.received(), []);
+      assert.equal(server.fakePid(), pid);
+      assert.equal(fs.lstatSync(server.consoleFile).isFIFO(), true);
+    }
+    otherIsUntouched();
+    assert.equal(fs.lstatSync(server.runtimeDir).isSymbolicLink(), true);
+
+    // With the folder back where it belongs, everything is as it was.
+    fs.unlinkSync(server.runtimeDir);
+    fs.renameSync(`${server.runtimeDir}.real`, server.runtimeDir);
+    if (own) {
+      assert.deepEqual(await manager.getServerStatus(SERVER_ID), STOPPED);
+    } else {
+      assert.equal((await manager.getServerStatus(SERVER_ID)).pid, pid);
+      assert.deepEqual(await manager.stopServer(SERVER_ID, OWNER), STOPPED);
+      assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
+    }
+    otherIsUntouched();
+  });
+}
+
+test("something that is not a folder where the dashboard's folder for a server belongs is refused as well", async (t) => {
+  const server = await createServerRoot(t);
+  const { serverManager } = await createManager(server.root);
+  fs.writeFileSync(server.runtimeDir, "not a folder\n");
+
+  const refused = { message: /^servers\/DemoServer\/\.rippermoon is not a folder of the server's own\. / };
+  await assert.rejects(serverManager.getServerStatus(SERVER_ID), refused);
+  await assert.rejects(serverManager.startServer(SERVER_ID, OWNER), refused);
+  await assert.rejects(serverManager.stopServer(SERVER_ID, OWNER), refused);
+  assert.equal(fs.readFileSync(server.runtimeDir, "utf8"), "not a folder\n");
+  assert.equal(server.fakePid(), null);
+
+  fs.rmSync(server.runtimeDir);
+  assert.deepEqual(await serverManager.getServerStatus(SERVER_ID), STOPPED);
 });
 
 test("a server the dashboard started is known by its process, whatever becomes of its pid file", async (t) => {
