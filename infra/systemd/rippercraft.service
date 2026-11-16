@@ -1,40 +1,199 @@
+# RipperCraft dashboard - systemd unit, as a template.
+#
+# Do not copy this file into /etc by hand. Each name between two @ signs stands
+# for a value from the machine it is installed on, and
+#
+#     sudo infra/systemd/migrate-to-rippercraft.sh
+#
+# fills them in, tries the result out and installs it. With --check it only
+# shows what it would do.
+#
+#   USER, UID      the account that owns the checkout. The service runs as it.
+#   GROUP          the service's own group, "rippercraft". See Group= below.
+#   HOME           that account's home directory
+#   CHECKOUT       this repository, where it is checked out
+#   NODE           the node binary
+#   NODE_BIN_DIR   the folder it is in, for PATH
+#   NODE_HIDDEN    the node binary again, when it is somewhere the service
+#                  would otherwise not see (nvm keeps it in the home directory)
+#   HOST, PORT     the address and port to listen on
+#   PRIVATE_TMP    "disconnected" on systemd 257 and later, otherwise "yes"
+#
+# The lines between "#@if NAME" and "#@end" are kept only on a machine where
+# they apply.
+
 [Unit]
 Description=RipperCraft web dashboard
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
-User=ripper-moon
-Group=ripper-moon
-WorkingDirectory=/home/ripper-moon/minecraft-server
+Type=exec
+User=@USER@
+# A group of its own, not the account's usual one. Linux lets one process look
+# inside another - at its files through /proc/<pid>/root, at its environment,
+# at its memory - only when both the user and the group are the same. The
+# service has to run as the account that owns the server folders, so the group
+# is what tells it apart from everything else that account is running: the
+# shell you are logged in with, your editor, your ssh agent. Give it the
+# account's own group and the home directory hidden further down can be reached
+# again through any of them.
+Group=@GROUP@
+WorkingDirectory=@CHECKOUT@
 Environment=NODE_ENV=production
-Environment=HOST=0.0.0.0
-Environment=PORT=4300
+Environment=HOST=@HOST@
+Environment=PORT=@PORT@
+Environment=PATH=@NODE_BIN_DIR@:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Tells the Owner page which file and which unit to name when it explains where
+# a key set in the environment comes from.
+Environment=RIPPERCRAFT_ENV_FILE=/etc/rippercraft.env
+Environment=RIPPERCRAFT_SERVICE=rippercraft
 # Optional secrets (CURSEFORGE_API_KEY, ...). The leading "-" keeps the service
 # starting normally when the file is absent. Never commit the key itself.
-# Both names are read so a host that still has the pre-rename file keeps working;
-# rippercraft.env is loaded second and therefore wins on any duplicate key.
-EnvironmentFile=-/etc/rippermoonstash.env
 EnvironmentFile=-/etc/rippercraft.env
-Environment=PATH=/home/ripper-moon/.nvm/versions/node/v24.15.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/home/ripper-moon/.nvm/versions/node/v24.15.0/bin/node /home/ripper-moon/minecraft-server/src/server.js
+# The dashboard itself needs a few tens of megabytes. Left alone, Node takes
+# its heap limit from the size of the machine, which on one that runs game
+# servers is gigabytes. With this limit a leak ends the dashboard at 1 GB,
+# Restart= below brings it back, and the game servers carry on (see KillMode=).
+ExecStart=@NODE@ --max-old-space-size=1024 @CHECKOUT@/src/server.js
 Restart=on-failure
 RestartSec=5
 
-# Minecraft servers are spawned as children of this process, so they live in
-# this unit's cgroup. Under the default KillMode=control-group, restarting the
-# dashboard SIGTERMs every running game server with it and SIGKILLs any still
-# saving when TimeoutStopSec expires - a web restart would drop every player
-# mid-session and risk a half-written world.
+# Minecraft servers are started by the dashboard, so they are part of this
+# unit. Under the default KillMode=control-group, restarting the dashboard
+# would stop every running game server with it, and kill any still saving
+# when TimeoutStopSec ran out.
 #
 # Signalling only the main process leaves the game servers running across a
-# dashboard restart. The dashboard re-attaches to them through the pid files it
+# dashboard restart. The dashboard finds them again through the pid files it
 # wrote (.rippermoon/pid.json), so they still show as running and can still be
-# stopped from the UI afterwards.
+# stopped from the page.
 KillMode=process
 KillSignal=SIGTERM
 TimeoutStopSec=30
+# If the kernel has to kill a game server for memory, that is the end of that
+# server only. Without this, systemd would stop the dashboard too.
+OOMPolicy=continue
+
+# ---------------------------------------------------------------------------
+# What the service can see and change
+#
+# A game server runs mods, and a mod is somebody else's code running as this
+# service. Everything below is there so that what such code can reach is this
+# checkout's data/ and servers/ folders and little else.
+# ---------------------------------------------------------------------------
+
+# The whole file system is read-only, apart from what is named further down.
+ProtectSystem=strict
+
+# /home, /root and /run/user are replaced by empty folders: no ~/.ssh, no
+# ~/.config, no session bus, nobody else's home either.
+ProtectHome=tmpfs
+#@if HOME
+# An empty home directory that can be written to, and that only this service
+# sees. Java libraries unpack themselves into ~/.cache, and would fail in a
+# home that is read-only. It is kept in memory, limited to 256 MB, and gone
+# when the last process that saw it has ended.
+TemporaryFileSystem=@HOME@:mode=0700,uid=@UID@,size=256m
+#@end
+
+# The checkout is put back, read-only: the code, the git repository, this
+# file. Nothing the service runs can change what it will run next time, or
+# what you run from here yourself.
+BindReadOnlyPaths=@CHECKOUT@
+# The two folders the dashboard and the game servers write to. Accounts,
+# settings and the dashboard's log are in data/; every server's files, worlds,
+# backups and logs are in servers/.
+BindPaths=@CHECKOUT@/data @CHECKOUT@/servers
+#@if NODE_HIDDEN
+# Node is installed where the lines above have hidden it. Only the program
+# itself is shown, not the folder it came in.
+BindReadOnlyPaths=@NODE_HIDDEN@
+#@end
+
+# /tmp and /var/tmp of its own, empty. "disconnected" keeps them, in memory,
+# for as long as any process of the unit is running. Plain "yes", which is all
+# systemd before 257 has, deletes them when the dashboard stops, from under
+# the game servers that are still running.
+PrivateTmp=@PRIVATE_TMP@
+
+# What is left that belongs to the account, or that one of its groups opens,
+# outside the folders hidden above. A service cannot be started without its
+# account's groups, so each of these is shut one by one.
+#
+# The system's logs: the account is often in the "adm" group, which may read
+# them. And what a crashed program leaves behind: a process may send any signal
+# to another one of its account, so it can make any of the account's programs
+# crash, and the memory that program had would be there to read.
+InaccessiblePaths=-/var/log -/run/log -/var/crash -/var/lib/systemd/coredump -/var/lib/apport/coredump
+# The terminals of whoever is logged in, and their screen sessions. A terminal
+# belongs to the account that is typing in it: whatever runs as that account
+# can read what is typed there and write over what is shown.
+InaccessiblePaths=-/dev/pts -/run/screen
+# The sockets that hand out root to whoever is in the group that goes with
+# them: Docker, LXD, Incus, libvirt.
+InaccessiblePaths=-/run/docker.sock -/run/lxd-installer.socket -/var/snap/lxd -/var/lib/lxd -/var/lib/incus -/run/incus -/run/libvirt
+
+# No disks or other hardware: /dev holds null, zero, random, urandom and tty.
+PrivateDevices=yes
+# Shared memory of its own, in place of the machine's, which the line above
+# leaves in /dev/shm.
+TemporaryFileSystem=/dev/shm:mode=1777
+# In /proc, only this service's own processes.
+ProtectProc=invisible
+# System V shared memory and message queues of its own.
+PrivateIPC=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# ---------------------------------------------------------------------------
+# What the service may do
+# ---------------------------------------------------------------------------
+
+# No way to gain privileges: sudo and every other setuid program stop working.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+# No namespaces of its own, no real-time scheduling, no other ABI.
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# Network sockets and local ones. AF_NETLINK is how Node and Java list the
+# machine's network interfaces.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# The system calls an ordinary service uses. Left out: mounting, loading kernel
+# modules, tracing other processes, setting the clock, rebooting, raw device
+# access. @pkey is for Node, which uses memory protection keys where the
+# processor has them, and mincore for Java, which asks how much of its memory
+# is in use. The second line takes two things back out of the first: the
+# kernel's key store, where an account's programs keep secrets for each other,
+# and reading and writing another process's memory. A call that is not allowed
+# fails with "not permitted" instead of ending the process, so a mod that
+# tries one gets an error back.
+SystemCallFilter=@system-service @pkey mincore
+SystemCallFilter=~@keyring process_vm_readv process_vm_writev
+SystemCallErrorNumber=EPERM
+
+# Not set, on purpose:
+#
+#   MemoryDenyWriteExecute=  Java and Node both compile code at run time.
+#   ProcSubset=pid           both read /proc/meminfo, /proc/cpuinfo and others.
+#   PrivateUsers=            Group= above already separates the service from
+#                            the account's other processes.
+#   PrivateNetwork=, IPAddressDeny=
+#                            game servers accept players, and the dashboard
+#                            fetches add-ons.
+#   MemoryMax=, MemorySwapMax=
+#                            they would count the game servers too, and when
+#                            the limit is reached the kernel ends the largest
+#                            process in the unit - a game server, not the
+#                            dashboard. The README says how to add one sized
+#                            for your machine.
 
 [Install]
 WantedBy=multi-user.target
