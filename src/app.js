@@ -152,8 +152,13 @@ async function createApp(rootDir = process.cwd(), options = {}) {
 
   const sessionManager = createSessionManager(() => store.getAppConfig());
   // options.outbound replaces the fetcher everything remote goes through; the
-  // default is the checked one in lib/outbound.js.
-  const serverManager = createServerManager(store, { outbound: options.outbound });
+  // default is the checked one in lib/outbound.js. options.stopWaits shortens
+  // how long stopping a server waits at each step, for tests.
+  const serverManager = createServerManager(store, {
+    logger,
+    outbound: options.outbound,
+    stopWaits: options.stopWaits
+  });
   const worldManager = createWorldManager(serverManager, {
     logger,
     worldLimitBytes: options.worldLimitBytes || resolveWorldLimitBytes(logger)
@@ -899,6 +904,11 @@ async function createApp(rootDir = process.cwd(), options = {}) {
             return;
           }
           const status = await serverManager.startServer(serverId, context.user);
+          logger.info("Server start requested", {
+            actor: context.user.username,
+            pid: status.pid,
+            serverId
+          });
           json(res, 200, { status });
           return;
         }
@@ -927,7 +937,15 @@ async function createApp(rootDir = process.cwd(), options = {}) {
           if (!ensureServerUnlocked(res, context, server, "Unlock the server with its passphrase before stopping it.")) {
             return;
           }
-          const status = await serverManager.stopServer(serverId);
+          // Answered at once. Stopping takes as long as the server needs to
+          // save - minutes, on a machine that is short of memory - and the
+          // page shows "stopping" from the status until it is done.
+          const status = await serverManager.requestStop(serverId, context.user);
+          logger.info("Server stop requested", {
+            actor: context.user.username,
+            serverId,
+            stopping: status.stopping
+          });
           json(res, 200, { status });
           return;
         }
