@@ -166,7 +166,8 @@ function readProcCwd(pid) {
   }
 }
 
-// The processes of a group, each with the above. null with no /proc to list.
+// The processes of a group, each with its session and when it was started.
+// null with no /proc to list.
 function readProcGroup(pgid) {
   let names;
   try {
@@ -178,7 +179,7 @@ function readProcGroup(pgid) {
   for (const name of names) {
     const stat = /^\d+$/.test(name) ? readProcStat(Number(name)) : null;
     if (stat && stat.group === pgid) {
-      members.push({ ...stat, cwd: readProcCwd(Number(name)) });
+      members.push(stat);
     }
   }
   return members;
@@ -204,14 +205,18 @@ function parsePidInfo(text) {
   }
   return {
     console: parsed.console === CONSOLE_PIPE ? CONSOLE_PIPE : null,
-    // Only `true` says the pid is a process group's as well: a record from
-    // before servers were started in a group of their own names one process.
     // Which run of the machine the pid is from, and when in that run the
     // process was started. A record without them, from before they were
     // written, is believed without.
     boot: typeof parsed.boot === "string" && BOOT_ID.test(parsed.boot) ? parsed.boot : null,
+    // Only `true` says the pid is a process group's as well: a record from
+    // before servers were started in a group of their own names one process.
     group: parsed.group === true,
     pid,
+    // Which server the process is. A record goes wherever its folder is
+    // copied to, and this is what says that it is not the copy's. null on a
+    // record from before it was written down.
+    server: typeof parsed.server === "string" && parsed.server ? parsed.server : null,
     started: Number.isSafeInteger(parsed.started) && parsed.started >= 0 ? parsed.started : null,
     startedAt: typeof parsed.startedAt === "string" ? parsed.startedAt : null,
     startedBy: typeof parsed.startedBy === "string" && parsed.startedBy ? parsed.startedBy : "unknown"
@@ -903,10 +908,23 @@ function createServerManager(store, options = {}) {
 
     return await Promise.all(
       visible.map(async (server) => {
-        const status = await getServerStatus(server.id);
-        const paths = resolveRecordPaths(server);
-        const worldCount = await countWorldAssets(paths.worldLibraryDir);
-        const modCount = await countFiles(paths.modsDir);
+        // One server at a time, and none of them in the way of the others:
+        // this list is the page's first request, and every server's Stop
+        // button hangs on it.
+        const status = await statusForShow(server.id);
+        let worldCount = 0;
+        let modCount = 0;
+        if (!status.unknown) {
+          // Not for a server in a state that is not known: one of these is
+          // counted in the very folder that may be why.
+          try {
+            const paths = resolveRecordPaths(server);
+            worldCount = await countWorldAssets(paths.worldLibraryDir);
+            modCount = await countFiles(paths.modsDir);
+          } catch (error) {
+            logger.warn("Could not count a server's worlds and add-ons for the list", { error: error.message, serverId: server.id });
+          }
+        }
         return {
           ...serializeServer(server),
           status,
@@ -955,6 +973,9 @@ function createServerManager(store, options = {}) {
   const fromRoot = (target) => path.relative(store.rootDir, target);
   // The files of servers last found not to be files. See readServerFile().
   const notFilesReported = new Set();
+  // The servers whose state was last found not to be known, each with the
+  // reason that was logged for it. See statusForShow().
+  const unknownReported = new Map();
 
   // Whether a server has the folder the dashboard keeps its record and its
   // log in, .rippermoon in the server's own folder.
@@ -973,13 +994,13 @@ function createServerManager(store, options = {}) {
       if (error.code === "ENOENT" || error.code === "ENOTDIR") {
         return false;
       }
-      throw new Error(`${fromRoot(paths.runtimeDir)} could not be looked at (${error.code || error.message}). Nothing in it has been touched.`);
+      throw stateUnknown(`${fromRoot(paths.runtimeDir)} could not be looked at (${error.code || error.message}). Nothing in it has been touched.`);
     }
     const [real, realServerDir] = stats.isDirectory()
       ? await Promise.all([fsp.realpath(paths.runtimeDir), fsp.realpath(paths.serverDir)])
       : [null, null];
     if (!stats.isDirectory() || real !== path.join(realServerDir, path.basename(paths.runtimeDir))) {
-      throw new Error(
+      throw stateUnknown(
         `${fromRoot(paths.runtimeDir)} is ${stats.isSymbolicLink() ? "a link" : "not a folder of the server's own"}. The dashboard keeps this server's record and log there, and reads, writes and removes nothing through it as it is. Put a folder there, or remove what is there.`
       );
     }
@@ -1107,7 +1128,7 @@ function createServerManager(store, options = {}) {
     }
     const unreadable = (error) =>
       Object.assign(
-        new Error(
+        stateUnknown(
           `${fromRoot(paths.pidFile)} could not be read (${error.code || error.message}). Whether this server is running is not known, and nothing has been removed.`
         ),
         { code: error.code }
@@ -1270,21 +1291,43 @@ function createServerManager(store, options = {}) {
   // A pid alone does not say. Copy a running server's folder and the copy's
   // record names the original's process: the copy showed as running, and
   // stopping it stopped the original. Restart the machine and the pid is
-  // some other program's. So, where /proc can answer:
+  // some other program's. So a record says which server it is of, which run
+  // of the machine it is from, and when its process was started, and it is
+  // believed when all three hold:
   //
-  //   - the record is from this run of the machine;
-  //   - the process was started when the record says it was;
-  //   - it is running in this server's folder, or under it.
+  //   - it is this server's record, and not one that came with a copy of
+  //     another server's folder;
+  //   - it is from this run of the machine;
+  //   - the process under its pid was started when the record says.
   //
-  // What fails one of these is not this server, and the record goes. What
-  // /proc cannot answer - there is none, or the process is one this
-  // dashboard may signal and not look at - is believed as before, on the pid.
+  // What fails one of these is definitely not this server, and the record
+  // goes. What cannot be asked - there is no /proc, or the process is one
+  // this dashboard may signal and not look at - is believed as before, on
+  // the pid.
+  //
+  // Where the process runs is not part of this. It was, and a server whose
+  // start script changes folder was then forgotten when the dashboard was
+  // restarted, record and console with it; and whether the folder of a
+  // process can be read at all from where the dashboard is depends on
+  // namespaces it has no say in. Only a record with no server in it, from
+  // before that was written down, is still held against the folder, for
+  // want of anything else - and never to its cost. A process that runs
+  // somewhere else may be another server's, so nothing is signalled on such
+  // a record; it may as well be this server, so nothing is removed either,
+  // and no second one is started. The answer then is that it is not known.
   //
   // A group whose leader has exited has no process under the recorded pid to
   // ask about. Then its members are asked instead: one of them has to be in
-  // the session the leader made, no older than the leader, and in this
-  // server's folder.
-  async function examineRecorded(info, paths) {
+  // the session the leader made, and no older than the leader. `leftover`
+  // says that this is how things are, and how many of them there are.
+  //
+  //   { running: true, leftover }   it is this server
+  //   { running: false, gone, why } it is not, for a reason that is certain
+  //   { unknown }                   it cannot be told, in words for whoever asks
+  async function examineRecorded(info, paths, serverId) {
+    if (info.server !== null && info.server !== serverId) {
+      return { gone: false, running: false, why: `it is the record of another server (${info.server.slice(0, 120)})` };
+    }
     if (info.boot && bootId && info.boot !== bootId) {
       return { gone: true, running: false, why: "it is from before this machine was last started" };
     }
@@ -1292,31 +1335,33 @@ function createServerManager(store, options = {}) {
     if (!leaderAlive && !(info.group && isGroupAlive(info.pid))) {
       return { gone: true, running: false, why: "its process has gone" };
     }
-    const home = await fsp.realpath(paths.serverDir).catch(() => null);
-    const inItsFolder = (cwd) => cwd === null || home === null || cwd === home || cwd.startsWith(`${home}${path.sep}`);
 
     if (leaderAlive) {
       const stat = readProcStat(info.pid);
       if (stat && info.started !== null && stat.started !== info.started) {
         return { gone: false, running: false, why: `pid ${info.pid} is another process now, started at another time` };
       }
-      const cwd = readProcCwd(info.pid);
-      if (!inItsFolder(cwd)) {
-        return { gone: false, running: false, why: `pid ${info.pid} is a process running in ${cwd}, not in this server's folder` };
+      if (info.server === null) {
+        const cwd = readProcCwd(info.pid);
+        const home = cwd === null ? null : await fsp.realpath(paths.serverDir).catch(() => null);
+        if (cwd !== null && home !== null && cwd !== home && !cwd.startsWith(`${home}${path.sep}`)) {
+          return {
+            unknown: `${fromRoot(paths.pidFile)} names pid ${info.pid}, which is running in ${cwd} and not in this server's folder. The record is from before the dashboard wrote down which server a process is, so whether that process is this server is not known: nothing is signalled, started or removed. If it is this server, stop it by hand. If it is not, remove the pid file.`
+          };
+        }
       }
-      return { running: true };
+      return { leftover: null, running: true };
     }
 
     const members = readProcGroup(info.pid);
     if (!members || !members.length) {
-      return { running: true };
+      // There, by the signal that found it, and not to be listed.
+      return { leftover: { count: null }, running: true };
     }
-    const itsOwn = members.some(
-      (member) => member.session === info.pid && (info.started === null || member.started >= info.started) && inItsFolder(member.cwd)
-    );
-    return itsOwn
-      ? { running: true }
-      : { gone: false, running: false, why: `process group ${info.pid} is not this server's: nothing in it runs in this server's folder` };
+    const itsOwn = members.filter((member) => member.session === info.pid && (info.started === null || member.started >= info.started));
+    return itsOwn.length
+      ? { leftover: { count: itsOwn.length }, running: true }
+      : { gone: false, running: false, why: `process group ${info.pid} is not this server's: nothing in it is from the session this server was started in` };
   }
 
   // The server this process started itself, while it runs. The child is the
@@ -1330,7 +1375,9 @@ function createServerManager(store, options = {}) {
   // The process a server is running as: this dashboard's own child, or the one
   // an earlier dashboard process recorded in pid.json and that is still there.
   // `stale` says why pid.json holds something else: a process that has gone,
-  // or nothing that can be a record. Throws when the record cannot be read.
+  // or nothing that can be a record. Throws, with stateUnknown(), when it
+  // cannot be told: the record cannot be read, or cannot be held against
+  // anything.
   async function findServerProcess(serverId) {
     const own = ownProcess(serverId);
     if (own) {
@@ -1348,14 +1395,20 @@ function createServerManager(store, options = {}) {
     if (!recorded.info) {
       return { process: null, stale: recorded.why };
     }
-    const state = await examineRecorded(recorded.info, paths);
-    return state.running ? { process: { ...recorded.info, child: null }, stale: null } : { process: null, stale: state.why };
+    const state = await examineRecorded(recorded.info, paths, serverId);
+    if (state.unknown) {
+      throw stateUnknown(state.unknown);
+    }
+    return state.running
+      ? { process: { ...recorded.info, child: null, leftover: state.leftover }, stale: null }
+      : { process: null, stale: state.why };
   }
 
   // Removes the record and the console of a server that is no longer running.
   // Run in the server's turn, and it looks again before it removes anything:
   // by now the record may be that of a server that has just been started. A
-  // record that cannot be read is not removed: this throws, like the read.
+  // record that cannot be read, or that cannot be told to be this server's
+  // or not, is not removed: this throws, like the look that found it so.
   // The pid file goes after the console, so that once it has gone the console
   // has too.
   async function clearProcessRecord(serverId, paths, { announce = false } = {}) {
@@ -1363,7 +1416,11 @@ function createServerManager(store, options = {}) {
       return;
     }
     const recorded = await readPidFile(paths);
-    const state = recorded.info ? await examineRecorded(recorded.info, paths) : null;
+    const state = recorded.info ? await examineRecorded(recorded.info, paths, serverId) : null;
+    if (state && state.unknown) {
+      // Not known to be this server, and not known not to be: it stays.
+      throw stateUnknown(state.unknown);
+    }
     if (state && state.running) {
       return;
     }
@@ -1431,6 +1488,17 @@ function createServerManager(store, options = {}) {
   // process stopped, has none. It is how the page knows to say that a server
   // was killed, and that its world may not have been saved, and not just
   // that it has stopped.
+  //
+  // `leftover` is for a server whose first process - the one the dashboard
+  // started, and the pid on record - has exited while others of its group
+  // run on: { count }, with null for a count that could not be taken. As a
+  // rule that first process is the server, and what is left is something its
+  // start script started beside it; it can also be a start script that has
+  // gone, with the server left behind. The dashboard cannot tell which, so
+  // such a server still counts as running, can be stopped, and is not
+  // started again before the last of them has gone.
+  //
+  // `unknown` is only ever set by statusForShow() below.
   function describeStatus(serverId, serverProcess) {
     const last = lastStops.get(serverId);
     if (!serverProcess) {
@@ -1441,7 +1509,9 @@ function createServerManager(store, options = {}) {
         startedBy: null,
         stopping: false,
         stoppingSince: null,
-        lastStop: last ? last.shown : null
+        lastStop: last ? last.shown : null,
+        leftover: null,
+        unknown: null
       };
     }
     if (last && (last.pid !== serverProcess.pid || last.startedAt !== serverProcess.startedAt)) {
@@ -1461,8 +1531,49 @@ function createServerManager(store, options = {}) {
       startedBy: serverProcess.startedBy || "unknown",
       stopping,
       stoppingSince: stopping ? stop.since : null,
-      lastStop: null
+      lastStop: null,
+      leftover: leftoverOf(serverProcess),
+      unknown: null
     };
+  }
+
+  // What is left of a server whose first process has exited, if that is how
+  // things are: see describeStatus(). For a server this process started the
+  // child says whether it has, and the group is counted; for one on record,
+  // the look that found it has said.
+  function leftoverOf(serverProcess) {
+    if (!serverProcess.child) {
+      return serverProcess.leftover || null;
+    }
+    return serverProcess.group && firstProcessHasExited(serverProcess) ? { count: countGroup(serverProcess.pid) } : null;
+  }
+
+  // Whether the process a server was started as - the one on record - has
+  // exited, whatever else of its group may still be there.
+  function firstProcessHasExited(serverProcess) {
+    if (serverProcess.child) {
+      return serverProcess.child.exitCode !== null || serverProcess.child.signalCode !== null;
+    }
+    return !isProcessAlive(serverProcess.pid);
+  }
+
+  // How many processes a group has, or null where that cannot be counted.
+  function countGroup(pgid) {
+    const members = readProcGroup(pgid);
+    return members && members.length ? members.length : null;
+  }
+
+  // "1 process ... is", "3 processes ... are", for a count that may be unknown.
+  function someProcesses(count) {
+    return count === 1 ? { are: "is", some: "1 process", them: "it" } : { are: "are", some: count === null ? "processes" : `${count} processes`, them: "them" };
+  }
+
+  // Why a server that has something left over is not started, in words.
+  function leftoverRefusal(server, leftover) {
+    const { are, some, them } = someProcesses(leftover.count);
+    return userFacingError(
+      `${server.name} cannot be started yet. The process it was started as has exited, but ${some} that it started ${are} still running, and may be using its world. Stop the server to end ${them}, then start it again.`
+    );
   }
 
   async function getServerStatus(serverId) {
@@ -1471,6 +1582,44 @@ function createServerManager(store, options = {}) {
       await clearStaleRecord(serverId);
     }
     return describeStatus(serverId, found.process);
+  }
+
+  // The status of a server for showing it: in the list of servers, and on its
+  // own page. getServerStatus() refuses when it cannot tell whether a server
+  // is running, and that is right for whatever acts on the answer. But one
+  // server in that state must not take the list of all of them with it, and
+  // with the list every Stop button on the page. So here the refusal becomes
+  // an answer: nothing is said to be running or stopped, and `unknown` holds
+  // the reason. It goes to the dashboard's log once for as long as it stays
+  // the same: the page asks again every few seconds.
+  async function statusForShow(serverId) {
+    try {
+      const status = await getServerStatus(serverId);
+      unknownReported.delete(serverId);
+      return status;
+    } catch (error) {
+      const reason = error && error.message ? error.message : "Its status could not be read.";
+      if (unknownReported.get(serverId) !== reason) {
+        unknownReported.set(serverId, reason);
+        const said = { reason, serverId, ...(error && error.stateUnknown ? {} : { stack: error && error.stack }) };
+        if (error && error.stateUnknown) {
+          logger.warn("Whether a server is running is not known", said);
+        } else {
+          logger.error("A server's status could not be worked out", said);
+        }
+      }
+      return {
+        running: null,
+        pid: null,
+        startedAt: null,
+        startedBy: null,
+        stopping: false,
+        stoppingSince: null,
+        lastStop: null,
+        leftover: null,
+        unknown: reason
+      };
+    }
   }
 
   // A per-server Java path is needed because one dashboard can host servers
@@ -2728,6 +2877,16 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     return error;
   }
 
+  // For when the dashboard cannot say whether a server is running: its
+  // record cannot be read, the folder the record is kept in is not the
+  // server's own, or the record cannot be held against anything. Whatever
+  // was asked for is refused with the reason, and nothing is signalled,
+  // started or removed. Where servers are only shown - the list, a server's
+  // page - this is caught, and that one server is shown as "not known".
+  function stateUnknown(message) {
+    return Object.assign(userFacingError(message, 409), { stateUnknown: true });
+  }
+
   function getInstallableLoaders() {
     return [...INSTALLABLE_LOADERS];
   }
@@ -3191,8 +3350,12 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     // In that time someone else may have started this server.
     const found = await findServerProcess(serverId);
     if (found.process) {
-      if (describeStatus(serverId, found.process).stopping) {
+      const status = describeStatus(serverId, found.process);
+      if (status.stopping) {
         throw stillStopping(server);
+      }
+      if (status.leftover) {
+        throw leftoverRefusal(server, status.leftover);
       }
       return false;
     }
@@ -3343,6 +3506,9 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
         startedBy: own.startedBy,
         ...(own.console === CONSOLE_PIPE ? { console: CONSOLE_PIPE } : {}),
         group: true,
+        // Which server this is: the record goes along when the folder is
+        // copied, and must not make the copy a running server.
+        server: serverId,
         // What tells this process from another that is given its pid later:
         // which run of the machine it is from, and when in it it was started.
         ...(bootId ? { boot: bootId } : {}),
@@ -3374,6 +3540,12 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       // The process is still there, saving. A second one on the same world
       // and the same port is the last thing it needs.
       throw stillStopping(server);
+    }
+    if (status.leftover) {
+      // Running, as far as anything can tell, and not as it was started:
+      // answering "it is running" to that would be to do nothing and say
+      // nothing, with a server that may have gone hours ago.
+      throw leftoverRefusal(server, status.leftover);
     }
     if (status.running) {
       return status;
@@ -3450,28 +3622,37 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
   // did not start, or the rest of a group whose leader has exited - is looked
   // at again and again. Timers only, no clock: the wait is as long as the
   // timer says.
-  function waitForExit(serverProcess, waitMs) {
+  //
+  // With `orFirstProcess` the wait is also over, answering "first", as soon
+  // as the process the server was started as has exited and others of its
+  // group have not.
+  function waitForExit(serverProcess, waitMs, { orFirstProcess = false } = {}) {
     return new Promise((resolve) => {
-      if (!isServerAlive(serverProcess)) {
-        resolve(true);
+      // true once all of it has gone. "first", where that is asked for, once
+      // the process it was started as has exited and others run on.
+      const answer = () => (!isServerAlive(serverProcess) ? true : orFirstProcess && firstProcessHasExited(serverProcess) ? "first" : null);
+      const already = answer();
+      if (already) {
+        resolve(already);
         return;
       }
       const { child } = serverProcess;
       let again = null;
-      const finish = (gone) => {
+      const finish = (ended) => {
         clearTimeout(deadline);
         clearInterval(again);
         if (child) {
           child.off("exit", look);
         }
-        resolve(gone);
+        resolve(ended);
       };
       const look = () => {
-        if (!isServerAlive(serverProcess)) {
-          finish(true);
+        const ended = answer();
+        if (ended) {
+          finish(ended);
         }
       };
-      const deadline = setTimeout(() => finish(!isServerAlive(serverProcess)), waitMs);
+      const deadline = setTimeout(() => finish(answer() || false), waitMs);
       if (child) {
         child.once("exit", look);
       }
@@ -3500,6 +3681,9 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     const by = actor && actor.username ? ` by ${actor.username}` : "";
     // The last thing the server was sent, for the status to say afterwards.
     let took = null;
+    // Whether the process on record is there as the stop begins. When it is
+    // not, what is being stopped is what that process left behind.
+    const firstWasThere = !firstProcessHasExited(serverProcess);
     const stopped = async () => {
       if (took) {
         lastStops.set(serverId, {
@@ -3514,16 +3698,40 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
         onServerGone(serverId, serverProcess, paths, "The last of the server's processes has gone");
       }
       // The record of a server this process did not start is cleared here.
-      // One it did start is cleared a turn ahead of this.
-      await takeTurn(lifecycleTurns, serverId, () => forgetServer(serverId, paths, { announce: true }));
+      // One it did start has been cleared a turn ahead of this, and that
+      // turn is only waited for: clearing twice says twice whatever there
+      // is to say about a record that would not go.
+      await takeTurn(lifecycleTurns, serverId, () => (serverProcess.child ? null : forgetServer(serverId, paths, { announce: true })));
       logger.info("Server stopped", { how: took, pid, serverId, waitedSeconds: waitedSeconds() });
     };
 
     // A server this process did not start is known by its record alone, and
     // minutes pass between one step and the next. What is about to be
     // signalled is looked at again each time: by then the pid could be some
-    // other program's.
-    const stillThisServer = async () => Boolean(serverProcess.child) || (await examineRecorded(serverProcess, paths)).running;
+    // other program's. Says whether to go on. When the server has gone, the
+    // stop is over; when it can no longer be told whether this is the server,
+    // nothing more is sent and nothing is cleared away, and both logs say so.
+    const lookAgain = async () => {
+      if (serverProcess.child) {
+        return true;
+      }
+      const state = await examineRecorded(serverProcess, paths, serverId);
+      if (state.running) {
+        return true;
+      }
+      if (state.unknown) {
+        logger.warn("Stopping a server: what its record names can no longer be told to be the server, and nothing more is sent", {
+          pid,
+          reason: state.unknown,
+          server: server.name,
+          serverId
+        });
+        await note(`Stop abandoned ${waitedSeconds()} s in: pid ${pid} can no longer be told to be this server. Nothing more is sent to it.`);
+        return false;
+      }
+      await stopped();
+      return false;
+    };
 
     // A server on record without a console was started before the dashboard
     // kept one for its servers, or by a dashboard process that could not make
@@ -3541,30 +3749,57 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     if (asked.sent) {
       took = "console";
       logger.info('Stopping a server: sent "stop" to its console', { pid, server: server.name, serverId });
-      if (await waitForExit(serverProcess, stopWaits.console)) {
+      const ended = await waitForExit(serverProcess, stopWaits.console, { orFirstProcess: firstWasThere });
+      if (ended === true) {
         return await stopped();
       }
 
-      if (!(await stillThisServer())) {
-        return await stopped();
+      if (!(await lookAgain())) {
+        return;
       }
       const waited = waitedSeconds();
-      signalServer(serverProcess, "SIGTERM");
-      took = "SIGTERM";
-      logger.warn('Server did not exit after "stop" on its console: sent SIGTERM', {
-        pid,
-        server: server.name,
-        serverId,
-        waitedSeconds: waited
-      });
-      await note(`No exit ${waited} s after "stop" on the console: sent SIGTERM`);
-      if (await waitForExit(serverProcess, stopWaits.term)) {
-        return await stopped();
+      if (ended === "first") {
+        // The process on record took "stop" and has exited: the server, or
+        // the start script that was waiting for it. What is still in its
+        // group is what that script started beside the server - a tunnel, a
+        // watcher - and it has no console to be asked on. Waiting out the
+        // minutes a saving server gets would be waiting for nothing, so it
+        // is signalled now; and then given as long as a server without a
+        // console, should the server be among it after all.
+        const { are, some, them } = someProcesses(countGroup(pid));
+        signalServer(serverProcess, "SIGTERM");
+        logger.info('The process a server was started as exited after "stop": sent SIGTERM to what it left running', {
+          left: countGroup(pid),
+          pid,
+          server: server.name,
+          serverId,
+          waitedSeconds: waited
+        });
+        await note(`The process the server was started as has exited, ${waited} s after "stop". ${some} that it started ${are} still running: sent SIGTERM to end ${them}`);
+        if (await waitForExit(serverProcess, stopWaits.signalOnly)) {
+          return await stopped();
+        }
+      } else {
+        signalServer(serverProcess, "SIGTERM");
+        took = "SIGTERM";
+        logger.warn('Server did not exit after "stop" on its console: sent SIGTERM', {
+          pid,
+          server: server.name,
+          serverId,
+          waitedSeconds: waited
+        });
+        await note(`No exit ${waited} s after "stop" on the console: sent SIGTERM`);
+        if (await waitForExit(serverProcess, stopWaits.term)) {
+          return await stopped();
+        }
       }
     } else {
-      if ((await waitForExit(serverProcess, 0)) || !(await stillThisServer())) {
+      if (await waitForExit(serverProcess, 0)) {
         // It went while it was being asked.
         return await stopped();
+      }
+      if (!(await lookAgain())) {
+        return;
       }
       signalServer(serverProcess, "SIGTERM");
       took = "SIGTERM";
@@ -3581,8 +3816,8 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       }
     }
 
-    if (!(await stillThisServer())) {
-      return await stopped();
+    if (!(await lookAgain())) {
+      return;
     }
     const waited = waitedSeconds();
     signalServer(serverProcess, "SIGKILL");
@@ -4380,15 +4615,20 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
 
     const paths = resolveRecordPaths(server);
     const lockedForUser = user.role !== "owner" && Boolean(server.passphraseHash) && !unlocked;
-    const status = await getServerStatus(serverId);
-    const worlds = lockedForUser ? [] : await listWorldEntries(serverId);
-    const installedFiles = lockedForUser ? [] : await listInstalledFiles(serverId);
-    const propertiesText = !lockedForUser && user.role === "owner" ? await readServerProperties(serverId) : null;
-    const safeProperties = lockedForUser ? null : await readSafeAdminProperties(serverId);
-    const operators = !lockedForUser && user.role === "owner" ? await listServerOperators(serverId) : [];
-    const worldRules = lockedForUser ? null : await readWorldRules(serverId);
-    const logs = lockedForUser ? null : await getServerLog(serverId);
-    const updateSupport = user.role === "owner" ? await getServerUpdateSupport(serverId) : null;
+    const status = await statusForShow(serverId);
+    // Of a server whose state is not known the page shows the reason, with
+    // Start and Stop, and nothing else. Half of what follows is read from the
+    // folder that may be the reason, and some of it is made there when it is
+    // found missing.
+    const withheld = lockedForUser || Boolean(status.unknown);
+    const worlds = withheld ? [] : await listWorldEntries(serverId);
+    const installedFiles = withheld ? [] : await listInstalledFiles(serverId);
+    const propertiesText = !withheld && user.role === "owner" ? await readServerProperties(serverId) : null;
+    const safeProperties = withheld ? null : await readSafeAdminProperties(serverId);
+    const operators = !withheld && user.role === "owner" ? await listServerOperators(serverId) : [];
+    const worldRules = withheld ? null : await readWorldRules(serverId);
+    const logs = withheld ? null : await getServerLog(serverId);
+    const updateSupport = user.role === "owner" && !status.unknown ? await getServerUpdateSupport(serverId) : null;
     // Only computed when adoption is actually on offer: it touches the disk, and
     // the loader build catalog behind the update panel needs the network, so
     // that stays behind its own route rather than loading on every render.

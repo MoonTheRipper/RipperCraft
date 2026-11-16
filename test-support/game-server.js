@@ -144,7 +144,7 @@ function bootIdNow() {
 // What the dashboard writes down about a server it has just started, given
 // the pid and the time it reported.
 function recordFor(pid, startedAt, extra = {}) {
-  const record = { group: true, pid, startedAt, startedBy: OWNER.username, ...extra };
+  const record = { group: true, pid, server: SERVER_ID, startedAt, startedBy: OWNER.username, ...extra };
   if (bootIdNow() !== null) {
     record.boot = bootIdNow();
   }
@@ -246,6 +246,22 @@ async function createServerRoot(t, behaviour = {}) {
 // A server manager over a root, the way one dashboard process makes it: with
 // a store of its own, and a logger that keeps what it is told. Making a
 // second one over the same root is what a restarted dashboard amounts to.
+// One more server in a dashboard root that createServerRoot() made, set up
+// like the first. Its stand-in is ended with the first one's, by whoever
+// started it; a test that leaves it running ends it itself.
+async function addServer(root, serverId, behaviour = {}) {
+  const layout = describeServerDir(root, serverId);
+  await fsp.mkdir(path.join(layout.serverDir, "logs"), { recursive: true });
+  await fsp.writeFile(path.join(layout.serverDir, "eula.txt"), "eula=true\n");
+  await fsp.writeFile(path.join(layout.serverDir, "fake-server.js"), fakeServerSource(behaviour), { mode: 0o755 });
+  const store = createStore(root);
+  await store.ensureInitialized();
+  const setup = createServerManager(store);
+  await setup.syncDiscoveredServers();
+  await setup.setServerMetadata(serverId, { passphrase: "lane-secret", startCommand: START_COMMAND });
+  return layout;
+}
+
 async function createManager(root, options = {}) {
   const logs = [];
   const keep = (level) => (message, meta) => logs.push({ level, message, meta });
@@ -302,13 +318,21 @@ async function startFromAnotherProcess(t, root, options = {}) {
 // one that went by itself, one that another dashboard process stopped.
 const STOPPED = Object.freeze({
   lastStop: null,
+  leftover: null,
   pid: null,
   running: false,
   startedAt: null,
   startedBy: null,
   stopping: false,
-  stoppingSince: null
+  stoppingSince: null,
+  unknown: null
 });
+
+// What a server is reported as, where servers are only shown, when the
+// dashboard cannot tell whether it is running. `reason` is why, in words.
+function notKnown(reason) {
+  return { ...STOPPED, running: null, unknown: reason };
+}
 
 // And one the dashboard has stopped. `how` is the last thing the stop took:
 // "console", "SIGTERM" or "SIGKILL". For comparing with a status that has
@@ -412,6 +436,7 @@ module.exports = {
   QUICK_WAITS,
   SERVER_ID,
   STOPPED,
+  addServer,
   bootIdNow,
   createManager,
   createServerRoot,
@@ -419,6 +444,7 @@ module.exports = {
   fakeServerSource,
   isAlive,
   isThere,
+  notKnown,
   plantPipe,
   procStarted,
   recordFor,

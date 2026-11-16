@@ -149,6 +149,76 @@ test("a server that had to be killed is reported as killed, to the list and to i
   assert.deepEqual(settled(await statusOf()), stoppedBy("SIGKILL"));
 });
 
+test("one server folder the dashboard will not read through does not take the list of servers down, and is refused in words", async (t) => {
+  const app = await startApp(t, { app: { stopWaits: QUICK_WAITS } });
+  const server = describeServerDir(app.root);
+  fs.writeFileSync(path.join(server.serverDir, "launch-server.sh"), fakeServerSource(), { mode: 0o755 });
+  fs.chmodSync(path.join(server.serverDir, "launch-server.sh"), 0o755);
+  fs.writeFileSync(path.join(server.serverDir, "eula.txt"), "eula=true\n");
+  let standIn = null;
+  t.after(() => {
+    if (standIn && isAlive(standIn)) {
+      process.kill(standIn, "SIGKILL");
+    }
+  });
+  const owner = await app.setupOwner();
+  assert.equal((await owner("PUT", "/api/servers/DemoServer/settings", { json: { passphrase: "lane-secret" } })).status, 200);
+  assert.equal((await owner("POST", "/api/servers/DemoServer/start")).status, 200);
+  standIn = await server.whenReady();
+
+  // One more folder under servers/, whose .rippermoon is a link: a mkdir and an ln -s.
+  const elsewhere = path.join(app.root, "elsewhere");
+  fs.mkdirSync(elsewhere);
+  fs.mkdirSync(path.join(app.root, "servers", "Other"));
+  fs.symlinkSync(elsewhere, path.join(app.root, "servers", "Other", ".rippermoon"));
+  const reason =
+    "servers/Other/.rippermoon is a link. The dashboard keeps this server's record and log there, and reads, writes and removes nothing through it as it is. Put a folder there, or remove what is there.";
+
+  // The list - the page's first request - answers, with every server in it.
+  const listed = await owner("GET", "/api/servers");
+  assert.equal(listed.status, 200, listed.text);
+  const byId = Object.fromEntries(listed.json.servers.map((entry) => [entry.id, entry.status]));
+  assert.deepEqual(Object.keys(byId).sort(), ["DemoServer", "Other"]);
+  assert.deepEqual([byId.DemoServer.running, byId.DemoServer.pid, byId.DemoServer.unknown], [true, standIn, null]);
+  assert.deepEqual(byId.Other, { ...STOPPED, running: null, unknown: reason });
+
+  // Its own page answers too, with the reason and with nothing read for it.
+  const page = await owner("GET", "/api/servers/Other");
+  assert.equal(page.status, 200, page.text);
+  assert.deepEqual(page.json.server.status, byId.Other);
+  assert.deepEqual([page.json.worlds, page.json.mods, page.json.logs], [[], [], null]);
+
+  // Whatever would act on it is refused in words: a refusal, not a failure.
+  assert.equal((await owner("PUT", "/api/servers/Other/settings", { json: { passphrase: "lane-secret" } })).status, 200);
+  for (const [method, route, body] of [
+    ["POST", "/api/servers/Other/stop"],
+    ["POST", "/api/servers/Other/start"],
+    ["DELETE", "/api/servers/Other", { json: { confirmServerId: "Other" } }]
+  ]) {
+    const answer = await owner(method, route, body);
+    assert.equal(answer.status, 409, `${method} ${route}: ${answer.text}`);
+    assert.deepEqual(answer.json, { error: reason }, `${method} ${route}`);
+  }
+  // Nothing was made, written or removed through the link, by any of that.
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
+  assert.equal(fs.lstatSync(path.join(app.root, "servers", "Other", ".rippermoon")).isSymbolicLink(), true);
+
+  // And the server that has nothing wrong with it is stopped as ever.
+  const stopping = await owner("POST", "/api/servers/DemoServer/stop");
+  assert.equal(stopping.status, 200);
+  assert.equal(stopping.json.status.stopping, true);
+  await waitFor(async () => {
+    const again = await owner("GET", "/api/servers");
+    return again.status === 200 && again.json.servers.find((entry) => entry.id === SERVER_ID).status.running === false;
+  }, "the healthy server to have stopped");
+  assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
+  // Said once in the dashboard's log, for all the times the list was asked for.
+  assert.deepEqual(
+    app.logs.filter((entry) => entry.message === "Whether a server is running is not known").map((entry) => [entry.level, entry.meta.serverId]),
+    [["warn", "Other"]]
+  );
+});
+
 test("a restricted admin has to unlock a server before stopping it, as before", async (t) => {
   const app = await startApp(t, { app: { stopWaits: QUICK_WAITS } });
   const owner = await app.setupOwner();

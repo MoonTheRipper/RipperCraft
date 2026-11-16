@@ -12,6 +12,7 @@ const {
   createServerRoot,
   isAlive,
   isThere,
+  procStarted,
   settled,
   sleep,
   startLegacyServer,
@@ -207,8 +208,10 @@ test("a signal goes to the server behind a start script as well, and the server 
 
   // The script has gone and the server has not: it is running, and stopping,
   // and nothing is cleared away or started beside it.
+  // The status says that this is what is left of what was started: one
+  // process, the server.
   const status = await serverManager.getServerStatus(SERVER_ID);
-  assert.deepEqual({ ...status, stoppingSince: null }, { ...started, stopping: true });
+  assert.deepEqual({ ...status, stoppingSince: null }, { ...started, leftover: { count: 1 }, stopping: true });
   await assert.rejects(serverManager.startServer(SERVER_ID, OWNER), { message: /still stopping/, statusCode: 409 });
   assert.equal(isThere(server.pidFile), true);
   assert.equal(isThere(server.consoleFile), true);
@@ -288,11 +291,18 @@ for (const who of ["the dashboard that started it", "a dashboard started later"]
     }
     const manager = dashboard.serverManager;
 
-    assert.deepEqual(await manager.getServerStatus(SERVER_ID), started);
-    // Start finds it running, and puts no second one beside it.
-    assert.deepEqual(await manager.startServer(SERVER_ID, OWNER), started);
+    // Running, and marked as what is left of what was started: the process
+    // on record has exited, and one that it started has not.
+    assert.deepEqual(await manager.getServerStatus(SERVER_ID), { ...started, leftover: { count: 1 } });
+    // Start puts no second one beside it, and says why not.
+    await assert.rejects(manager.startServer(SERVER_ID, OWNER), {
+      message:
+        "DemoServer cannot be started yet. The process it was started as has exited, but 1 process that it started is still running, and may be using its world. Stop the server to end it, then start it again.",
+      statusCode: 409
+    });
     assert.equal(server.fakePid(), pid);
     assert.equal(isThere(server.pidFile), true);
+    assert.equal((server.runtimeLog().match(/^fake server ready$/gm) || []).length, 1);
 
     assert.deepEqual(settled(await manager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
     assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
@@ -300,6 +310,112 @@ for (const who of ["the dashboard that started it", "a dashboard started later"]
     assert.equal(isThere(server.pidFile), false);
     assert.equal(isThere(server.consoleFile), false);
     assert.equal((server.runtimeLog().match(/^fake server ready$/gm) || []).length, 1);
+  });
+}
+
+// --- what a start script leaves running beside the server -------------------------------------------
+
+// A start script that starts something else as well - a tunnel, a watcher -
+// and then hands over to the server. The server is the process on record;
+// the other thing is in its group, and has no console.
+function besideAHelper(server) {
+  fs.writeFileSync(
+    path.join(server.serverDir, "run.sh"),
+    `#!/bin/sh\n"${process.execPath}" -e "setTimeout(() => {}, 60000)" &\nexec ./fake-server.js\n`,
+    { mode: 0o755 }
+  );
+  return { startCommand: "./run.sh" };
+}
+
+function groupIsThere(pgid) {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+for (const who of ["the dashboard that started it", "a dashboard started later"]) {
+  test(`a server that has gone, with something its start script started still running, is said to be so by ${who}, is not started beside it, and is cleared by Stop`, async (t) => {
+    const server = await createServerRoot(t);
+    let dashboard = await createManager(server.root);
+    await dashboard.serverManager.setServerMetadata(SERVER_ID, besideAHelper(server));
+    const started = await dashboard.serverManager.startServer(SERVER_ID, OWNER);
+    const pid = await server.whenReady();
+    assert.equal(started.pid, pid);
+    t.after(() => {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        // Gone already.
+      }
+    });
+
+    // The server crashes, or is stopped from inside the game.
+    process.kill(pid, "SIGKILL");
+    await waitFor(() => !isAlive(pid), "the server to have gone");
+    await sleep(200);
+    assert.equal(groupIsThere(pid), true);
+    if (who !== "the dashboard that started it") {
+      dashboard = await createManager(server.root);
+    }
+    const manager = dashboard.serverManager;
+
+    // Still counted as running - what is left may be using the world - and
+    // marked as what it is: the process on record has exited, and one that
+    // it started has not. Where that cannot be counted the count is null.
+    const counted = procStarted(process.pid) === null ? null : 1;
+    assert.deepEqual(await manager.getServerStatus(SERVER_ID), { ...started, leftover: { count: counted } });
+
+    // Start does not answer "it is running" and do nothing: it says why not.
+    fs.rmSync(path.join(server.serverDir, "fake-server.pid"));
+    await assert.rejects(manager.startServer(SERVER_ID, OWNER), {
+      message: /^DemoServer cannot be started yet\. The process it was started as has exited, but (1 process that it started is|processes that it started are) still running, and may be using its world\. Stop the server to end (it|them), then start it again\.$/,
+      statusCode: 409
+    });
+    await sleep(300);
+    assert.equal(server.fakePid(), null);
+    assert.equal(isThere(server.pidFile), true);
+
+    // Stop ends what is left. Nothing reads the console any more, so it is
+    // signalled at once.
+    const began = Date.now();
+    assert.deepEqual(settled(await manager.stopServer(SERVER_ID, OWNER)), stoppedBy("SIGTERM"));
+    assert.ok(Date.now() - began < 5000, `the stop took ${Date.now() - began} ms`);
+    assert.equal(groupIsThere(pid), false);
+    assert.equal(isThere(server.pidFile), false);
+    assert.equal(isThere(server.consoleFile), false);
+
+    // And then it is started again, a server like any other.
+    const again = await manager.startServer(SERVER_ID, OWNER);
+    const second = await server.whenReady();
+    assert.deepEqual([again.running, again.pid, again.leftover], [true, second, null]);
+    t.after(() => {
+      try {
+        process.kill(-second, "SIGKILL");
+      } catch {
+        // Gone already.
+      }
+    });
+
+    // Stopped the ordinary way, the server takes "stop" and exits, and what
+    // its script started beside it is ended there and then: not after the
+    // minutes a server is given to save. It counts as a stop by the console.
+    const stopBegan = Date.now();
+    assert.deepEqual(settled(await manager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
+    assert.ok(Date.now() - stopBegan < 5000, `the stop took ${Date.now() - stopBegan} ms`);
+    assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
+    assert.equal(groupIsThere(second), false);
+    assert.match(
+      server.runtimeLog(),
+      /^\[[^\]]+\] The process the server was started as has exited, \d+ s after "stop"\. (1 process that it started is|processes that it started are) still running: sent SIGTERM to end (it|them)$/m
+    );
+    // No warning for it: nothing went wrong.
+    assert.deepEqual(
+      dashboard.problems().map((entry) => entry.message).filter((message) => /SIGTERM|SIGKILL/.test(message)),
+      ['Server has no console the dashboard can reach: sent SIGTERM instead of "stop"']
+    );
   });
 }
 
@@ -318,15 +434,7 @@ test("a server on record without a console is stopped by signal, and given as lo
   await waitFor(() => server.received().includes("console: closed"), "the server to find its console closed");
 
   const found = await serverManager.getServerStatus(SERVER_ID);
-  assert.deepEqual(found, {
-    lastStop: null,
-    pid,
-    running: true,
-    startedAt: "2026-11-16T09:00:00.000Z",
-    startedBy: "owner",
-    stopping: false,
-    stoppingSince: null
-  });
+  assert.deepEqual(found, { ...STOPPED, pid, running: true, startedAt: "2026-11-16T09:00:00.000Z", startedBy: "owner" });
 
   const stopping = serverManager.stopServer(SERVER_ID, OWNER);
   await waitFor(() => server.received().includes("signal: SIGTERM"), "the server to be sent SIGTERM");
@@ -386,7 +494,7 @@ test("two stops at once are one stop, and the server is not started again in the
   // Asked for the way a request asks: answered at once, with the server
   // still running and now stopping.
   const answered = await serverManager.requestStop(SERVER_ID, OWNER);
-  assert.deepEqual(Object.keys(answered).sort(), ["lastStop", "pid", "running", "startedAt", "startedBy", "stopping", "stoppingSince"]);
+  assert.deepEqual(Object.keys(answered).sort(), ["lastStop", "leftover", "pid", "running", "startedAt", "startedBy", "stopping", "stoppingSince", "unknown"]);
   assert.deepEqual({ ...answered, stoppingSince: null }, { ...started, stopping: true });
   assert.match(answered.stoppingSince, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
   assert.ok(Date.parse(answered.stoppingSince) >= Date.parse(started.startedAt));
@@ -502,6 +610,12 @@ test("a look at a server that began just before it went does not take away what 
   const pid = await server.whenReady();
   // A dashboard started later: it knows the server by its record, and has to
   // ask the system about the process each time it is asked for the status.
+  // The record is one from before it said which server it is of: only such
+  // a record is held against the folder its process runs in, and that is
+  // the one look into the system that takes any time.
+  const { server: omitted, ...older } = server.pidInfo();
+  assert.equal(omitted, SERVER_ID);
+  fs.writeFileSync(server.pidFile, `${JSON.stringify(older, null, 2)}\n`);
   const { serverManager } = await createManager(server.root);
   assert.equal((await serverManager.requestStop(SERVER_ID, OWNER)).stopping, true);
   await waitFor(() => server.received().includes("console: stop"), "the server to be told to stop");
@@ -611,8 +725,10 @@ test("a stop that fails in the background is logged, and takes nothing down with
     logs.map((entry) => [entry.level, entry.message, entry.meta.error, entry.meta.pid, entry.meta.serverId]),
     [["error", "Stopping a server failed", "the disk the log is on has gone", pid, SERVER_ID]]
   );
-  // The stop is over, and the next one is a new one.
+  // The stop is over, and the next one is a new one. The server had been
+  // told to stop before the failure, and goes by itself.
   await waitFor(async () => !(await serverManager.getServerStatus(SERVER_ID)).stopping, "the failed stop to be forgotten");
+  await waitFor(() => !isAlive(pid), "the server to act on the stop it was sent");
   assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
   await sleep(50);
   assert.deepEqual(uncaught, []);

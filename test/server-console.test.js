@@ -66,10 +66,12 @@ test("a server the dashboard started is stopped through its console, and nothing
   assert.equal(fs.lstatSync(server.consolesDir).isDirectory(), true);
   assert.equal(fs.lstatSync(server.consolesDir).mode & 0o777, 0o700);
   assert.deepEqual(server.pidInfo(), recordFor(started.pid, started.startedAt, { console: "fifo" }));
+  // It says which server this is, wherever the folder is copied to.
+  assert.equal(server.pidInfo().server, SERVER_ID);
   // Where /proc can say, the record holds what tells this process from any
   // other that is ever given its pid.
   if (procStarted(started.pid) !== null) {
-    assert.deepEqual(Object.keys(server.pidInfo()).sort(), ["boot", "console", "group", "pid", "started", "startedAt", "startedBy"]);
+    assert.deepEqual(Object.keys(server.pidInfo()).sort(), ["boot", "console", "group", "pid", "server", "started", "startedAt", "startedBy"]);
     assert.match(server.pidInfo().boot, /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
     assert.equal(Number.isSafeInteger(server.pidInfo().started), true);
   }

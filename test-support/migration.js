@@ -431,6 +431,7 @@ exec '${real("id")}' "$@"
           startedBy: "owner",
           console: "fifo",
           group: true,
+          server: "Demo",
           boot: "0a1b2c3d-0000-4000-8000-000000000000",
           started: 4194303
         },
