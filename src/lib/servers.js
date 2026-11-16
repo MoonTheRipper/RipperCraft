@@ -5,6 +5,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 const { hashSecret, verifySecret } = require("./auth");
+const { HttpError } = require("./http");
 const { getDefaultOutbound } = require("./outbound");
 const { isUploadTempName, newUploadTempPath } = require("./upload");
 const {
@@ -19,6 +20,7 @@ const {
   LEGACY_ENV_PREFIX,
   childEnvironment,
   coerceBoolean,
+  createMutex,
   displayNameFromSlug,
   ensureDir,
   exists,
@@ -88,12 +90,118 @@ const SAFE_ADMIN_SETTING_DEFINITIONS = [
 ];
 const SAFE_ADMIN_SETTING_KEYS = new Set(SAFE_ADMIN_SETTING_DEFINITIONS.map((definition) => definition.key));
 
+// What a Minecraft server is told on its console to make it save and exit.
+const STOP_COMMAND = "stop\n";
+// In pid.json: this server reads its console from the named pipe beside it.
+const CONSOLE_PIPE = "fifo";
+// In memory only: this process holds the server's stdin itself, as a pipe.
+const CONSOLE_STDIN = "stdin";
+// pid.json is a few short lines. Whatever is found in its place is not read
+// past this.
+const PID_FILE_MAX_BYTES = 4096;
+// The largest pid Linux hands out. A pid is only ever taken from between 2 and
+// this: 1 is init, 0 is the dashboard's own process group, and a negative
+// number is a whole group or, as -1, every process of the account.
+const PID_MAX = 4_194_304;
+// How long stopping a server waits at each step, in milliseconds. Saving a
+// large world takes a server seconds on a quiet machine and minutes on one
+// that is short of memory, and a server killed before it has finished loses
+// what it had not written.
+const DEFAULT_STOP_WAITS = Object.freeze({
+  // After "stop" on the console, before SIGTERM.
+  console: 180_000,
+  // After that SIGTERM, before SIGKILL.
+  term: 60_000,
+  // After SIGTERM when there was no console to ask, before SIGKILL.
+  signalOnly: 240_000,
+  // After SIGKILL, for the process to be gone.
+  kill: 10_000,
+  // Between two looks at a process this dashboard did not start itself.
+  poll: 1_000
+});
+
+// What pid.json holds, as far as it can be believed. The file is in the
+// server's own folder, where a mod can write anything: a pid that is not a
+// whole number in range is no pid, the dashboard's own is not a game server,
+// and only the exact marker says there is a console.
+function parsePidInfo(text) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+  const { pid } = parsed;
+  if (!Number.isInteger(pid) || pid <= 1 || pid > PID_MAX || pid === process.pid) {
+    return null;
+  }
+  return {
+    console: parsed.console === CONSOLE_PIPE ? CONSOLE_PIPE : null,
+    pid,
+    startedAt: typeof parsed.startedAt === "string" ? parsed.startedAt : null,
+    startedBy: typeof parsed.startedBy === "string" && parsed.startedBy ? parsed.startedBy : "unknown"
+  };
+}
+
+// What is in the way when a file in a server's folder cannot be opened the way
+// the dashboard opens them, in words for a log line.
+const OPEN_FAILURES = Object.freeze({
+  EISDIR: "a folder is in its place",
+  ELOOP: "a link is in its place",
+  ENOENT: "it is gone",
+  ENOTDIR: "it is gone",
+  ENXIO: "a pipe that nothing reads is in its place"
+});
+
+// Why a console could not be written to.
+function describeConsoleFailure(error) {
+  const code = error && error.code;
+  if (code === "ENXIO") {
+    return "nothing is reading it";
+  }
+  if (code === "EAGAIN") {
+    return "it is full and nothing is reading it";
+  }
+  if (code === "EPIPE") {
+    return "the server has closed it";
+  }
+  return OPEN_FAILURES[code] || code || (error && error.message) || "it could not be opened";
+}
+
 function createServerManager(store, options = {}) {
   // Everything this file fetches from another machine - version lists, server
   // jars, installers, add-ons - goes through the one checked fetcher.
   const outbound = options.outbound || getDefaultOutbound();
+  const logger = options.logger || {
+    error() {},
+    info() {},
+    warn() {}
+  };
+  // options.stopWaits shortens the waits, for tests that cannot spend four
+  // minutes on a server that will not stop.
+  const stopWaits = { ...DEFAULT_STOP_WAITS, ...(options.stopWaits || {}) };
+  // The program that makes a named pipe: Node cannot make one itself.
+  const mkfifoCommand = options.mkfifoCommand || "mkfifo";
   const serversRoot = path.join(store.rootDir, "servers");
+  // The servers this process started and has not seen exit: for each, the
+  // child, its pid, who started it and when, and how its console is reached.
   const runningChildren = new Map();
+  // The stops that are under way, by server: the pid being stopped, when the
+  // stop began, and a promise for its end. Kept in memory only. A dashboard
+  // that is restarted in the middle of one has already asked the server to
+  // stop, and the next press of Stop begins a new, equally patient one.
+  const stopsInProgress = new Map();
+  // Launching a server, and clearing up after one that has gone, take turns
+  // for each server. Without that a status check that found a dead pid could
+  // remove the pid file a start had just written, and the dashboard would lose
+  // track of a server that is running.
+  const lifecycleTurns = new Map();
+  // The dashboard's own lines in a server's runtime log, kept in the order
+  // they were written.
+  const runtimeLogTurns = new Map();
   const versionCatalogCache = {
     data: null,
     expiresAt: 0,
@@ -170,6 +278,7 @@ function createServerManager(store, options = {}) {
       modsDir: path.join(serverDir, PAPER_LIKE_LOADERS.has(record.loader) ? "plugins" : (record.modsDir || "mods")),
       disabledModsDir: path.join(serverDir, ".rippermoon", "disabled-mods"),
       addonManifestFile: path.join(serverDir, ".rippermoon", "addons.json"),
+      consoleFile: path.join(serverDir, ".rippermoon", "console"),
       eulaFile: path.join(serverDir, "eula.txt"),
       pidFile: path.join(serverDir, ".rippermoon", "pid.json"),
       opsFile: path.join(serverDir, "ops.json"),
@@ -734,27 +843,137 @@ function createServerManager(store, options = {}) {
     }
   }
 
-  async function getPidInfo(serverId) {
-    const server = await getServer(serverId);
-    if (!server) {
-      return null;
+  // --- a server's process: its record, its console, its log -------------------------------
+
+  function takeTurn(turns, key, task) {
+    let turn = turns.get(key);
+    if (!turn) {
+      turn = createMutex();
+      turns.set(key, turn);
     }
-    const paths = resolveRecordPaths(server);
+    return turn(task);
+  }
+
+  // Opens a server's runtime log to add to the end of it. Never through a
+  // link, and never waiting: a named pipe left at this path would hold a plain
+  // open until something read from it. O_NONBLOCK means nothing on the regular
+  // file this has to turn out to be.
+  async function openRuntimeLog(runtimeLog) {
+    const handle = await fsp.open(
+      runtimeLog,
+      fs.constants.O_WRONLY |
+        fs.constants.O_APPEND |
+        fs.constants.O_CREAT |
+        fs.constants.O_NOFOLLOW |
+        fs.constants.O_NONBLOCK,
+      0o666
+    );
     try {
-      const raw = await fsp.readFile(paths.pidFile, "utf8");
-      return JSON.parse(raw);
-    } catch (error) {
-      if (error.code === "ENOENT") {
-        return null;
+      if (!(await handle.stat()).isFile()) {
+        throw new Error("it is not a regular file");
       }
+    } catch (error) {
+      await handle.close().catch(() => {});
+      throw error;
+    }
+    return handle;
+  }
+
+  // Adds a line of the dashboard's own to a server's runtime log. The server
+  // writes its output to the same file itself, so the dashboard keeps nothing
+  // open there: each line is opened for, added to the end and closed. A log
+  // that cannot be written to is said in the dashboard's log, and never stops
+  // what the line was about.
+  async function appendRuntimeLog(paths, text) {
+    return await takeTurn(runtimeLogTurns, paths.runtimeLog, async () => {
+      let handle = null;
+      try {
+        handle = await openRuntimeLog(paths.runtimeLog);
+        await handle.write(text);
+        return true;
+      } catch (error) {
+        logger.warn("Could not write to a server's runtime log", {
+          error: OPEN_FAILURES[error.code] || error.message,
+          file: path.relative(store.rootDir, paths.runtimeLog)
+        });
+        return false;
+      } finally {
+        if (handle) {
+          await handle.close().catch(() => {});
+        }
+      }
+    });
+  }
+
+  // Removes what is at a path without following it: of a link, the link goes
+  // and what it points to stays. A folder stays too. Says whether anything
+  // was removed.
+  async function removeWithoutFollowing(target) {
+    try {
+      await fsp.unlink(target);
+      return true;
+    } catch {
+      // Not there, or a folder.
+      return false;
+    }
+  }
+
+  // Removes a server's console pipe once nothing runs behind it. Only a pipe:
+  // anything else found at that path is not the dashboard's, and is left for
+  // the next start to deal with.
+  async function removeConsolePipe(consoleFile) {
+    try {
+      if ((await fsp.lstat(consoleFile)).isFIFO()) {
+        await fsp.unlink(consoleFile);
+      }
+    } catch {
+      // Not there.
+    }
+  }
+
+  // Reads pid.json. `exists` says something is at that path; `info` is what it
+  // holds when that can be believed, and null otherwise.
+  async function readPidFile(pidFile) {
+    let handle;
+    try {
+      // Not through a link, and without waiting on a named pipe left there.
+      handle = await fsp.open(pidFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    } catch (error) {
+      return { exists: error.code !== "ENOENT" && error.code !== "ENOTDIR", info: null };
+    }
+    try {
+      const stats = await handle.stat();
+      if (!stats.isFile() || stats.size > PID_FILE_MAX_BYTES) {
+        return { exists: true, info: null };
+      }
+      const buffer = Buffer.alloc(PID_FILE_MAX_BYTES);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      return { exists: true, info: parsePidInfo(buffer.toString("utf8", 0, bytesRead)) };
+    } catch {
+      return { exists: true, info: null };
+    } finally {
+      await handle.close().catch(() => {});
+    }
+  }
+
+  // Written beside its final name and moved into place, so that whatever is
+  // at that name - a link a mod left there, say - is replaced and never
+  // written through.
+  async function writePidFile(pidFile, info) {
+    const temporaryPath = `${pidFile}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
+    try {
+      await fsp.writeFile(temporaryPath, `${JSON.stringify(info, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+      await fsp.rename(temporaryPath, pidFile);
+    } catch (error) {
+      await fsp.rm(temporaryPath, { force: true }).catch(() => {});
       throw error;
     }
   }
 
+  // Whether a process is there and this account's to signal. Only ever asked
+  // about a pid that parsePidInfo() let through, or one of this process's own
+  // children.
   function isProcessAlive(pid) {
-    if (!pid) {
-      return false;
-    }
     try {
       process.kill(pid, 0);
       return true;
@@ -763,43 +982,98 @@ function createServerManager(store, options = {}) {
     }
   }
 
-  async function writePidInfo(serverId, info) {
-    const server = await getServer(serverId);
-    const paths = resolveRecordPaths(server);
-    await ensureDir(paths.runtimeDir);
-    await fsp.writeFile(paths.pidFile, `${JSON.stringify(info, null, 2)}\n`, "utf8");
+  // The server this process started itself, while it runs. The child is the
+  // truth about it. pid.json is for the dashboard process that comes after
+  // this one, and sits where a mod can rewrite it.
+  function ownProcess(serverId) {
+    const own = runningChildren.get(serverId);
+    return own && own.child.exitCode === null && own.child.signalCode === null ? own : null;
   }
 
-  async function clearPidInfo(serverId) {
+  // The process a server is running as: this dashboard's own child, or the one
+  // an earlier dashboard process recorded in pid.json and that is still there.
+  // `stale` says pid.json holds something else: a process that has gone, or
+  // nothing that can be believed.
+  async function findServerProcess(serverId) {
+    const own = ownProcess(serverId);
+    if (own) {
+      return { process: own, stale: false };
+    }
+    const server = await getServer(serverId);
+    if (!server) {
+      return { process: null, stale: false };
+    }
+    const recorded = await readPidFile(resolveRecordPaths(server).pidFile);
+    if (recorded.info && isProcessAlive(recorded.info.pid)) {
+      return { process: { ...recorded.info, child: null }, stale: false };
+    }
+    return { process: null, stale: recorded.exists };
+  }
+
+  // Removes the record and the console of a server that is no longer running.
+  // Run in the server's turn, and it looks again before it removes anything:
+  // by now the record may be that of a server that has just been started. The
+  // pid file goes after the console, so that once it has gone the console has
+  // too.
+  async function clearProcessRecord(serverId, paths, { announce = false } = {}) {
+    if (ownProcess(serverId)) {
+      return;
+    }
+    const recorded = await readPidFile(paths.pidFile);
+    if (recorded.info && isProcessAlive(recorded.info.pid)) {
+      return;
+    }
+    await removeConsolePipe(paths.consoleFile);
+    const removed = await removeWithoutFollowing(paths.pidFile);
+    if (announce && recorded.info && removed) {
+      // A server an earlier dashboard process started. Its exit code went to
+      // that process, so all there is to say is that it is gone. Said once:
+      // only when the record went with it.
+      logger.info("A recorded server process is no longer running", { pid: recorded.info.pid, serverId });
+      await appendRuntimeLog(paths, `\n[${nowIso()}] Process ${recorded.info.pid} is no longer running\n`);
+    }
+  }
+
+  async function clearStaleRecord(serverId) {
     const server = await getServer(serverId);
     if (!server) {
       return;
     }
     const paths = resolveRecordPaths(server);
-    await fsp.rm(paths.pidFile, { force: true });
+    await takeTurn(lifecycleTurns, serverId, () => clearProcessRecord(serverId, paths, { announce: true }));
+  }
+
+  // `stopping` is only ever true of a server that is running: the moment its
+  // process has gone it is stopped, whether or not the stop has noticed yet.
+  function describeStatus(serverId, serverProcess) {
+    if (!serverProcess) {
+      return {
+        running: false,
+        pid: null,
+        startedAt: null,
+        startedBy: null,
+        stopping: false,
+        stoppingSince: null
+      };
+    }
+    const stop = stopsInProgress.get(serverId);
+    const stopping = Boolean(stop && stop.pid === serverProcess.pid);
+    return {
+      running: true,
+      pid: serverProcess.pid,
+      startedAt: serverProcess.startedAt,
+      startedBy: serverProcess.startedBy || "unknown",
+      stopping,
+      stoppingSince: stopping ? stop.since : null
+    };
   }
 
   async function getServerStatus(serverId) {
-    const pidInfo = await getPidInfo(serverId);
-    if (pidInfo && isProcessAlive(pidInfo.pid)) {
-      return {
-        running: true,
-        pid: pidInfo.pid,
-        startedAt: pidInfo.startedAt,
-        startedBy: pidInfo.startedBy || "unknown"
-      };
+    const found = await findServerProcess(serverId);
+    if (found.stale) {
+      await clearStaleRecord(serverId);
     }
-
-    if (pidInfo) {
-      await clearPidInfo(serverId);
-    }
-
-    return {
-      running: false,
-      pid: null,
-      startedAt: null,
-      startedBy: null
-    };
+    return describeStatus(serverId, found.process);
   }
 
   // A per-server Java path is needed because one dashboard can host servers
@@ -2378,52 +2652,130 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     };
   }
 
-  async function startServer(serverId, actor) {
-    const server = await getServer(serverId);
-    if (!server) {
-      throw userFacingError("Server not found.", 404);
-    }
-    if (!server.passphraseHash) {
-      throw userFacingError("This server has no passphrase configured yet.");
-    }
+  // Refused, and worded for whoever pressed Start: not a fault to be logged
+  // with a stack trace.
+  function stillStopping(server) {
+    return new HttpError(409, `${server.name} is still stopping. Wait until it has stopped, then start it again.`);
+  }
 
-    const status = await getServerStatus(serverId);
-    if (status.running) {
-      return status;
-    }
-
-    if (!(await readEulaStatus(serverId))) {
-      throw userFacingError(
-        `Unable to start ${server.name}. The Minecraft server EULA has not been accepted yet. Open the server overview and accept the EULA first.`
-      );
-    }
-
-    const paths = resolveRecordPaths(server);
-    await ensureDir(paths.runtimeDir);
-    await ensureDir(paths.modsDir);
-    const runtimeLog = fs.createWriteStream(paths.runtimeLog, { flags: "a" });
-    runtimeLog.write(`\n[${nowIso()}] Starting ${server.name} as ${actor.username}\n`);
-
-    let launchSpec;
+  // Makes the named pipe a server reads its console from, and opens it.
+  //
+  // A server used to read its console from a pipe whose other end was this
+  // process. When the dashboard was restarted that end closed, the server was
+  // left with no console at all, and the only way to stop it was a signal. A
+  // named pipe is in the server's folder instead, and any later dashboard
+  // process can open it to write "stop".
+  //
+  // Returns the open pipe, or null and why there is none.
+  async function createConsole(paths) {
+    // Whatever is at the path goes first: the pipe of an earlier run, or
+    // something a mod left there. unlink removes a link and not what it points
+    // to. It fails on a folder, and then there is no console.
     try {
-      launchSpec = await resolveLaunchCommand(serverId, server);
+      await fsp.unlink(paths.consoleFile);
     } catch (error) {
-      // The log was opened above. Say why nothing started, and close it: left
-      // open, every refused start kept a file handle for good.
-      runtimeLog.write(`[${nowIso()}] Start failed: ${error.message}\n`);
-      runtimeLog.end();
-      throw error;
+      if (error.code !== "ENOENT") {
+        // Linux says EISDIR of a folder, and macOS EPERM.
+        const isFolder = await fsp.lstat(paths.consoleFile).then(
+          (stats) => stats.isDirectory(),
+          () => false
+        );
+        return {
+          handle: null,
+          reason: isFolder ? OPEN_FAILURES.EISDIR : `what is at its path could not be removed: ${error.message}`
+        };
+      }
     }
-    const command = launchSpec.command;
-    const spawnDirectly = shouldSpawnDirectly(command);
-    const directCommandPath = spawnDirectly ? path.resolve(paths.serverDir, command) : null;
+    try {
+      // Given half a minute: on a machine short of memory even this can crawl,
+      // and a server started without its pipe is one that can only be
+      // signalled once the dashboard has been restarted.
+      await runCommand(mkfifoCommand, ["-m", "600", paths.consoleFile], { timeoutMs: 30_000 });
+    } catch (error) {
+      const said = typeof error.stderr === "string" ? error.stderr.trim() : "";
+      return { handle: null, reason: `${mkfifoCommand} failed: ${said || error.message}` };
+    }
+    let handle = null;
+    try {
+      // Read-write: opened that way a pipe never waits for its other end, and
+      // the server, which is handed this as its stdin, holds both ends. It
+      // then never reads an end of file, however many writers come and go.
+      // Not through a link, and looked at before it is believed: the pipe was
+      // made a moment ago, but in a folder a mod can write to.
+      handle = await fsp.open(paths.consoleFile, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
+      if (!(await handle.stat()).isFIFO()) {
+        throw new Error("what was opened there is not a named pipe");
+      }
+      return { handle, reason: null };
+    } catch (error) {
+      if (handle) {
+        await handle.close().catch(() => {});
+      }
+      await removeConsolePipe(paths.consoleFile);
+      return { handle: null, reason: `the pipe could not be opened: ${OPEN_FAILURES[error.code] || error.message}` };
+    }
+  }
 
-    if (spawnDirectly && !(await exists(directCommandPath))) {
-      const message = buildStartFailureMessage(server, command, { code: "ENOENT" }, directCommandPath);
-      runtimeLog.write(`[${nowIso()}] Start failed: ${message}\n`);
-      runtimeLog.end();
-      throw userFacingError(message);
+  // Writes a line to a server's console pipe.
+  //
+  // The path is in the server's folder, and a mod running in any server can
+  // put something else there: a file, a link to one, a folder, a pipe of its
+  // own. So it is opened without following a link, and looked at before
+  // anything is written: only a named pipe is written to. It is opened
+  // without waiting, too. A pipe that nothing reads would hold a plain open
+  // for ever; opened this way it fails at once, which is how the dashboard
+  // learns that the console is no longer attached to anything.
+  async function writeToConsole(consoleFile, text) {
+    let handle;
+    try {
+      handle = await fsp.open(consoleFile, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW);
+    } catch (error) {
+      return { reason: describeConsoleFailure(error), sent: false };
     }
+    try {
+      if (!(await handle.stat()).isFIFO()) {
+        return { reason: "what is in its place is not a named pipe", sent: false };
+      }
+      await handle.write(text);
+      return { reason: null, sent: true };
+    } catch (error) {
+      return { reason: describeConsoleFailure(error), sent: false };
+    } finally {
+      await handle.close().catch(() => {});
+    }
+  }
+
+  // A server this process started has exited. It is forgotten at once, so
+  // that nothing takes it for running, and cleared up after in its turn.
+  function onChildExit(serverId, own, paths, code, signal) {
+    if (runningChildren.get(serverId) === own) {
+      runningChildren.delete(serverId);
+    }
+    logger.info("Server process exited", { code, pid: own.pid, serverId, signal });
+    takeTurn(lifecycleTurns, serverId, async () => {
+      await appendRuntimeLog(
+        paths,
+        `\n[${nowIso()}] ${code === null ? `Process was ended by ${signal}` : `Process exited with code ${code}`}\n`
+      );
+      await clearProcessRecord(serverId, paths);
+    }).catch((error) => {
+      logger.error("Clearing up after a server that exited failed", { error: error.message, serverId, stack: error.stack });
+    });
+  }
+
+  // The launch itself, in the server's turn. Returns false when there was
+  // nothing to launch because the server is running after all.
+  async function launchServer({ actor, command, directCommandPath, paths, server, serverId }) {
+    // Getting ready can take minutes when a runtime has to be repaired first.
+    // In that time someone else may have started this server.
+    const found = await findServerProcess(serverId);
+    if (found.process) {
+      if (describeStatus(serverId, found.process).stopping) {
+        throw stillStopping(server);
+      }
+      return false;
+    }
+    await clearProcessRecord(serverId, paths, { announce: true });
 
     const shellCommand = resolveShellCommand();
     // The server gets a short list of variables, not the dashboard's own
@@ -2440,151 +2792,397 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       // generate. Exporting both means a per-server JDK keeps reaching them.
       childEnv[`${LEGACY_ENV_PREFIX}JAVA_BIN`] = server.javaBin;
       childEnv.JAVA_HOME = path.dirname(path.dirname(server.javaBin));
-      runtimeLog.write(`[${nowIso()}] Using per-server Java: ${server.javaBin}\n`);
+      await appendRuntimeLog(paths, `[${nowIso()}] Using per-server Java: ${server.javaBin}\n`);
     }
-    const child = spawnDirectly
-      ? spawn(directCommandPath, [], {
-          cwd: paths.serverDir,
-          env: childEnv,
-          stdio: ["pipe", "pipe", "pipe"]
-        })
-      : spawn(shellCommand.command, [...shellCommand.args, command], {
-          cwd: paths.serverDir,
-          env: childEnv,
-          stdio: ["pipe", "pipe", "pipe"]
-        });
 
-    let runtimeLogClosed = false;
-    const closeRuntimeLog = (line) => {
-      if (runtimeLogClosed) {
-        return;
-      }
-      runtimeLogClosed = true;
-      if (line) {
-        runtimeLog.write(line);
-      }
-      runtimeLog.end();
+    // The server's output goes straight into its runtime log, not through
+    // this process. It is then still written down after a dashboard restart,
+    // where a pipe would have been closed under the server, and a dashboard
+    // that has stalled can never hold a server up on a pipe that is full.
+    let logHandle;
+    try {
+      logHandle = await openRuntimeLog(paths.runtimeLog);
+    } catch (error) {
+      throw userFacingError(
+        `Unable to start ${server.name}. Its runtime log, ${path.relative(store.rootDir, paths.runtimeLog)}, cannot be written to: ${OPEN_FAILURES[error.code] || error.message}.`
+      );
+    }
+
+    const own = {
+      child: null,
+      console: CONSOLE_STDIN,
+      pid: null,
+      startedAt: nowIso(),
+      startedBy: actor.username
     };
+    let consoleHandle = null;
+    let outcome = null;
+    let launchError = null;
+    try {
+      const consolePipe = await createConsole(paths);
+      consoleHandle = consolePipe.handle;
+      if (consoleHandle) {
+        own.console = CONSOLE_PIPE;
+      } else {
+        // The server is started the way it always was, with a pipe from this
+        // process for its console. That works for as long as this process
+        // lives.
+        logger.warn("A server was started without a console that outlasts the dashboard", {
+          reason: consolePipe.reason,
+          serverId
+        });
+        await appendRuntimeLog(
+          paths,
+          `[${nowIso()}] No console pipe: ${consolePipe.reason}. Started with a pipe from the dashboard instead. After a dashboard restart this server can only be stopped by signal.\n`
+        );
+      }
 
-    child.stdout.on("data", (chunk) => runtimeLog.write(chunk));
-    child.stderr.on("data", (chunk) => runtimeLog.write(chunk));
-
-    const startedAt = nowIso();
-    await new Promise((resolve, reject) => {
-      let settled = false;
-
-      const finishResolve = async () => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        try {
-          runningChildren.set(serverId, child);
-          await writePidInfo(serverId, {
-            pid: child.pid,
-            startedAt,
-            startedBy: actor.username
+      const stdio = [consoleHandle ? consoleHandle.fd : "pipe", logHandle.fd, logHandle.fd];
+      const child = directCommandPath
+        ? spawn(directCommandPath, [], {
+            cwd: paths.serverDir,
+            env: childEnv,
+            stdio
+          })
+        : spawn(shellCommand.command, [...shellCommand.args, command], {
+            cwd: paths.serverDir,
+            env: childEnv,
+            stdio
           });
-          resolve();
-        } catch (error) {
-          runningChildren.delete(serverId);
-          closeRuntimeLog(`[${nowIso()}] Start failed while recording pid info: ${error.message}\n`);
-          reject(error);
-        }
-      };
-
-      const finishReject = async (error) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        runningChildren.delete(serverId);
-        await clearPidInfo(serverId);
-        const message = buildStartFailureMessage(server, command, error, directCommandPath);
-        closeRuntimeLog(`[${nowIso()}] Start failed: ${message}\n`);
-        reject(userFacingError(message));
-      };
-
-      child.once("spawn", () => {
-        finishResolve().catch(reject);
+      own.child = child;
+      own.pid = child.pid;
+      // Listened for before anything is awaited. Whether the process was made
+      // is already known, and the event that says so comes on the next tick.
+      outcome = new Promise((resolve) => {
+        child.once("spawn", () => resolve(null));
+        child.once("error", (error) => resolve(error));
       });
+      child.once("exit", (code, signal) => onChildExit(serverId, own, paths, code, signal));
+    } catch (error) {
+      launchError = error;
+    } finally {
+      // The server has its own copies by now: spawn() returns after the
+      // process has been made. The dashboard keeps neither open, so nothing
+      // of a running server depends on this process staying alive.
+      if (consoleHandle) {
+        await consoleHandle.close().catch(() => {});
+      }
+      await logHandle.close().catch(() => {});
+    }
+    if (outcome) {
+      launchError = await outcome;
+    }
 
-      child.once("error", (error) => {
-        finishReject(error).catch(reject);
-      });
+    if (launchError) {
+      if (consoleHandle) {
+        await removeConsolePipe(paths.consoleFile);
+      }
+      const message = buildStartFailureMessage(server, command, launchError, directCommandPath);
+      await appendRuntimeLog(paths, `[${nowIso()}] Start failed: ${message}\n`);
+      throw userFacingError(message);
+    }
 
-      child.once("close", (code) => {
-        if (!settled && code !== null && code !== 0) {
-          finishReject(new Error(`The server process exited immediately with code ${code}.`)).catch(reject);
-        }
-      });
+    const { child } = own;
+    // An 'error' that nobody listens for ends the process it is raised in.
+    // One can still come later, from a signal that could not be sent.
+    child.on("error", (error) => {
+      logger.warn("A server's process reported an error", { error: error.message, pid: own.pid, serverId });
     });
+    if (child.stdin) {
+      // The same goes for the pipe: "stop" written to a server that has just
+      // exited fails, and must not take the dashboard with it.
+      child.stdin.on("error", () => {});
+    }
+    if (child.exitCode === null && child.signalCode === null) {
+      // Unless it has exited already: its exit was then heard a moment ago,
+      // and will not be heard again to take this record back out.
+      runningChildren.set(serverId, own);
+    }
 
-    child.on("close", async (code) => {
-      closeRuntimeLog(`\n[${nowIso()}] Process exited with code ${code ?? "unknown"}\n`);
-      runningChildren.delete(serverId);
-      await clearPidInfo(serverId);
-    });
+    try {
+      await writePidFile(paths.pidFile, {
+        pid: own.pid,
+        startedAt: own.startedAt,
+        startedBy: own.startedBy,
+        ...(own.console === CONSOLE_PIPE ? { console: CONSOLE_PIPE } : {})
+      });
+    } catch (error) {
+      // A server the next dashboard process cannot find would be shown as
+      // stopped while it runs, and be started a second time on the same
+      // world. This one has only just begun, so it is ended instead.
+      child.kill("SIGKILL");
+      const message = `Unable to start ${server.name}. Its process could not be recorded in ${path.relative(store.rootDir, paths.pidFile)} (${error.message}), so it was ended again.`;
+      await appendRuntimeLog(paths, `[${nowIso()}] Start failed: ${message}\n`);
+      throw userFacingError(message);
+    }
+    return true;
+  }
 
-    await sleep(500);
+  async function startServer(serverId, actor) {
+    const server = await getServer(serverId);
+    if (!server) {
+      throw userFacingError("Server not found.", 404);
+    }
+    if (!server.passphraseHash) {
+      throw userFacingError("This server has no passphrase configured yet.");
+    }
+
+    const status = await getServerStatus(serverId);
+    if (status.stopping) {
+      // The process is still there, saving. A second one on the same world
+      // and the same port is the last thing it needs.
+      throw stillStopping(server);
+    }
+    if (status.running) {
+      return status;
+    }
+
+    if (!(await readEulaStatus(serverId))) {
+      throw userFacingError(
+        `Unable to start ${server.name}. The Minecraft server EULA has not been accepted yet. Open the server overview and accept the EULA first.`
+      );
+    }
+
+    const paths = resolveRecordPaths(server);
+    await ensureDir(paths.runtimeDir);
+    await ensureDir(paths.modsDir);
+    await appendRuntimeLog(paths, `\n[${nowIso()}] Starting ${server.name} as ${actor.username}\n`);
+
+    let launchSpec;
+    try {
+      launchSpec = await resolveLaunchCommand(serverId, server);
+    } catch (error) {
+      // Say in the server's own log why nothing started.
+      await appendRuntimeLog(paths, `[${nowIso()}] Start failed: ${error.message}\n`);
+      throw error;
+    }
+    const command = launchSpec.command;
+    const spawnDirectly = shouldSpawnDirectly(command);
+    const directCommandPath = spawnDirectly ? path.resolve(paths.serverDir, command) : null;
+
+    if (spawnDirectly && !(await exists(directCommandPath))) {
+      const message = buildStartFailureMessage(server, command, { code: "ENOENT" }, directCommandPath);
+      await appendRuntimeLog(paths, `[${nowIso()}] Start failed: ${message}\n`);
+      throw userFacingError(message);
+    }
+
+    const launched = await takeTurn(lifecycleTurns, serverId, () =>
+      launchServer({ actor, command, directCommandPath, paths, server, serverId })
+    );
+    if (launched) {
+      await sleep(500);
+    }
     return await getServerStatus(serverId);
   }
 
-  async function stopServer(serverId) {
+  // Asks a server to stop through its console: the named pipe in its folder,
+  // or, for a server this process had to start without one, the pipe this
+  // process still holds.
+  async function sendStopCommand(serverProcess, paths) {
+    if (serverProcess.console === CONSOLE_PIPE) {
+      return await writeToConsole(paths.consoleFile, STOP_COMMAND);
+    }
+    const stdin = serverProcess.child && serverProcess.child.stdin;
+    if (!stdin || stdin.destroyed || !stdin.writable) {
+      return { reason: "the pipe to it has closed", sent: false };
+    }
+    return await new Promise((resolve) => {
+      stdin.write(STOP_COMMAND, (error) => {
+        resolve(error ? { reason: describeConsoleFailure(error), sent: false } : { reason: null, sent: true });
+      });
+    });
+  }
+
+  function sendSignal(serverProcess, signal) {
+    try {
+      if (serverProcess.child) {
+        serverProcess.child.kill(signal);
+      } else {
+        process.kill(serverProcess.pid, signal);
+      }
+    } catch {
+      // Gone already. The wait that follows sees that.
+    }
+  }
+
+  // Waits for a server's process to be gone, for at most `waitMs`. A server
+  // this process started says so itself, with its exit event. One it did not
+  // start has no event to wait for, so it is looked at again and again.
+  async function waitForExit(serverProcess, waitMs) {
+    const { child, pid } = serverProcess;
+    if (child) {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        return true;
+      }
+      return await new Promise((resolve) => {
+        const onExit = () => {
+          clearTimeout(timer);
+          resolve(true);
+        };
+        const timer = setTimeout(() => {
+          child.off("exit", onExit);
+          resolve(false);
+        }, waitMs);
+        child.once("exit", onExit);
+      });
+    }
+
+    const deadline = performance.now() + waitMs;
+    for (;;) {
+      if (!isProcessAlive(pid)) {
+        return true;
+      }
+      const left = deadline - performance.now();
+      if (left <= 0) {
+        return false;
+      }
+      await sleep(Math.min(stopWaits.poll, left));
+    }
+  }
+
+  // Stops a server, and takes its time over it.
+  //
+  // "stop" on the console is what a Minecraft server expects: it tells the
+  // players, saves the world and exits, in seconds on a quiet machine. A
+  // signal is the second choice. Minecraft saves on SIGTERM as well, but a
+  // server short of memory has been seen to do nothing with one for 20
+  // seconds, which was all it used to get before SIGKILL. SIGKILL saves
+  // nothing: whatever the server had not written is lost. So each step waits
+  // minutes, not seconds, and each step past the first is said out loud, in
+  // the dashboard's log and in the server's own.
+  async function runStop(serverId, server, serverProcess, actor) {
+    const paths = resolveRecordPaths(server);
+    const { pid } = serverProcess;
+    const began = performance.now();
+    const waitedSeconds = () => Math.round((performance.now() - began) / 1000);
+    const note = (text) => appendRuntimeLog(paths, `[${nowIso()}] ${text}\n`);
+    const by = actor && actor.username ? ` by ${actor.username}` : "";
+    const stopped = async () => {
+      // The record of a server this process did not start is cleared here.
+      // One it did start has been cleared by its exit already, a turn ahead.
+      await takeTurn(lifecycleTurns, serverId, () => clearProcessRecord(serverId, paths, { announce: true }));
+      logger.info("Server stopped", { pid, serverId, waitedSeconds: waitedSeconds() });
+    };
+
+    // A server on record without a console was started before the dashboard
+    // kept one for its servers, or by a dashboard process that could not make
+    // one and has since gone. A signal is all that reaches it.
+    let asked = { reason: "it was started without one that outlasts the dashboard", sent: false };
+    if (serverProcess.console) {
+      // Written down before it is sent, so that what the server says in
+      // answer comes after it in the log.
+      await note(`Stop requested${by}: sending "stop" to the console`);
+      asked = await sendStopCommand(serverProcess, paths);
+    } else {
+      await note(`Stop requested${by}`);
+    }
+
+    if (asked.sent) {
+      logger.info('Stopping a server: sent "stop" to its console', { pid, server: server.name, serverId });
+      if (await waitForExit(serverProcess, stopWaits.console)) {
+        return await stopped();
+      }
+
+      const waited = waitedSeconds();
+      sendSignal(serverProcess, "SIGTERM");
+      logger.warn('Server did not exit after "stop" on its console: sent SIGTERM', {
+        pid,
+        server: server.name,
+        serverId,
+        waitedSeconds: waited
+      });
+      await note(`No exit ${waited} s after "stop" on the console: sent SIGTERM`);
+      if (await waitForExit(serverProcess, stopWaits.term)) {
+        return await stopped();
+      }
+    } else {
+      if (await waitForExit(serverProcess, 0)) {
+        // It went while it was being asked.
+        return await stopped();
+      }
+      sendSignal(serverProcess, "SIGTERM");
+      logger.warn('Server has no console the dashboard can reach: sent SIGTERM instead of "stop"', {
+        pid,
+        reason: asked.reason,
+        server: server.name,
+        serverId,
+        waitedSeconds: waitedSeconds()
+      });
+      await note(`No console to send "stop" to (${asked.reason}): sent SIGTERM`);
+      if (await waitForExit(serverProcess, stopWaits.signalOnly)) {
+        return await stopped();
+      }
+    }
+
+    const waited = waitedSeconds();
+    sendSignal(serverProcess, "SIGKILL");
+    logger.warn("Server did not exit after SIGTERM: sent SIGKILL. The world may not have been saved.", {
+      pid,
+      server: server.name,
+      serverId,
+      waitedSeconds: waited
+    });
+    await note(`No exit ${waited} s after the stop began: sent SIGKILL. The world may not have been saved.`);
+    if (await waitForExit(serverProcess, stopWaits.kill)) {
+      return await stopped();
+    }
+    logger.error("Server is still running after SIGKILL", { pid, server: server.name, serverId, waitedSeconds: waitedSeconds() });
+    await note(`Still running ${waitedSeconds()} s after the stop began, after SIGKILL`);
+  }
+
+  // Begins stopping a server, or finds the stop that is already under way.
+  // Returns null when the server is not running.
+  async function beginStop(serverId, actor) {
     const server = await getServer(serverId);
     if (!server) {
       throw new Error("Server not found.");
     }
-
-    const child = runningChildren.get(serverId);
-    if (child && !child.killed) {
-      try {
-        child.stdin.write("stop\n");
-      } catch {
-        // ignore
+    const found = await findServerProcess(serverId);
+    if (!found.process) {
+      if (found.stale) {
+        await clearStaleRecord(serverId);
       }
-
-      for (let attempt = 0; attempt < 20; attempt += 1) {
-        if (child.exitCode !== null || child.killed) {
-          break;
-        }
-        await sleep(1_000);
-      }
-
-      if (child.exitCode === null) {
-        child.kill("SIGTERM");
-        await sleep(3_000);
-      }
-
-      if (child.exitCode === null) {
-        child.kill("SIGKILL");
-      }
-    } else {
-      // The server outlived the dashboard process that started it - a restart
-      // of the web service, now that game servers are no longer torn down with
-      // it. There is no stdin to write "stop" to and no exit event to await, so
-      // this drives the same escalation by pid instead.
-      //
-      // Waiting matters: clearing the pid while Minecraft is still saving would
-      // report the server as stopped, and starting it again from there would
-      // put a second JVM on the same port.
-      const pidInfo = await getPidInfo(serverId);
-      if (pidInfo && isProcessAlive(pidInfo.pid)) {
-        // Minecraft's shutdown hook runs on SIGTERM and saves the world.
-        process.kill(pidInfo.pid, "SIGTERM");
-
-        for (let attempt = 0; attempt < 20 && isProcessAlive(pidInfo.pid); attempt += 1) {
-          await sleep(1_000);
-        }
-
-        if (isProcessAlive(pidInfo.pid)) {
-          process.kill(pidInfo.pid, "SIGKILL");
-          await sleep(1_000);
-        }
-      }
+      return null;
     }
 
-    await clearPidInfo(serverId);
+    // Nothing is awaited between this look and the set below, so two requests
+    // that arrive together find one stop between them. Pressing Stop three
+    // times used to start three, each with a SIGKILL of its own at the end.
+    const underWay = stopsInProgress.get(serverId);
+    if (underWay && underWay.pid === found.process.pid) {
+      return underWay;
+    }
+    const stop = { finished: null, pid: found.process.pid, since: nowIso() };
+    stopsInProgress.set(serverId, stop);
+    stop.finished = runStop(serverId, server, found.process, actor)
+      .catch((error) => {
+        // Nobody may be waiting for this: it runs on after the request that
+        // began it has been answered. A failure is logged, and ends here.
+        logger.error("Stopping a server failed", { error: error.message, pid: stop.pid, serverId, stack: error.stack });
+      })
+      .finally(() => {
+        if (stopsInProgress.get(serverId) === stop) {
+          stopsInProgress.delete(serverId);
+        }
+      });
+    return stop;
+  }
+
+  // Begins stopping a server and answers at once, with its status as it is
+  // now: still running, and stopping. The stop carries on by itself. This is
+  // what a request calls: a stop can take minutes, and a request that was
+  // held open for all of them left the page with nothing to show.
+  async function requestStop(serverId, actor) {
+    await beginStop(serverId, actor);
+    return await getServerStatus(serverId);
+  }
+
+  // The same, and waits until the stop has run its course.
+  async function stopServer(serverId, actor) {
+    const stop = await beginStop(serverId, actor);
+    if (stop) {
+      await stop.finished;
+    }
     return await getServerStatus(serverId);
   }
 
@@ -3422,6 +4020,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     setActiveWorldName,
     setAddonEnabled,
     setServerMetadata,
+    requestStop,
     startServer,
     stopServer,
     syncDiscoveredServers,
