@@ -77,9 +77,65 @@ async function ensureDir(targetPath) {
   await fs.mkdir(targetPath, { recursive: true });
 }
 
+// The most that is read of a file that is read whole. The files read this way
+// are settings and records of a few kilobytes; something far larger in the
+// place of one is not that file, and is not taken into memory to find out.
+const WHOLE_FILE_LIMIT_BYTES = 16 * 1024 * 1024;
+
+// Reads a whole file, the way everything is read that a game server can write
+// to: its own folder, and data/.
+//
+// A mod can leave anything at a name the dashboard reads. A named pipe,
+// opened the ordinary way, holds the open until something writes to it, and
+// with it one of the four threads that every file operation in the dashboard
+// shares: a pipe where eula.txt belongs and four loads of the server's page
+// left none, and a stop request waited with everything else. So the file is
+// opened without waiting, and looked at before it is read.
+//
+// A link is followed, as readFile follows one: it is what the link leads to
+// that has to be a file. A file that is not there fails as it does for
+// readFile, with ENOENT. What is there and is not a regular file - a pipe, a
+// folder, a device, a socket - fails at once with ERR_NOT_A_FILE, and a file
+// larger than `maxBytes` with ERR_FILE_TOO_LARGE. No more is read than the
+// file held when it was opened.
+async function readRegularFile(filePath, { encoding = "utf8", maxBytes = WHOLE_FILE_LIMIT_BYTES } = {}) {
+  const notAFile = () => Object.assign(new Error(`${filePath} is not a regular file, and was not read.`), { code: "ERR_NOT_A_FILE" });
+  let handle;
+  try {
+    handle = await fs.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+  } catch (error) {
+    // A socket cannot be opened at all, and says so with ENXIO.
+    throw error.code === "ENXIO" ? notAFile() : error;
+  }
+  try {
+    const stats = await handle.stat();
+    if (!stats.isFile()) {
+      throw notAFile();
+    }
+    if (stats.size > maxBytes) {
+      throw Object.assign(new Error(`${filePath} is ${stats.size} bytes, which is more than is read of a file like it.`), {
+        code: "ERR_FILE_TOO_LARGE"
+      });
+    }
+    const buffer = Buffer.alloc(stats.size);
+    let length = 0;
+    while (length < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+      if (bytesRead === 0) {
+        break;
+      }
+      length += bytesRead;
+    }
+    const contents = buffer.subarray(0, length);
+    return encoding ? contents.toString(encoding) : contents;
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
 async function readJson(filePath, fallbackValue) {
   try {
-    const raw = await fs.readFile(filePath, "utf8");
+    const raw = await readRegularFile(filePath);
     return JSON.parse(raw);
   } catch (error) {
     if (error.code === "ENOENT") {
@@ -209,23 +265,33 @@ function displayNameFromSlug(value) {
     .replace(/\b\w/g, (match) => match.toUpperCase());
 }
 
+// The end of a text file: its last `maxBytes`, or "" when there is no file.
+//
+// What is read this way is a log in a server's folder, opened without
+// waiting and looked at before it is read, for the reasons readRegularFile()
+// gives. A log is only shown, so here anything but a regular file reads as
+// empty.
 async function tailTextFile(filePath, maxBytes = 160_000) {
+  let handle;
   try {
-    const stats = await fs.stat(filePath);
-    const start = Math.max(0, stats.size - maxBytes);
-    const handle = await fs.open(filePath, "r");
-    try {
-      const buffer = Buffer.alloc(stats.size - start);
-      await handle.read(buffer, 0, buffer.length, start);
-      return buffer.toString("utf8");
-    } finally {
-      await handle.close();
-    }
+    handle = await fs.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
   } catch (error) {
     if (error.code === "ENOENT") {
       return "";
     }
     throw error;
+  }
+  try {
+    const stats = await handle.stat();
+    if (!stats.isFile()) {
+      return "";
+    }
+    const start = Math.max(0, stats.size - maxBytes);
+    const buffer = Buffer.alloc(stats.size - start);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
+    return buffer.toString("utf8", 0, bytesRead);
+  } finally {
+    await handle.close();
   }
 }
 
@@ -318,6 +384,7 @@ module.exports = {
   readEnv,
   randomId,
   readJson,
+  readRegularFile,
   runCommand,
   safeFilename,
   sleep,

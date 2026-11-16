@@ -13,7 +13,7 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
-const { spawn, spawnSync } = require("node:child_process");
+const { execFileSync, spawn, spawnSync } = require("node:child_process");
 
 const REPO_ROOT = path.join(__dirname, "..");
 const SCRIPT = path.join(REPO_ROOT, "infra", "systemd", "migrate-to-rippercraft.sh");
@@ -391,6 +391,11 @@ exec '${real("id")}' "$@"
       await writeFile(path.join(checkout, "data", name), contents, 0o600);
     }
     await fsp.mkdir(path.join(checkout, "servers"), { recursive: true });
+    // What a dashboard with a running server leaves in data/ besides its
+    // files: the server's console, a named pipe. The script looks through
+    // data/ and backs up part of it, and must not stop at a pipe.
+    await fsp.mkdir(path.join(checkout, "data", "consoles"), { mode: 0o700, recursive: true });
+    execFileSync("mkfifo", ["-m", "600", path.join(checkout, "data", "consoles", "Demo")]);
   }
 
   let gameServerPid = 0;
@@ -415,9 +420,24 @@ exec '${real("id")}' "$@"
     const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
     children.push(child);
     gameServerPid = child.pid;
+    // The record as the dashboard writes it now. All the script takes from
+    // it is the pid, and the numbers after it must not be taken for one.
     await writeFile(
       path.join(checkout, "servers", "Demo", ".rippermoon", "pid.json"),
-      `${JSON.stringify({ pid: gameServerPid, startedBy: "owner" }, null, 2)}\n`
+      `${JSON.stringify(
+        {
+          pid: gameServerPid,
+          startedAt: "2026-11-16T09:00:00.000Z",
+          startedBy: "owner",
+          console: "fifo",
+          group: true,
+          server: "Demo",
+          boot: "0a1b2c3d-0000-4000-8000-000000000000",
+          started: 4194303
+        },
+        null,
+        2
+      )}\n`
     );
     await writeFile(path.join(root, "proc", String(gameServerPid), "cgroup"), `0::/system.slice/${OLD_UNIT}\n`);
     await writeFile(path.join(state, OLD_UNIT, "children"), `${gameServerPid}\n`);

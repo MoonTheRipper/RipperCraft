@@ -34,6 +34,7 @@
 
   /* derived tints - always color-mix, never a re-typed RGB triplet */
   --c-ok-weak: color-mix(in srgb, var(--c-ok) 12%, transparent);
+  --c-warn-weak: color-mix(in srgb, var(--c-warn) 12%, transparent);
   --c-danger-weak: color-mix(in srgb, var(--c-danger) 12%, transparent);
   --c-danger-weak-hover: color-mix(in srgb, var(--c-danger) 18%, transparent);
   --c-idle-weak: color-mix(in srgb, var(--c-text) 6%, transparent);
@@ -835,6 +836,12 @@ h2 {
 .status-inline--idle {
   background: var(--c-idle-weak);
   color: var(--c-text-muted);
+}
+
+/* In between: a server that has been told to stop and has not gone yet. */
+.status-inline--warn {
+  background: var(--c-warn-weak);
+  color: var(--c-warn);
 }
 
 .status-inline--danger {

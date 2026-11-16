@@ -1,0 +1,1285 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawn } = require("node:child_process");
+const {
+  OWNER,
+  QUICK_WAITS,
+  SERVER_ID,
+  STOPPED,
+  addServer,
+  bootIdNow,
+  createManager,
+  createServerRoot,
+  isAlive,
+  isThere,
+  notKnown,
+  plantPipe,
+  procStarted,
+  recordFor,
+  settled,
+  sleep,
+  startLegacyServer,
+  stoppedBy,
+  unlessItHangs,
+  waitFor,
+  whatArrived
+} = require("../test-support/game-server");
+
+// --- what is believed of a pid file, and of a runtime log ------------------------------------------
+
+test("a pid file that does not hold a game server's pid is never signalled", async (t) => {
+  const server = await createServerRoot(t);
+  const { logs, problems, serverManager } = await createManager(server.root);
+  fs.mkdirSync(server.runtimeDir, { recursive: true });
+
+  // A process of this account that has nothing to do with the dashboard, in a
+  // group of its own: a signal to "minus its pid" would reach it too. It runs
+  // in the server's folder, so that a record of it is believed when the file
+  // itself is in order: every refusal below is of what the file holds.
+  const bystander = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { cwd: server.serverDir, detached: true, stdio: "ignore" });
+  t.after(() => bystander.kill("SIGKILL"));
+  const stillThere = () => bystander.exitCode === null && bystander.signalCode === null;
+
+  // Every signal this process sends from here on, and every look at whether a
+  // process is there. Only the bystander is really reached.
+  const realKill = process.kill;
+  const sent = [];
+  process.kill = (pid, signal) => {
+    sent.push([pid, signal]);
+    if (pid === bystander.pid) {
+      return realKill.call(process, pid, signal);
+    }
+    throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+  };
+  t.after(() => {
+    process.kill = realKill;
+  });
+
+  const elsewhere = path.join(server.root, "a-real-record.json");
+  const believable = `${JSON.stringify({ pid: bystander.pid, startedAt: "2026-11-16T09:00:00.000Z", startedBy: "owner" }, null, 2)}\n`;
+  fs.writeFileSync(elsewhere, believable);
+  const write = (contents) => () => fs.writeFileSync(server.pidFile, contents);
+  const NO_PID = "it does not hold a game server's pid";
+  const NOT_A_FILE = "it is not a regular file";
+  const records = [
+    ["a pid written as text", NO_PID, write(JSON.stringify({ pid: String(bystander.pid) }))],
+    ["a pid with a fraction", NO_PID, write(`{"pid": ${bystander.pid}.5}`)],
+    ["a negative pid, which is a whole process group", NO_PID, write(JSON.stringify({ pid: -bystander.pid }))],
+    ["pid 1, which is init", NO_PID, write(JSON.stringify({ pid: 1 }))],
+    ["pid 0, which is the dashboard's own process group", NO_PID, write(JSON.stringify({ pid: 0 }))],
+    ["pid -1, which is every process of the account", NO_PID, write(JSON.stringify({ pid: -1 }))],
+    ["the dashboard's own pid", NO_PID, write(JSON.stringify({ pid: process.pid }))],
+    ["a pid past the largest there is", NO_PID, write(JSON.stringify({ pid: bystander.pid + 2 ** 32 }))],
+    ["a pid that is true", NO_PID, write(JSON.stringify({ pid: true }))],
+    ["no pid", NO_PID, write(JSON.stringify({ startedBy: "owner" }))],
+    ["a list", NO_PID, write(JSON.stringify([bystander.pid]))],
+    ["a bare number", NO_PID, write(String(bystander.pid))],
+    ["not JSON", NO_PID, write(`pid=${bystander.pid}`)],
+    ["nothing", NO_PID, write("")],
+    ["a real record with a megabyte after it", "it is far too large to be a pid file", write(`${believable}${" ".repeat(1024 * 1024)}`)],
+    ["a link to a real record somewhere else", "a link is in its place", () => fs.symlinkSync(elsewhere, server.pidFile)],
+    ["a named pipe", NOT_A_FILE, () => plantPipe(server.pidFile)],
+    [
+      "a named pipe with a real record waiting in it",
+      NOT_A_FILE,
+      () => {
+        plantPipe(server.pidFile);
+        const writer = fs.openSync(server.pidFile, fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
+        t.after(() => fs.closeSync(writer));
+        fs.writeSync(writer, believable);
+      }
+    ]
+  ];
+
+  for (const [label, reason, plant] of records) {
+    plant();
+    const answers = await unlessItHangs(
+      (async () => [await serverManager.getServerStatus(SERVER_ID), await serverManager.stopServer(SERVER_ID, OWNER)])()
+    );
+    assert.deepEqual(answers, [STOPPED, STOPPED], label);
+    // Not signalled, and not so much as looked for.
+    assert.deepEqual(sent, [], label);
+    assert.equal(stillThere(), true, label);
+    // What cannot be a record is cleared away, without following it, and
+    // the dashboard's log says that it was and why.
+    assert.equal(isThere(server.pidFile), false, label);
+    assert.equal(fs.readFileSync(elsewhere, "utf8"), believable, label);
+    assert.deepEqual(
+      problems().splice(0).map((entry) => [entry.level, entry.message, entry.meta]),
+      [["warn", "Removed a server's pid file that could not be a record", { file: "servers/DemoServer/.rippermoon/pid.json", reason, serverId: SERVER_ID }]],
+      label
+    );
+    logs.length = 0;
+  }
+
+  // A folder cannot be cleared away. It is still no server.
+  fs.mkdirSync(server.pidFile);
+  assert.deepEqual(await serverManager.getServerStatus(SERVER_ID), STOPPED);
+  assert.deepEqual(sent, []);
+  fs.rmdirSync(server.pidFile);
+  assert.deepEqual(problems(), []);
+
+  // The same record as a file of its own is believed - so every refusal
+  // above was of what the file held, not of the process it named.
+  fs.writeFileSync(server.pidFile, believable);
+  const found = await serverManager.getServerStatus(SERVER_ID);
+  assert.deepEqual(found, {
+    ...STOPPED,
+    pid: bystander.pid,
+    running: true,
+    startedAt: "2026-11-16T09:00:00.000Z",
+    startedBy: "owner"
+  });
+  assert.deepEqual(sent, [[bystander.pid, 0]]);
+  assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("SIGTERM"));
+  assert.equal(bystander.signalCode, "SIGTERM");
+  assert.equal(sent.some(([pid, signal]) => pid === bystander.pid && signal === "SIGTERM"), true);
+  assert.equal(sent.every(([pid]) => pid === bystander.pid), true);
+});
+
+test("a pid file that cannot be read is left as it is, with the server and its console", async (t) => {
+  const fsp = require("node:fs/promises");
+  const server = await createServerRoot(t);
+  const first = await createManager(server.root);
+  await first.serverManager.startServer(SERVER_ID, OWNER);
+  const pid = await server.whenReady();
+  // The dashboard after a restart: all it has is what is on disk.
+  const later = await createManager(server.root);
+  const manager = later.serverManager;
+  const owner = { id: "usr_owner", role: "owner", servers: [], username: "owner" };
+  assert.equal((await manager.getServerStatus(SERVER_ID)).pid, pid);
+  const record = fs.readFileSync(server.pidFile, "utf8");
+
+  // Whatever would act on the server is refused with the failure, in words
+  // and as a refusal, and nothing is done on a guess: not stopped, not
+  // started, not cleared away.
+  const everyAnswer = async (code) => {
+    const reason = `servers/DemoServer/.rippermoon/pid.json could not be read (${code}). Whether this server is running is not known, and nothing has been removed.`;
+    const asked = {
+      delete: () => manager.deleteServer(SERVER_ID),
+      needsStopped: () => manager.ensureServerStopped(SERVER_ID),
+      requestStop: () => manager.requestStop(SERVER_ID, OWNER),
+      start: () => manager.startServer(SERVER_ID, OWNER),
+      status: () => manager.getServerStatus(SERVER_ID),
+      stop: () => manager.stopServer(SERVER_ID, OWNER)
+    };
+    for (const [what, ask] of Object.entries(asked)) {
+      await assert.rejects(ask(), { code, message: reason, statusCode: 409 }, `${what}, ${code}`);
+    }
+    // Where servers are only shown, it is shown as what it is: not known,
+    // with the reason, and with nothing else read for it.
+    const [listed] = await manager.listServersForUser(owner);
+    assert.deepEqual([listed.id, listed.status, listed.worldCount, listed.modCount], [SERVER_ID, notKnown(reason), 0, 0], code);
+    const page = await manager.getServerSnapshot(SERVER_ID, owner, true);
+    assert.deepEqual(page.server.status, notKnown(reason), code);
+    assert.deepEqual([page.worlds, page.mods, page.logs, page.propertiesText, page.safeProperties], [[], [], null, null, null], code);
+    assert.equal(isAlive(pid), true, code);
+    assert.equal(fs.lstatSync(server.consoleFile).isFIFO(), true, code);
+    assert.equal(fs.existsSync(server.serverDir), true, code);
+    assert.deepEqual(server.received(), [], code);
+    assert.equal(server.fakePid(), pid, code);
+  };
+
+  // No permission. (Not something root can be refused.)
+  if (process.getuid() !== 0) {
+    fs.chmodSync(server.pidFile, 0o000);
+    await everyAnswer("EACCES");
+    fs.chmodSync(server.pidFile, 0o644);
+    assert.equal(fs.readFileSync(server.pidFile, "utf8"), record);
+  }
+
+  // A disk that fails in the middle of the read, and a dashboard that has
+  // run out of file handles: made to happen for this one file.
+  const realOpen = fsp.open;
+  t.after(() => {
+    fsp.open = realOpen;
+  });
+  fsp.open = async (file, ...rest) => {
+    const handle = await realOpen.call(fsp, file, ...rest);
+    if (file === server.pidFile) {
+      handle.read = async () => {
+        throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
+      };
+    }
+    return handle;
+  };
+  await everyAnswer("EIO");
+  for (const code of ["EMFILE", "ESTALE"]) {
+    fsp.open = async (file, ...rest) => {
+      if (file === server.pidFile) {
+        throw Object.assign(new Error(`${code}: open`), { code });
+      }
+      return await realOpen.call(fsp, file, ...rest);
+    };
+    await everyAnswer(code);
+  }
+  fsp.open = realOpen;
+  assert.equal(fs.readFileSync(server.pidFile, "utf8"), record);
+  // The dashboard's log has each reason once, however often the list and the
+  // page were asked for.
+  assert.deepEqual(
+    later.problems().map((entry) => [entry.level, entry.message, entry.meta.serverId, /\((\w+)\)/.exec(entry.meta.reason)[1]]),
+    [...(process.getuid() !== 0 ? ["EACCES"] : []), "EIO", "EMFILE", "ESTALE"].map((code) => ["warn", "Whether a server is running is not known", SERVER_ID, code])
+  );
+
+  // Readable again, it is the same server as before, and stops as one.
+  assert.equal((await manager.getServerStatus(SERVER_ID)).pid, pid);
+  assert.deepEqual(settled(await manager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
+  assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
+});
+
+for (const who of ["the dashboard that started it", "a dashboard started later"]) {
+  test(`with the dashboard's folder for a server swapped for a link to another server's, ${who} reads, writes and removes nothing through it`, async (t) => {
+    const server = await createServerRoot(t);
+    const owner = { id: "usr_owner", role: "owner", servers: [], username: "owner" };
+    // Another server's folder, with a record and a log of its own.
+    const other = path.join(server.root, "servers", "Other", ".rippermoon");
+    fs.mkdirSync(other, { recursive: true });
+    // It is running, too: a process in that folder, which its record names.
+    const otherServer = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { cwd: path.dirname(other), stdio: "ignore" });
+    t.after(() => otherServer.kill("SIGKILL"));
+    const otherRecord = `${JSON.stringify({ pid: otherServer.pid, startedAt: "2026-11-16T09:00:00.000Z", startedBy: "someone" }, null, 2)}\n`;
+    fs.writeFileSync(path.join(other, "pid.json"), otherRecord);
+    fs.writeFileSync(path.join(other, "runtime.log"), "the other server's log\n");
+    const otherIsUntouched = () => {
+      assert.deepEqual(fs.readdirSync(other).sort(), ["pid.json", "runtime.log"]);
+      assert.equal(fs.readFileSync(path.join(other, "pid.json"), "utf8"), otherRecord);
+      assert.equal(fs.readFileSync(path.join(other, "runtime.log"), "utf8"), "the other server's log\n");
+    };
+
+    let dashboard = await createManager(server.root);
+    const started = await dashboard.serverManager.startServer(SERVER_ID, OWNER);
+    const pid = await server.whenReady();
+    const own = who === "the dashboard that started it";
+    if (!own) {
+      dashboard = await createManager(server.root);
+    }
+    const manager = dashboard.serverManager;
+
+    // What a mod has to do: one rename and one link. No file in the folder is a link.
+    fs.renameSync(server.runtimeDir, `${server.runtimeDir}.real`);
+    fs.symlinkSync(other, server.runtimeDir);
+    const refused = {
+      message:
+        "servers/DemoServer/.rippermoon is a link. The dashboard keeps this server's record and log there, and reads, writes and removes nothing through it as it is. Put a folder there, or remove what is there.",
+      statusCode: 409
+    };
+
+    if (own) {
+      // It started the server, and knows it by its process, not by the folder.
+      assert.deepEqual(await manager.getServerStatus(SERVER_ID), started);
+      // The log it shows is not the other server's.
+      assert.equal((await manager.getServerLog(SERVER_ID)).runtimeLog, "");
+      // "stop" goes to this server's own console, which is not in the folder.
+      // Once the server has gone, all that is left to go on is the folder,
+      // and that is refused.
+      await assert.rejects(manager.stopServer(SERVER_ID, OWNER), refused);
+      assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
+      assert.equal(isAlive(pid), false);
+      assert.equal(isThere(server.consoleFile), false);
+      assert.equal(
+        dashboard.problems().every((entry) => ["Could not write to a server's runtime log", "A server has gone, and its record could not be cleared"].includes(entry.message)),
+        true,
+        JSON.stringify(dashboard.problems())
+      );
+      assert.equal(dashboard.problems().some((entry) => entry.message === "A server has gone, and its record could not be cleared"), true);
+    } else {
+      // All it has is the folder, and it will not go through the link: not
+      // to say whether the server runs, not to stop it, not to start another.
+      for (const ask of [
+        () => manager.getServerStatus(SERVER_ID),
+        () => manager.stopServer(SERVER_ID, OWNER),
+        () => manager.requestStop(SERVER_ID, OWNER),
+        () => manager.startServer(SERVER_ID, OWNER),
+        () => manager.deleteServer(SERVER_ID)
+      ]) {
+        await assert.rejects(ask(), refused);
+      }
+      // The list of servers and the server's own page say that it is not
+      // known, and why, and read nothing else for it: the other server's
+      // folder would have had two folders made in it by the page alone.
+      const listed = await manager.listServersForUser(owner);
+      assert.deepEqual(listed.map((entry) => entry.id).sort(), [SERVER_ID, "Other"]);
+      assert.deepEqual(listed.find((entry) => entry.id === SERVER_ID).status, notKnown(refused.message));
+      // The other server, found by its folder, is listed as what it is.
+      assert.equal(listed.find((entry) => entry.id === "Other").status.pid, otherServer.pid);
+      const page = await manager.getServerSnapshot(SERVER_ID, owner, true);
+      assert.deepEqual(page.server.status, notKnown(refused.message));
+      assert.deepEqual([page.worlds, page.mods, page.logs], [[], [], null]);
+      assert.equal((await manager.getServerLog(SERVER_ID)).runtimeLog, "");
+      assert.equal(isAlive(pid), true);
+      assert.deepEqual(server.received(), []);
+      assert.equal(server.fakePid(), pid);
+      assert.equal(fs.lstatSync(server.consoleFile).isFIFO(), true);
+    }
+    otherIsUntouched();
+    assert.equal(otherServer.exitCode, null);
+    assert.equal(otherServer.signalCode, null);
+    assert.equal(fs.lstatSync(server.runtimeDir).isSymbolicLink(), true);
+
+    // With the folder back where it belongs, everything is as it was.
+    fs.unlinkSync(server.runtimeDir);
+    fs.renameSync(`${server.runtimeDir}.real`, server.runtimeDir);
+    if (own) {
+      // The stop it could not report on had gone through, by the console.
+      assert.deepEqual(settled(await manager.getServerStatus(SERVER_ID)), stoppedBy("console"));
+    } else {
+      assert.equal((await manager.getServerStatus(SERVER_ID)).pid, pid);
+      assert.deepEqual(settled(await manager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
+      assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
+    }
+    otherIsUntouched();
+  });
+}
+
+test("something that is not a folder where the dashboard's folder for a server belongs is refused as well", async (t) => {
+  const server = await createServerRoot(t);
+  const { serverManager } = await createManager(server.root);
+  fs.writeFileSync(server.runtimeDir, "not a folder\n");
+
+  const refused = { message: /^servers\/DemoServer\/\.rippermoon is not a folder of the server's own\. /, statusCode: 409 };
+  await assert.rejects(serverManager.getServerStatus(SERVER_ID), refused);
+  await assert.rejects(serverManager.startServer(SERVER_ID, OWNER), refused);
+  await assert.rejects(serverManager.stopServer(SERVER_ID, OWNER), refused);
+  // The list still loads, and says of this server that it is not known.
+  const [listed] = await serverManager.listServersForUser({ id: "usr_owner", role: "owner", servers: [], username: "owner" });
+  assert.equal(listed.status.running, null);
+  assert.match(listed.status.unknown, refused.message);
+  assert.equal(fs.readFileSync(server.runtimeDir, "utf8"), "not a folder\n");
+  assert.equal(server.fakePid(), null);
+
+  fs.rmSync(server.runtimeDir);
+  assert.deepEqual(await serverManager.getServerStatus(SERVER_ID), STOPPED);
+});
+
+test("a server the dashboard started is known by its process, whatever becomes of its pid file", async (t) => {
+  const server = await createServerRoot(t);
+  const { problems, serverManager } = await createManager(server.root);
+  const bystander = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  t.after(() => bystander.kill("SIGKILL"));
+  const started = await serverManager.startServer(SERVER_ID, OWNER);
+  const pid = await server.whenReady();
+
+  const damage = [
+    ["removed", () => fs.unlinkSync(server.pidFile)],
+    ["emptied", () => fs.writeFileSync(server.pidFile, "")],
+    ["pointed at init", () => fs.writeFileSync(server.pidFile, JSON.stringify({ pid: 1 }))],
+    ["pointed at another process", () => fs.writeFileSync(server.pidFile, JSON.stringify({ pid: bystander.pid, startedBy: "someone else" }))]
+  ];
+  for (const [label, apply] of damage) {
+    apply();
+    assert.deepEqual(await serverManager.getServerStatus(SERVER_ID), started, label);
+    // Start finds it running, and does not put a second one beside it.
+    assert.deepEqual(await serverManager.startServer(SERVER_ID, OWNER), started, label);
+    assert.equal(server.fakePid(), pid, label);
+  }
+
+  // Stop goes to the server, by its own console, and to nothing else - with
+  // the record still pointing at the other process.
+  const answer = await serverManager.stopServer(SERVER_ID, OWNER).then(
+    (status) => status,
+    (error) => error
+  );
+  assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
+  assert.equal(isAlive(pid), false);
+  assert.equal(bystander.exitCode, null);
+  assert.equal(bystander.signalCode, null);
+
+  if (procStarted(bystander.pid) === null) {
+    // With no /proc to ask, a record of a process that is running is all
+    // there is to go on, and it is believed until it has gone.
+    assert.equal(answer.pid, bystander.pid);
+    return;
+  }
+  // What is left is a record, of the kind that does not say whose it is, of
+  // a process that is running somewhere else. That may be another server's
+  // process or some other program's, so nothing is done on it: the stop
+  // answers that it is not known, and the record stays where it is.
+  assert.equal(answer.statusCode, 409);
+  assert.match(answer.message, /^servers\/DemoServer\/\.rippermoon\/pid\.json names pid \d+, which is running in .+ and not in this server's folder\. /);
+  assert.equal(JSON.parse(fs.readFileSync(server.pidFile, "utf8")).pid, bystander.pid);
+  assert.equal(isThere(server.consoleFile), false);
+  assert.deepEqual(
+    problems().map((entry) => [entry.level, entry.message]),
+    [["warn", "A server has gone, and its record could not be cleared"]]
+  );
+  await assert.rejects(serverManager.startServer(SERVER_ID, OWNER), { message: answer.message, statusCode: 409 });
+  assert.equal(bystander.exitCode === null && bystander.signalCode === null, true);
+  // With that file out of the way, the server is as the stop left it.
+  fs.unlinkSync(server.pidFile);
+  assert.deepEqual(settled(await serverManager.getServerStatus(SERVER_ID)), stoppedBy("console"));
+});
+
+test("two starts at once start one server", async (t) => {
+  const server = await createServerRoot(t);
+  const { problems, serverManager } = await createManager(server.root);
+
+  const [first, second, third] = await Promise.all([
+    serverManager.startServer(SERVER_ID, OWNER),
+    serverManager.startServer(SERVER_ID, OWNER),
+    serverManager.startServer(SERVER_ID, OWNER)
+  ]);
+  await server.whenReady();
+  await sleep(300);
+  // One process, known to all three callers by the same pid.
+  assert.equal(first.running, true);
+  assert.deepEqual(second, first);
+  assert.deepEqual(third, first);
+  assert.equal((server.runtimeLog().match(/^fake server ready$/gm) || []).length, 1);
+  assert.equal(server.pidInfo().pid, first.pid);
+
+  assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
+  assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
+  assert.deepEqual(problems(), []);
+});
+
+test("a start that cannot record the server's pid ends the server again", async (t) => {
+  const server = await createServerRoot(t);
+  const { logs, serverManager } = await createManager(server.root);
+  // A folder with something in it, where the pid file belongs: it cannot be replaced.
+  fs.mkdirSync(server.pidFile, { recursive: true });
+  fs.writeFileSync(path.join(server.pidFile, "in-the-way"), "");
+
+  await assert.rejects(serverManager.startServer(SERVER_ID, OWNER), {
+    message: /^Unable to start DemoServer\. Its process could not be recorded in servers\/DemoServer\/\.rippermoon\/pid\.json \(.+\), so it was ended again\.$/,
+    statusCode: 409
+  });
+  // The process that had been made is gone: not left running where no later
+  // dashboard would find it.
+  const exited = await waitFor(() => logs.find((entry) => entry.message === "Server process exited"), "the server to have been ended");
+  assert.equal(exited.meta.signal, "SIGKILL");
+  assert.equal(isAlive(exited.meta.pid), false);
+  assert.deepEqual(await serverManager.getServerStatus(SERVER_ID), STOPPED);
+  await waitFor(() => !isThere(server.consoleFile), "its console to be removed");
+  assert.deepEqual(fs.readdirSync(server.runtimeDir).sort(), ["pid.json", "runtime.log"]);
+  assert.match(server.runtimeLog(), /^\[[^\]]+\] Start failed: Unable to start DemoServer\. Its process could not be recorded/m);
+});
+
+test("clearing up after a server that has gone leaves a newer record alone", async (t) => {
+  const server = await createServerRoot(t);
+  const { serverManager } = await createManager(server.root);
+  await serverManager.startServer(SERVER_ID, OWNER);
+  const pid = await server.whenReady();
+
+  // As if a dashboard started later had started the server afresh while this
+  // one was still clearing up after the old process: a record of another
+  // process that is running, with the console that goes with it.
+  const newer = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { cwd: server.serverDir, stdio: "ignore" });
+  t.after(() => newer.kill("SIGKILL"));
+  const record = `${JSON.stringify({ console: "fifo", pid: newer.pid, startedAt: "2026-11-16T09:00:00.000Z", startedBy: "owner" }, null, 2)}\n`;
+  fs.writeFileSync(server.pidFile, record);
+
+  process.kill(pid, "SIGKILL");
+  await waitFor(() => /^\[[^\]]+\] Process was ended by SIGKILL$/m.test(server.runtimeLog()), "the old process to be cleared up after");
+  await sleep(150);
+  assert.equal(fs.readFileSync(server.pidFile, "utf8"), record);
+  assert.equal(fs.lstatSync(server.consoleFile).isFIFO(), true);
+  assert.equal((await serverManager.getServerStatus(SERVER_ID)).pid, newer.pid);
+});
+
+// --- one server that cannot be told about, beside the others -----------------------------------------
+
+for (const [what, breakIt, mend, said] of [
+  [
+    "a link where its folder for the dashboard belongs",
+    (other) => {
+      fs.renameSync(other.runtimeDir, `${other.runtimeDir}.real`);
+      fs.symlinkSync(`${other.runtimeDir}.real`, other.runtimeDir);
+    },
+    (other) => {
+      fs.unlinkSync(other.runtimeDir);
+      fs.renameSync(`${other.runtimeDir}.real`, other.runtimeDir);
+    },
+    /^servers\/Other\/\.rippermoon is a link\. The dashboard keeps this server's record and log there, and reads, writes and removes nothing through it as it is\. /
+  ],
+  [
+    "a pid file that cannot be read",
+    (other) => fs.chmodSync(other.pidFile, 0o000),
+    (other) => fs.chmodSync(other.pidFile, 0o644),
+    /^servers\/Other\/\.rippermoon\/pid\.json could not be read \(EACCES\)\. Whether this server is running is not known, and nothing has been removed\.$/
+  ]
+]) {
+  // No permission is not something root can be refused.
+  const skip = what.includes("cannot be read") && process.getuid() === 0 ? "root can read anything" : false;
+  test(`one server with ${what} does not take the list of servers with it, and the others are stopped as ever`, { skip }, async (t) => {
+    const server = await createServerRoot(t);
+    const other = await addServer(server.root, "Other");
+    const owner = { id: "usr_owner", role: "owner", servers: [], username: "owner" };
+    const first = await createManager(server.root);
+    const started = await first.serverManager.startServer(SERVER_ID, OWNER);
+    await server.whenReady();
+    await first.serverManager.startServer("Other", OWNER);
+    const otherPid = await other.whenReady();
+    t.after(() => {
+      try {
+        process.kill(otherPid, "SIGKILL");
+      } catch {
+        // Gone already.
+      }
+    });
+
+    // The dashboard after a restart: all it has of either is what is on disk.
+    const { problems, serverManager } = await createManager(server.root);
+    assert.deepEqual((await serverManager.listServersForUser(owner)).map((entry) => [entry.id, entry.status.pid]).sort(), [
+      [SERVER_ID, started.pid],
+      ["Other", otherPid]
+    ]);
+    breakIt(other);
+    let mended = false;
+    t.after(() => {
+      if (!mended) {
+        mend(other);
+      }
+    });
+
+    // The list still loads. The one server is in it as not known, with the
+    // reason; the other is in it as it is.
+    for (let asked = 0; asked < 3; asked += 1) {
+      const listed = await serverManager.listServersForUser(owner);
+      assert.deepEqual(listed.map((entry) => entry.id).sort(), [SERVER_ID, "Other"]);
+      assert.deepEqual(listed.find((entry) => entry.id === SERVER_ID).status, started);
+      const broken = listed.find((entry) => entry.id === "Other");
+      assert.deepEqual({ ...broken.status, unknown: null }, { ...STOPPED, running: null });
+      assert.match(broken.status.unknown, said);
+      assert.deepEqual([broken.worldCount, broken.modCount], [0, 0]);
+    }
+    // Said once in the dashboard's log, however often the page asks.
+    assert.deepEqual(
+      problems().map((entry) => [entry.level, entry.message, entry.meta.serverId]),
+      [["warn", "Whether a server is running is not known", "Other"]]
+    );
+    assert.match(problems()[0].meta.reason, said);
+
+    // The healthy one is stopped as ever.
+    assert.equal((await serverManager.requestStop(SERVER_ID, OWNER)).stopping, true);
+    await waitFor(async () => !(await serverManager.getServerStatus(SERVER_ID)).running, "the healthy server to have stopped");
+    assert.deepEqual(settled(await serverManager.getServerStatus(SERVER_ID)), stoppedBy("console"));
+    assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
+
+    // Stop and Start on the other are answered with the reason, as a
+    // refusal, and nothing is done to it.
+    for (const ask of [
+      () => serverManager.stopServer("Other", OWNER),
+      () => serverManager.requestStop("Other", OWNER),
+      () => serverManager.startServer("Other", OWNER)
+    ]) {
+      await assert.rejects(ask(), { message: said, statusCode: 409 });
+    }
+    assert.equal(isAlive(otherPid), true);
+    assert.deepEqual(other.received(), []);
+
+    // Put right, it is the server it was, and is stopped as one.
+    mend(other);
+    mended = true;
+    assert.equal((await serverManager.getServerStatus("Other")).pid, otherPid);
+    assert.deepEqual(settled(await serverManager.stopServer("Other", OWNER)), stoppedBy("console"));
+    assert.deepEqual(other.received(), ["console: stop", "exit: stop"]);
+  });
+}
+
+// --- whose process a record names ----------------------------------------------------------------
+
+// Most of these need /proc: it is what says which process a pid is.
+const withoutProc = procStarted(process.pid) === null ? "there is no /proc to ask on this system" : false;
+
+// Makes this process's looks into /proc come out differently for the rest of
+// a test. `answer(target, read)` is called for every path under /proc that is
+// read, with a way to read it for real; what it returns is what was read, and
+// what it throws is the failure. Returns a way to put things back early.
+function alterProc(t, answer) {
+  const real = { readFileSync: fs.readFileSync, readdirSync: fs.readdirSync, readlinkSync: fs.readlinkSync };
+  const restore = () => Object.assign(fs, real);
+  t.after(restore);
+  for (const name of Object.keys(real)) {
+    fs[name] = (target, ...rest) => {
+      const read = () => real[name].call(fs, target, ...rest);
+      return typeof target === "string" && (target === "/proc" || target.startsWith("/proc/")) ? answer(target, read) : read();
+    };
+  }
+  return restore;
+}
+
+const noSuchFile = (target) => Object.assign(new Error(`ENOENT: no such file or directory, open '${target}'`), { code: "ENOENT" });
+const notAllowed = (target) => Object.assign(new Error(`EACCES: permission denied, readlink '${target}'`), { code: "EACCES" });
+
+for (const system of ["", ", on a system with no /proc to ask as well"]) {
+  test(`a copy of a running server's folder is not a second running server, and stopping the copy stops nothing${system}`, async (t) => {
+    const { execFileSync } = require("node:child_process");
+    if (system) {
+      alterProc(t, (target) => {
+        throw noSuchFile(target);
+      });
+    }
+    const server = await createServerRoot(t);
+    const first = await createManager(server.root);
+    const started = await first.serverManager.startServer(SERVER_ID, OWNER);
+    const pid = await server.whenReady();
+
+    // The folder is copied while the server runs. Its record goes with it,
+    // and names a process that is there: the original's. It also says which
+    // server that process is, and that is not the copy.
+    const copyDir = path.join(server.root, "servers", "Copy");
+    execFileSync("cp", ["-a", server.serverDir, copyDir]);
+    const copiedRecord = path.join(copyDir, ".rippermoon", "pid.json");
+    assert.deepEqual(JSON.parse(fs.readFileSync(copiedRecord, "utf8")), server.pidInfo());
+    assert.equal(server.pidInfo().server, SERVER_ID);
+
+    for (const dashboard of [first, await createManager(server.root)]) {
+      fs.copyFileSync(server.pidFile, copiedRecord);
+      const manager = dashboard.serverManager;
+      await manager.syncDiscoveredServers();
+
+      assert.deepEqual(await manager.getServerStatus("Copy"), STOPPED);
+      assert.deepEqual(await manager.stopServer("Copy", OWNER), STOPPED);
+      assert.deepEqual(await manager.requestStop("Copy", OWNER), STOPPED);
+      // Nobody asked for the original to be stopped, and nothing was sent to it.
+      assert.deepEqual(server.received(), []);
+      assert.equal(isAlive(pid), true);
+      assert.deepEqual(await manager.getServerStatus(SERVER_ID), started);
+      // The original has its record and its console still.
+      assert.equal(server.pidInfo().pid, pid);
+      assert.equal(fs.lstatSync(server.consoleFile).isFIFO(), true);
+      // The copy's record is cleared away, and the log says what it was.
+      assert.equal(isThere(copiedRecord), false);
+      assert.deepEqual(
+        dashboard.problems().map((entry) => [entry.level, entry.message, entry.meta.pid, entry.meta.reason, entry.meta.serverId]),
+        [["warn", "Removed a server's record of a process that is not that server", pid, `it is the record of another server (${SERVER_ID})`, "Copy"]]
+      );
+      dashboard.logs.length = 0;
+    }
+
+    // The original is as it was, and stops when it is the one that is asked.
+    assert.deepEqual(settled(await first.serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
+    assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
+  });
+}
+
+test("a record that is this server's by name but not by its process is not believed, and nothing is signalled on its word", { skip: withoutProc }, async (t) => {
+  const server = await createServerRoot(t);
+  const { logs, problems, serverManager } = await createManager(server.root);
+  // A process that is where a server would be, and one that is somewhere else.
+  const inFolder = startLegacyServer(t, server);
+  const pid = await server.whenReady();
+  await waitFor(() => server.received().includes("console: closed"), "the stand-in to settle");
+  const elsewhere = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { cwd: server.root, stdio: "ignore" });
+  t.after(() => elsewhere.kill("SIGKILL"));
+  await waitFor(() => procStarted(elsewhere.pid) !== null, "the other process to be there");
+
+  const write = (fields) => fs.writeFileSync(server.pidFile, `${JSON.stringify({ startedAt: "2026-11-16T09:00:00.000Z", startedBy: "owner", ...fields }, null, 2)}\n`);
+  const truth = { boot: bootIdNow(), pid, server: SERVER_ID, started: procStarted(pid) };
+  const notBelieved = [
+    // The pid was the server's once, and has since been given to this process.
+    ["a start time that is not this process's", { ...truth, started: truth.started + 1 }, "warn", "pid PID is another process now, started at another time"],
+    ["a start time from long ago", { ...truth, started: 1 }, "warn", "pid PID is another process now, started at another time"],
+    // The machine has been restarted since: pids begin again from nothing.
+    ["another run of the machine", { ...truth, boot: "0a1b2c3d-0000-4000-8000-000000000000" }, "info", null],
+    // Everything about the process is right, and the record is another server's.
+    ["another server's record", { ...truth, server: "SomeOtherServer" }, "warn", "it is the record of another server (SomeOtherServer)"]
+  ];
+
+  for (const [label, fields, level, reason] of notBelieved) {
+    write(fields);
+    assert.deepEqual(await serverManager.getServerStatus(SERVER_ID), STOPPED, label);
+    write(fields);
+    assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED, label);
+    // Neither process was sent anything.
+    assert.deepEqual(server.received(), ["console: closed"], label);
+    assert.equal(isAlive(pid), true, label);
+    assert.equal(elsewhere.exitCode === null && elsewhere.signalCode === null, true, label);
+    // The record went, both times, and the log says why.
+    assert.equal(isThere(server.pidFile), false, label);
+    if (level === "warn") {
+      assert.deepEqual(
+        problems().map((entry) => [entry.level, entry.message, entry.meta.reason]),
+        Array(2).fill(["warn", "Removed a server's record of a process that is not that server", reason.replace("PID", String(pid))]),
+        label
+      );
+    } else {
+      assert.deepEqual(problems(), [], label);
+      assert.equal(logs.filter((entry) => entry.message === "A recorded server process is no longer running").length, 2, label);
+    }
+    logs.length = 0;
+  }
+
+  // Where a process runs is no part of it. A record that is this server's by
+  // name, by the run of the machine and by the start of its process is
+  // believed wherever that process is: a server's start script may take it
+  // anywhere. (So may a mod that writes such a record. It runs as the same
+  // account, and has no need of the dashboard to signal anything.)
+  write({ boot: truth.boot, pid: elsewhere.pid, server: SERVER_ID, started: procStarted(elsewhere.pid) });
+  assert.equal((await serverManager.getServerStatus(SERVER_ID)).pid, elsewhere.pid);
+  assert.deepEqual(problems(), []);
+  fs.rmSync(server.pidFile);
+
+  // The record with nothing wrong in it is believed, and its process is the
+  // one that is stopped.
+  write(truth);
+  assert.deepEqual(await serverManager.getServerStatus(SERVER_ID), {
+    ...STOPPED,
+    pid,
+    running: true,
+    startedAt: "2026-11-16T09:00:00.000Z",
+    startedBy: "owner"
+  });
+  assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("SIGTERM"));
+  assert.deepEqual(server.received(), ["console: closed", "signal: SIGTERM", "exit: SIGTERM"]);
+  assert.equal(inFolder.exitCode, 0);
+  assert.equal(elsewhere.exitCode === null && elsewhere.signalCode === null, true);
+});
+
+test("a record that does not say which server it is of is held against the folder, and never to its cost", { skip: withoutProc }, async (t) => {
+  const server = await createServerRoot(t);
+  const owner = { id: "usr_owner", role: "owner", servers: [], username: "owner" };
+  const { problems, serverManager } = await createManager(server.root);
+  const inFolder = startLegacyServer(t, server);
+  const pid = await server.whenReady();
+  await waitFor(() => server.received().includes("console: closed"), "the stand-in to settle");
+  const sleeper = (cwd) => {
+    fs.mkdirSync(cwd, { recursive: true });
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { cwd, stdio: "ignore" });
+    t.after(() => child.kill("SIGKILL"));
+    return child;
+  };
+  // Somewhere else, in a folder beside the server's whose name begins with
+  // the server's, and in a folder under the server's.
+  const elsewhere = sleeper(server.root);
+  const beside = sleeper(`${server.serverDir}-old`);
+  const under = sleeper(path.join(server.serverDir, "world", "region"));
+  for (const child of [elsewhere, beside, under]) {
+    await waitFor(() => procStarted(child.pid) !== null, "the other processes to be there");
+  }
+  // A console pipe of the server's, as one that is running has.
+  fs.mkdirSync(server.consolesDir, { recursive: true });
+  plantPipe(server.consoleFile);
+
+  // A record as the dashboard wrote them before it wrote down whose they are.
+  const older = (child) => `${JSON.stringify({ pid: child, startedAt: "2026-11-16T09:00:00.000Z", startedBy: "owner" }, null, 2)}\n`;
+  const everyoneIsThere = (label) => {
+    assert.deepEqual(server.received(), ["console: closed"], label);
+    for (const child of [inFolder, elsewhere, beside, under]) {
+      assert.equal(child.exitCode === null && child.signalCode === null, true, label);
+    }
+  };
+  // Not known: said in words wherever the server is only shown, refused
+  // wherever something would be done, and nothing signalled, started or
+  // removed - the record and the console least of all.
+  const isNotKnown = async (record, label) => {
+    const said = /^servers\/DemoServer\/\.rippermoon\/pid\.json names pid \d+, which is running in .+ and not in this server's folder\. The record is from before the dashboard wrote down which server a process is, so whether that process is this server is not known: nothing is signalled, started or removed\. If it is this server, stop it by hand\. If it is not, remove the pid file\.$/;
+    for (const ask of [
+      () => serverManager.getServerStatus(SERVER_ID),
+      () => serverManager.startServer(SERVER_ID, OWNER),
+      () => serverManager.stopServer(SERVER_ID, OWNER),
+      () => serverManager.requestStop(SERVER_ID, OWNER),
+      () => serverManager.deleteServer(SERVER_ID)
+    ]) {
+      await assert.rejects(ask(), { message: said, statusCode: 409 }, label);
+    }
+    const [listed] = await serverManager.listServersForUser(owner);
+    assert.equal(listed.status.running, null, label);
+    assert.match(listed.status.unknown, said, label);
+    assert.equal(fs.readFileSync(server.pidFile, "utf8"), record, label);
+    assert.equal(fs.lstatSync(server.consoleFile).isFIFO(), true, label);
+    assert.equal(server.fakePid(), pid, label);
+    everyoneIsThere(label);
+  };
+
+  for (const [label, child] of [
+    ["a process that runs somewhere else", elsewhere],
+    ["a process in a folder beside the server's", beside]
+  ]) {
+    fs.writeFileSync(server.pidFile, older(child.pid));
+    await isNotKnown(older(child.pid), label);
+  }
+  // Said once for each, in the dashboard's log.
+  assert.deepEqual(
+    problems().map((entry) => [entry.level, entry.message]),
+    Array(2).fill(["warn", "Whether a server is running is not known"])
+  );
+
+  // A process in the server's folder, or in a folder under it, is believed:
+  // that is where a server is, as a rule.
+  for (const child of [under, inFolder]) {
+    fs.writeFileSync(server.pidFile, older(child.pid));
+    assert.equal((await serverManager.getServerStatus(SERVER_ID)).pid, child.pid);
+  }
+
+  // Where the folder of the process cannot be read - from another mount
+  // namespace, as after a restart of the service, it may well not be - the
+  // record is believed as it always was, and stays.
+  let restore = alterProc(t, (target, read) => {
+    if (target === `/proc/${pid}/cwd`) {
+      throw notAllowed(target);
+    }
+    return read();
+  });
+  assert.equal((await serverManager.getServerStatus(SERVER_ID)).pid, pid);
+  assert.equal(fs.readFileSync(server.pidFile, "utf8"), older(pid));
+  restore();
+
+  // And where it reads as some other path - which is the same thing, seen
+  // from where the dashboard is - it is not known, and stays.
+  restore = alterProc(t, (target, read) => (target === `/proc/${pid}/cwd` ? "/some/other/view/of/it" : read()));
+  await isNotKnown(older(pid), "a folder that reads as another path");
+  restore();
+
+  // Read as it is, the server is the server, and is stopped as one.
+  assert.equal((await serverManager.getServerStatus(SERVER_ID)).pid, pid);
+  assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("SIGTERM"));
+  assert.deepEqual(server.received(), ["console: closed", "signal: SIGTERM", "exit: SIGTERM"]);
+});
+
+test("a server whose start script takes it out of its folder is still that server after a dashboard restart", async (t) => {
+  const server = await createServerRoot(t);
+  // Runs the server from the folder above its own.
+  fs.writeFileSync(path.join(server.serverDir, "run.sh"), "#!/bin/sh\ncd ..\nexec ./DemoServer/fake-server.js\n", { mode: 0o755 });
+  const above = path.join(server.root, "servers");
+  const read = (name) => {
+    try {
+      return fs.readFileSync(path.join(above, name), "utf8");
+    } catch {
+      return "";
+    }
+  };
+  const received = () => read("received.log").split("\n").filter(Boolean);
+  const first = await createManager(server.root);
+  await first.serverManager.setServerMetadata(SERVER_ID, { startCommand: "./run.sh" });
+  const started = await first.serverManager.startServer(SERVER_ID, OWNER);
+  const pid = await waitFor(() => /^fake server ready$/m.test(server.runtimeLog()) && Number(read("fake-server.pid")), "the server");
+  t.after(() => {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Gone already.
+    }
+  });
+  assert.equal(started.pid, pid);
+  if (!withoutProc) {
+    assert.equal(fs.readlinkSync(`/proc/${pid}/cwd`), fs.realpathSync(above));
+  }
+
+  // After a restart of the dashboard, whatever the folder of the process
+  // reads as from where the new one is: as it is, as nothing that may be
+  // read, or as some other path altogether.
+  const views = [
+    ["as it is", null],
+    ["not to be read", (target) => {
+      throw notAllowed(target);
+    }],
+    ["another path", () => "/some/other/view/of/it"]
+  ];
+  for (const [label, cwd] of views) {
+    const restore = cwd ? alterProc(t, (target, real) => (target === `/proc/${pid}/cwd` ? cwd(target) : real())) : () => {};
+    const later = await createManager(server.root);
+    assert.deepEqual(await later.serverManager.getServerStatus(SERVER_ID), started, label);
+    // Start finds it running, and puts no second one beside it.
+    assert.deepEqual(await later.serverManager.startServer(SERVER_ID, OWNER), started, label);
+    assert.equal(Number(read("fake-server.pid")), pid, label);
+    assert.equal(server.pidInfo().pid, pid, label);
+    assert.equal(fs.lstatSync(server.consoleFile).isFIFO(), true, label);
+    assert.deepEqual(later.problems(), [], label);
+    restore();
+  }
+
+  // And it is stopped through its console, by a dashboard that did not start it.
+  const later = await createManager(server.root);
+  assert.deepEqual(settled(await later.serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
+  assert.deepEqual(received(), ["console: stop", "exit: stop"]);
+  assert.equal(isAlive(pid), false);
+  assert.equal((server.runtimeLog().match(/^fake server ready$/gm) || []).length, 1);
+});
+
+test("what a stop is about to signal is looked at again first: a pid that has become another process is sent nothing", { skip: withoutProc }, async (t) => {
+  const server = await createServerRoot(t, { onStop: "ignore" });
+  const first = await createManager(server.root);
+  await first.serverManager.startServer(SERVER_ID, OWNER);
+  const pid = await server.whenReady();
+  // A dashboard started later: all it has is the record, and what /proc says of the pid in it.
+  const { problems, serverManager } = await createManager(server.root, { stopWaits: { ...QUICK_WAITS, console: 1500 } });
+
+  const stopping = serverManager.stopServer(SERVER_ID, OWNER);
+  await waitFor(() => server.received().includes("console: stop"), "the server to be told to stop");
+  // In the minutes a stop waits, the server goes and its pid is given to
+  // something else. Made to look so here: the process under that pid is now
+  // one that was started at another time.
+  alterProc(t, (target, read) => {
+    if (target !== `/proc/${pid}/stat`) {
+      return read();
+    }
+    const line = read();
+    const fields = line.slice(line.lastIndexOf(")") + 2).split(" ");
+    fields[19] = String(Number(fields[19]) + 7);
+    return `${line.slice(0, line.lastIndexOf(")") + 2)}${fields.join(" ")}`;
+  });
+
+  // The wait runs out, and what would have been sent SIGTERM is looked at
+  // first: it is not this server, so it is sent nothing, now or later.
+  assert.deepEqual(settled(await stopping), stoppedBy("console"));
+  assert.deepEqual(server.received(), ["console: stop"]);
+  assert.equal(isAlive(pid), true);
+  assert.equal(isThere(server.pidFile), false);
+  assert.deepEqual(
+    problems().map((entry) => [entry.level, entry.message, entry.meta.reason]),
+    [["warn", "Removed a server's record of a process that is not that server", `pid ${pid} is another process now, started at another time`]]
+  );
+});
+
+test("the same on an older record: a process that has left the server's folder since SIGTERM is not killed, and its record stays", { skip: withoutProc }, async (t) => {
+  const server = await createServerRoot(t);
+  // A stand-in that, sent SIGTERM, does not stop, and moves out of the
+  // server's folder: from then on a record that does not say whose it is
+  // names a process that is somewhere else.
+  fs.writeFileSync(
+    path.join(server.serverDir, "fake-server.js"),
+    `#!${process.execPath}
+const fs = require("node:fs");
+const path = require("node:path");
+const home = process.cwd();
+const record = (line) => fs.appendFileSync(path.join(home, "received.log"), line + "\\n");
+process.on("SIGTERM", () => {
+  record("signal: SIGTERM");
+  if (process.cwd() === home) {
+    process.chdir(${JSON.stringify(server.root)});
+    record("moved away");
+  }
+});
+setTimeout(() => process.exit(9), 60000);
+setInterval(() => {}, 1000);
+fs.writeFileSync("fake-server.pid", String(process.pid));
+console.log("fake server ready");
+`,
+    { mode: 0o755 }
+  );
+  // The wait is long enough for the stand-in to have moved before it is over, on a busy machine too.
+  const { problems, serverManager } = await createManager(server.root, { stopWaits: { ...QUICK_WAITS, signalOnly: 1500 } });
+  const standIn = startLegacyServer(t, server);
+  const pid = await server.whenReady();
+  const record = fs.readFileSync(server.pidFile, "utf8");
+
+  // It is sent SIGTERM as this server. When SIGKILL is due it can no longer
+  // be told to be: the stop ends there, saying so, and nothing is cleared away.
+  const answer = await serverManager.stopServer(SERVER_ID, OWNER).then(
+    (status) => status,
+    (error) => error
+  );
+  assert.equal(answer.statusCode, 409);
+  assert.match(answer.message, /names pid \d+, which is running in .+ and not in this server's folder/);
+  assert.deepEqual(server.received(), ["signal: SIGTERM", "moved away"]);
+  assert.equal(isAlive(pid), true);
+  assert.equal(standIn.signalCode, null);
+  assert.equal(fs.readFileSync(server.pidFile, "utf8"), record);
+  assert.deepEqual(
+    problems().map((entry) => entry.message),
+    [
+      'Server has no console the dashboard can reach: sent SIGTERM instead of "stop"',
+      "Stopping a server: what its record names can no longer be told to be the server, and nothing more is sent"
+    ]
+  );
+  assert.match(server.runtimeLog(), /^\[[^\]]+\] Stop abandoned \d+ s in: pid \d+ can no longer be told to be this server\. Nothing more is sent to it\.$/m);
+});
+
+test("a process group that is somebody else's is not taken for what is left of a server", { skip: withoutProc }, async (t) => {
+  const server = await createServerRoot(t);
+  const { logs, problems, serverManager } = await createManager(server.root);
+  fs.mkdirSync(server.runtimeDir, { recursive: true });
+  const statOf = (id) => {
+    const line = fs.readFileSync(`/proc/${id}/stat`, "utf8");
+    const fields = line.slice(line.lastIndexOf(")") + 2).split(" ");
+    return { group: Number(fields[2]), session: Number(fields[3]) };
+  };
+  const membersOf = (group) =>
+    fs
+      .readdirSync("/proc")
+      .filter((name) => /^\d+$/.test(name))
+      .map(Number)
+      .filter((id) => {
+        try {
+          return id !== group && statOf(id).group === group;
+        } catch {
+          return false;
+        }
+      });
+  const endLater = (pid) =>
+    t.after(() => {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Gone already.
+      }
+    });
+  const record = (fields) => fs.writeFileSync(server.pidFile, `${JSON.stringify({ group: true, server: SERVER_ID, startedAt: "2026-11-16T09:00:00.000Z", startedBy: "owner", ...fields }, null, 2)}\n`);
+  const notThisServers = async (leader, left, reason) => {
+    assert.deepEqual(await serverManager.getServerStatus(SERVER_ID), STOPPED);
+    assert.equal(isThere(server.pidFile), false);
+    // Nothing was signalled: what was left of that group is still there.
+    assert.equal(isAlive(left), true);
+    assert.deepEqual(
+      problems().map((entry) => [entry.message, entry.meta.reason]),
+      [["Removed a server's record of a process that is not that server", reason.replace("PID", String(leader))]]
+    );
+    logs.length = 0;
+  };
+  const sleeper = `"${process.execPath}" -e "setTimeout(() => {}, 60000)"`;
+
+  // Some other program of the account: a shell that started something and
+  // has gone, leaving it behind in a group that still carries the shell's pid.
+  // The shell was the leader of a group, and not of a session: what it left
+  // is in the session of whatever started it.
+  const noted = path.join(server.root, "leader.pid");
+  const job = spawn("bash", ["-c", `set -m\nsh -c '${sleeper} & wait' &\necho $! > "${noted}"\nwait\n`], { cwd: server.root, stdio: "ignore" });
+  t.after(() => job.kill("SIGKILL"));
+  const leader = await waitFor(() => {
+    try {
+      return Number(fs.readFileSync(noted, "utf8")) || null;
+    } catch {
+      return null;
+    }
+  }, "the shell to have started its job");
+  const [left] = await waitFor(() => {
+    const members = membersOf(leader);
+    return members.length ? members : null;
+  }, "the job to have started something");
+  endLater(left);
+  if (statOf(left).session === leader) {
+    t.skip("this shell gives a job a session of its own");
+    return;
+  }
+  process.kill(leader, "SIGKILL");
+  await waitFor(() => !isAlive(leader), "the shell to have gone");
+  assert.equal(isAlive(left), true);
+
+  record({ pid: leader });
+  await notThisServers(leader, left, "process group PID is not this server's: nothing in it is from the session this server was started in");
+
+  // And one whose shell did make a session, as a server's first process
+  // does, but which is older than the record says the server is.
+  const shell = spawn("sh", ["-c", `${sleeper} & wait`], { cwd: server.root, detached: true, stdio: "ignore" });
+  const [other] = await waitFor(() => {
+    const members = membersOf(shell.pid);
+    return members.length ? members : null;
+  }, "the second shell to have started something");
+  endLater(other);
+  process.kill(shell.pid, "SIGKILL");
+  await waitFor(() => !isAlive(shell.pid), "the second shell to have gone");
+  record({ pid: shell.pid, started: procStarted(other) + 100000 });
+  await notThisServers(shell.pid, other, "process group PID is not this server's: nothing in it is from the session this server was started in");
+
+  // The same group under a record it is not too old for is taken for what
+  // is left of the server. There is nothing more to tell it by: the process
+  // the record was of has gone, and the pid has to have come round again to
+  // a program that leaves this behind for it to be anything else.
+  record({ pid: shell.pid, started: procStarted(other) });
+  const status = await serverManager.getServerStatus(SERVER_ID);
+  assert.deepEqual([status.running, status.pid, status.leftover], [true, shell.pid, { count: 1 }]);
+  assert.equal(isThere(server.pidFile), true);
+  assert.deepEqual(problems(), []);
+});
+
+test("with no /proc to ask, a record is believed on its pid alone, as it was before", async (t) => {
+  // As on a system that has none: every look into /proc fails.
+  alterProc(t, (target) => {
+    throw noSuchFile(target);
+  });
+  assert.equal(procStarted(process.pid), null);
+  assert.equal(bootIdNow(), null);
+
+  const server = await createServerRoot(t);
+  const first = await createManager(server.root);
+  // A start script that stays between the dashboard and the server, as well.
+  fs.writeFileSync(path.join(server.serverDir, "run.sh"), "#!/usr/bin/env sh\n./fake-server.js\n", { mode: 0o755 });
+  await first.serverManager.setServerMetadata(SERVER_ID, { startCommand: "./run.sh" });
+
+  // What a start writes down then: the pid, and neither of the things that
+  // would tell its process from another.
+  const started = await first.serverManager.startServer(SERVER_ID, OWNER);
+  const pid = await server.whenReady();
+  assert.deepEqual(server.pidInfo(), { console: "fifo", group: true, pid: started.pid, server: SERVER_ID, startedAt: started.startedAt, startedBy: "owner" });
+
+  // The script goes. A dashboard started later cannot list what is left of
+  // its group, and takes the group's being there for the server's.
+  process.kill(started.pid, "SIGKILL");
+  await waitFor(() => !isAlive(started.pid), "the start script to have gone");
+  const later = await createManager(server.root);
+  // What is left cannot be counted either.
+  assert.deepEqual(await later.serverManager.getServerStatus(SERVER_ID), { ...started, leftover: { count: null } });
+  assert.deepEqual(settled(await later.serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
+  assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
+  assert.equal(isAlive(pid), false);
+  assert.deepEqual(later.problems(), []);
+
+  // And a record of a process that runs somewhere else, from another run of
+  // the machine by what it says, is believed: there is nothing to hold it
+  // against. This is what every record was before, and what one still is
+  // where the system cannot be asked.
+  const elsewhere = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { cwd: server.root, stdio: "ignore" });
+  t.after(() => elsewhere.kill("SIGKILL"));
+  const gone = new Promise((resolve) => elsewhere.once("exit", (code, signal) => resolve(signal)));
+  fs.writeFileSync(
+    server.pidFile,
+    `${JSON.stringify({ boot: "0a1b2c3d-0000-4000-8000-000000000000", pid: elsewhere.pid, started: 1, startedAt: "2026-11-16T09:00:00.000Z", startedBy: "owner" }, null, 2)}\n`
+  );
+  assert.equal((await later.serverManager.getServerStatus(SERVER_ID)).pid, elsewhere.pid);
+  assert.deepEqual(settled(await later.serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("SIGTERM"));
+  assert.equal(await gone, "SIGTERM");
+});
+
+test("a pid file is replaced when a server starts, never written through", async (t) => {
+  const server = await createServerRoot(t);
+  const { serverManager } = await createManager(server.root);
+  const elsewhere = path.join(server.root, "elsewhere.txt");
+  fs.writeFileSync(elsewhere, "nobody writes here\n");
+  fs.mkdirSync(server.runtimeDir, { recursive: true });
+  fs.symlinkSync(elsewhere, server.pidFile);
+
+  const started = await serverManager.startServer(SERVER_ID, OWNER);
+  await server.whenReady();
+  assert.equal(started.running, true);
+  assert.equal(fs.lstatSync(server.pidFile).isFile(), true);
+  assert.equal(server.pidInfo().pid, started.pid);
+  assert.equal(fs.readFileSync(elsewhere, "utf8"), "nobody writes here\n");
+  // Nothing but the record, the console and the log is left in the folder.
+  assert.deepEqual(fs.readdirSync(server.runtimeDir).sort(), ["pid.json", "runtime.log"]);
+  assert.deepEqual(fs.readdirSync(server.consolesDir), [SERVER_ID]);
+
+  assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
+  assert.deepEqual(fs.readdirSync(server.runtimeDir), ["runtime.log"]);
+  assert.deepEqual(fs.readdirSync(server.consolesDir), []);
+
+  // That link was found and cleared before the server was started. This one
+  // turns up later, once the start is under way: a stand-in for mkfifo makes
+  // the pipe and then leaves it, as a mod would have to in that moment.
+  const program = path.join(server.root, "planting-mkfifo");
+  fs.writeFileSync(program, `#!/bin/sh\nmkfifo "$@" && ln -s "${elsewhere}" "${server.pidFile}"\n`, { mode: 0o755 });
+  const later = await createManager(server.root, { mkfifoCommand: program });
+  fs.rmSync(path.join(server.serverDir, "fake-server.pid"));
+
+  const again = await later.serverManager.startServer(SERVER_ID, OWNER);
+  await server.whenReady();
+  assert.equal(again.running, true);
+  assert.equal(fs.lstatSync(server.pidFile).isFile(), true);
+  assert.deepEqual(server.pidInfo(), recordFor(again.pid, again.startedAt, { console: "fifo" }));
+  assert.equal(fs.readFileSync(elsewhere, "utf8"), "nobody writes here\n");
+  assert.deepEqual(fs.readdirSync(server.runtimeDir).sort(), ["pid.json", "runtime.log"]);
+  assert.deepEqual(fs.readdirSync(server.consolesDir), [SERVER_ID]);
+  assert.deepEqual(settled(await later.serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
+  assert.deepEqual(later.problems(), []);
+});
+
+test("a runtime log that is not a file of its own is not written through, and the server is not started on it", async (t) => {
+  const server = await createServerRoot(t);
+  const elsewhere = path.join(server.root, "elsewhere.txt");
+  const logFile = path.join(server.runtimeDir, "runtime.log");
+  const plants = [
+    [
+      "a link to a file somewhere else",
+      () => {
+        fs.symlinkSync(elsewhere, logFile);
+      },
+      /cannot be written to: a link is in its place\.$/
+    ],
+    [
+      "a folder",
+      () => {
+        fs.mkdirSync(logFile);
+      },
+      /cannot be written to: a folder is in its place\.$/
+    ],
+    [
+      "a named pipe that nothing reads",
+      () => {
+        plantPipe(logFile);
+      },
+      /cannot be written to: a pipe that nothing reads is in its place\.$/
+    ],
+    [
+      "a named pipe that something reads",
+      () => {
+        plantPipe(logFile);
+        const reader = fs.openSync(logFile, fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
+        t.after(() => fs.closeSync(reader));
+        return reader;
+      },
+      /cannot be written to: it is not a regular file\.$/
+    ]
+  ];
+
+  for (const [label, plant, message] of plants) {
+    fs.writeFileSync(elsewhere, "nobody writes here\n");
+    fs.rmSync(server.runtimeDir, { force: true, recursive: true });
+    fs.mkdirSync(server.runtimeDir, { recursive: true });
+    const reader = plant();
+    const { problems, serverManager } = await createManager(server.root);
+
+    const refused = await unlessItHangs(
+      serverManager.startServer(SERVER_ID, OWNER).then(
+        () => "it started",
+        (error) => error
+      )
+    );
+    assert.match(String(refused.message || refused), message, label);
+    assert.equal(refused.statusCode, 409, label);
+    assert.match(refused.message, /^Unable to start DemoServer\. Its runtime log, servers\/DemoServer\/\.rippermoon\/runtime\.log, /, label);
+
+    assert.deepEqual(await serverManager.getServerStatus(SERVER_ID), { ...STOPPED }, label);
+    assert.equal(server.fakePid(), null, label);
+    assert.equal(fs.readFileSync(elsewhere, "utf8"), "nobody writes here\n", label);
+    if (reader !== undefined) {
+      // Not a line of the dashboard's own went into the pipe either.
+      assert.equal(whatArrived(reader), "", label);
+    }
+    // No pipe is left behind for a server that never ran.
+    assert.equal(isThere(server.consoleFile), false, label);
+    assert.equal(isThere(server.pidFile), false, label);
+    assert.equal(problems().every((entry) => entry.message === "Could not write to a server's runtime log"), true, label);
+    assert.ok(problems().length > 0, label);
+  }
+});
+
+test("only the exact marker in a pid file says that a server has a console", async (t) => {
+  // A pipe where a console would be, with something reading it, so that
+  // whatever the dashboard writes there can be seen.
+  const consoleWithAReader = (server) => {
+    fs.mkdirSync(server.consolesDir, { recursive: true });
+    plantPipe(server.consoleFile);
+    const reader = fs.openSync(server.consoleFile, fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
+    t.after(() => fs.closeSync(reader));
+    return () => whatArrived(reader);
+  };
+  const stopWaits = { ...QUICK_WAITS, console: 250 };
+
+  for (const marker of [true, 1, "FIFO", "fifo ", ["fifo"], { fifo: true }, "pipe", null]) {
+    const server = await createServerRoot(t);
+    const { problems, serverManager } = await createManager(server.root, { stopWaits });
+    const legacy = startLegacyServer(t, server);
+    await server.whenReady();
+    fs.writeFileSync(server.pidFile, JSON.stringify({ console: marker, pid: legacy.pid, startedAt: "2026-11-16T09:00:00.000Z", startedBy: "owner" }));
+    const arrived = consoleWithAReader(server);
+
+    assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("SIGTERM"), JSON.stringify(marker));
+    // Nothing was written to the pipe: the record does not say it is a console.
+    assert.equal(arrived(), "", JSON.stringify(marker));
+    assert.equal(server.received().includes("signal: SIGTERM"), true, JSON.stringify(marker));
+    assert.deepEqual(
+      problems().map((entry) => [entry.message, entry.meta.reason]),
+      [['Server has no console the dashboard can reach: sent SIGTERM instead of "stop"', "it was started without one that outlasts the dashboard"]],
+      JSON.stringify(marker)
+    );
+  }
+
+  // With the marker as the dashboard writes it, the same pipe is written to.
+  const server = await createServerRoot(t);
+  const { problems, serverManager } = await createManager(server.root, { stopWaits });
+  const legacy = startLegacyServer(t, server);
+  await server.whenReady();
+  fs.writeFileSync(server.pidFile, JSON.stringify({ console: "fifo", pid: legacy.pid, startedAt: "2026-11-16T09:00:00.000Z", startedBy: "owner" }));
+  const arrived = consoleWithAReader(server);
+
+  assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("SIGTERM"));
+  assert.equal(arrived(), "stop\n");
+  // This server was never listening there, so the wait ran out and a signal followed.
+  assert.deepEqual(
+    problems().map((entry) => entry.message),
+    ['Server did not exit after "stop" on its console: sent SIGTERM']
+  );
+});

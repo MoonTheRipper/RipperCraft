@@ -160,8 +160,19 @@ export async function handleAppClick(event) {
 
     if (action === "stop-server") {
       state.updatePlan = null;
-      await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/stop`, { method: "POST" });
-      setNotice("success", "server stop command sent");
+      // Answered at once: the server is told to stop and then given the time
+      // it needs to save. The page shows it as stopping from here on, and
+      // stopping-live.js watches until it has gone.
+      const payload = await api(`/api/servers/${encodeURIComponent(state.selectedServerId)}/stop`, { method: "POST" });
+      if (payload?.status?.stopping) {
+        setNotice("success", "stopping — the server saves the world first");
+      } else if (payload?.status?.running) {
+        // Running, and not stopping: the stop could not begin, or was over
+        // before this answer and had not ended it. That is not "not running".
+        setNotice("error", "the server is still running: the stop did not go through. see its log and the dashboard's, then try again");
+      } else {
+        setNotice("success", "the server is not running");
+      }
       await loadServers();
       await loadSnapshot();
       render();
