@@ -25,14 +25,37 @@ export function formatBytes(bytes) {
 // A server that has been told to stop is still running until its process has
 // gone: it is saving the world, and that can take minutes. It is shown as
 // neither up nor down, and it can be neither started nor stopped again.
+//
+// Two more things a status can say, each drawn as a warning. `unknown`: the
+// dashboard cannot tell whether the server is running - its record cannot be
+// read, or the folder the record is kept in is not the server's own - and
+// will neither start nor stop it until it can. `leftover`: the process the
+// server was started as has exited, and others that it started run on. That
+// still counts as running, and Stop is what ends them.
 export function describeRunState(status) {
+  if (typeof status?.unknown === "string" && status.unknown) {
+    return { label: "not known", short: "unknown", stopping: false, tone: "warn", unknown: true };
+  }
   if (status?.running && status.stopping) {
     return { label: "stopping…", short: "stopping", stopping: true, tone: "warn" };
+  }
+  if (status?.running && status.leftover) {
+    return { label: "exited, with processes left", leftover: true, short: "left over", stopping: false, tone: "warn" };
   }
   if (status?.running) {
     return { label: "online", short: "up", stopping: false, tone: "ok" };
   }
   return { label: "offline", short: "down", stopping: false, tone: "idle" };
+}
+
+// What is left of a server whose first process has exited, in words: "2
+// processes ... are", "1 process ... is". The count is a whole number or is
+// not given, whatever an answer holds.
+export function describeLeftover(status) {
+  const count = Number.isSafeInteger(status?.leftover?.count) && status.leftover.count > 0 ? status.leftover.count : null;
+  return count === 1
+    ? { are: "is", some: "1 process", them: "it", they: "it" }
+    : { are: "are", some: count === null ? "processes" : `${count} processes`, them: "them", they: "they" };
 }
 
 // How the dashboard's last stop of a server ended, for a server that is not

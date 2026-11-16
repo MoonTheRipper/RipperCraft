@@ -1,5 +1,5 @@
 import { loadServers, loadSnapshot } from "./data.js";
-import { describeLastStop } from "./format.js";
+import { describeLastStop, describeRunState } from "./format.js";
 import { setNotice } from "./notice.js";
 import { render } from "./render.js";
 import { state } from "./state.js";
@@ -30,13 +30,14 @@ export function anyServerStopping() {
 
 // What to say when stops have ended, and in which colour.
 //
-// A stop ends in one of three ways, and only one of them is good news. The
+// A stop ends in one of four ways, and only one of them is good news. The
 // server stopped: by its console or by SIGTERM, with its world saved. It was
-// killed: it has stopped, and whatever it had not saved is lost. Or it is
-// still there, the same process, with no stop under way any more: the stop
-// failed, or the dashboard was restarted in the middle of it. The last two
-// are said as errors, and first.
-function noticeForEndedStops({ killed, stopped, unstopped }) {
+// killed: it has stopped, and whatever it had not saved is lost. It is still
+// there, the same process, with no stop under way any more: the stop failed,
+// or the dashboard was restarted in the middle of it. Or the dashboard can no
+// longer tell: the stop gave up on a process it could not be sure of. The
+// last three are said as errors, and first.
+function noticeForEndedStops({ killed, stopped, unknown, unstopped }) {
   const names = (servers) => servers.map((server) => server.name).join(", ");
   const parts = [];
   if (killed.length) {
@@ -45,6 +46,10 @@ function noticeForEndedStops({ killed, stopped, unstopped }) {
       `${names(killed)} did not stop when asked, and ${one ? "was" : "were"} killed: the world may not have been saved, see ${one ? "its log" : "their logs"}`
     );
   }
+  if (unknown.length) {
+    const one = unknown.length === 1;
+    parts.push(`it is no longer known whether ${names(unknown)} ${one ? "is" : "are"} running: see ${one ? "its page" : "their pages"}`);
+  }
   if (unstopped.length) {
     const one = unstopped.length === 1;
     parts.push(`${names(unstopped)} ${one ? "is" : "are"} still running: the stop did not finish. see ${one ? "its log" : "their logs"}, then stop ${one ? "it" : "them"} again`);
@@ -52,7 +57,7 @@ function noticeForEndedStops({ killed, stopped, unstopped }) {
   if (stopped.length) {
     parts.push(`${names(stopped)} stopped`);
   }
-  return parts.length ? { message: parts.join(". "), type: killed.length || unstopped.length ? "error" : "success" } : null;
+  return parts.length ? { message: parts.join(". "), type: killed.length || unknown.length || unstopped.length ? "error" : "success" } : null;
 }
 
 // The request that stops a server is answered at once, and the server then
@@ -106,10 +111,12 @@ export async function pollStoppingOnce() {
     }
 
     const ended = finished.map((id) => listed.get(id)).filter(Boolean);
-    const gone = ended.filter((server) => !server.status?.running);
+    const unknown = ended.filter((server) => describeRunState(server.status).unknown);
+    const gone = ended.filter((server) => !server.status?.running && !unknown.includes(server));
     const notice = noticeForEndedStops({
       killed: gone.filter((server) => describeLastStop(server.status)?.killed),
       stopped: gone.filter((server) => !describeLastStop(server.status)?.killed),
+      unknown,
       // Running under another pid, it has been started again since: that is
       // a server like any other, and nothing needs saying about it.
       unstopped: ended.filter((server) => server.status?.running && server.status.pid === wereStopping.get(server.id))

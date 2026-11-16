@@ -990,15 +990,27 @@ function snapshotOf(status, permissions = {}) {
 
 const RUNNING = {
   lastStop: null,
+  leftover: null,
   pid: 4242,
   running: true,
   startedAt: "2026-11-16T10:00:00.000Z",
   startedBy: "owner",
   stopping: false,
-  stoppingSince: null
+  stoppingSince: null,
+  unknown: null
 };
 const STOPPING = { ...RUNNING, stopping: true, stoppingSince: "2026-11-16T12:00:00.000Z" };
-const STOPPED = { lastStop: null, pid: null, running: false, startedAt: null, startedBy: null, stopping: false, stoppingSince: null };
+const STOPPED = {
+  lastStop: null,
+  leftover: null,
+  pid: null,
+  running: false,
+  startedAt: null,
+  startedBy: null,
+  stopping: false,
+  stoppingSince: null,
+  unknown: null
+};
 // Stopped by the dashboard, and what the stop took.
 const STOP_ENDED_AT = "2026-11-16T12:04:10.000Z";
 const stoppedBy = (how) => ({ ...STOPPED, lastStop: { at: STOP_ENDED_AT, how } });
@@ -1419,3 +1431,142 @@ test("stop on a server that keeps running without stopping is not called 'not ru
   assert.match(appElement.innerHTML, /status-inline--ok"><span class="icon">.*?<\/span>online/);
 });
 
+// Not known, and why; and what is left of a server whose first process has gone.
+const NOT_KNOWN_WHY = "servers/demo/.rippermoon is a link. The dashboard keeps this server's record and log there, and reads, writes and removes nothing through it as it is. Put a folder there, or remove what is there.";
+const NOT_KNOWN = { ...STOPPED, running: null, unknown: NOT_KNOWN_WHY };
+const leftOver = (count) => ({ ...RUNNING, leftover: { count } });
+
+test("a server is also shown as not known, or as exited with processes left, and neither as online", async () => {
+  const { describeLeftover, describeRunState } = await load(path.join(jsRoot, "format.js"));
+  const offline = { label: "offline", short: "down", stopping: false, tone: "idle" };
+  const online = { label: "online", short: "up", stopping: false, tone: "ok" };
+  const notKnown = { label: "not known", short: "unknown", stopping: false, tone: "warn", unknown: true };
+  const left = { label: "exited, with processes left", leftover: true, short: "left over", stopping: false, tone: "warn" };
+
+  assert.deepEqual(describeRunState(NOT_KNOWN), notKnown);
+  // Whatever else such an answer says.
+  assert.deepEqual(describeRunState({ ...RUNNING, unknown: "the record cannot be read" }), notKnown);
+  assert.deepEqual(describeRunState({ ...STOPPING, unknown: "the record cannot be read" }), notKnown);
+  // Only a reason in words says so.
+  for (const unknown of [null, undefined, "", true, 1, {}, ["a reason"]]) {
+    assert.deepEqual(describeRunState({ ...STOPPED, unknown }), offline, JSON.stringify(unknown));
+    assert.deepEqual(describeRunState({ ...RUNNING, unknown }), online, JSON.stringify(unknown));
+  }
+
+  assert.deepEqual(describeRunState(leftOver(1)), left);
+  assert.deepEqual(describeRunState(leftOver(null)), left);
+  // A server that is stopping is stopping, with whatever is left of it.
+  assert.deepEqual(describeRunState({ ...STOPPING, leftover: { count: 2 } }), { label: "stopping…", short: "stopping", stopping: true, tone: "warn" });
+  // And one that is not running has nothing left over, whatever an answer says.
+  assert.deepEqual(describeRunState({ ...STOPPED, leftover: { count: 2 } }), offline);
+
+  assert.deepEqual(describeLeftover(leftOver(1)), { are: "is", some: "1 process", them: "it", they: "it" });
+  assert.deepEqual(describeLeftover(leftOver(3)), { are: "are", some: "3 processes", them: "them", they: "they" });
+  // A count that is not one is not passed on.
+  for (const count of [null, undefined, 0, -1, 1.5, "2", '<b onclick="alert(1)">', {}]) {
+    assert.deepEqual(describeLeftover(leftOver(count)), { are: "are", some: "processes", them: "them", they: "they" }, JSON.stringify(count));
+  }
+});
+
+test("a server whose state is not known shows the reason and nothing else of itself, and can still be asked to start and stop", async (t) => {
+  const state = await withServerOnPage(t, NOT_KNOWN);
+  // Whatever the page would start a timer for is kept, not started.
+  const intervals = captureIntervals(t);
+  const { handleAppClick } = await load(path.join(jsRoot, "actions", "click.js"));
+  const { renderServerContent } = await load(path.join(jsRoot, "views", "server.js"));
+  const { renderServerTree } = await load(path.join(jsRoot, "views", "nav.js"));
+  const { anyServerStopping } = await load(path.join(jsRoot, "stopping-live.js"));
+
+  for (const section of ["overview", "settings", "worlds", "mods", "logs"]) {
+    state.serverSection = section;
+    const page = renderServerContent();
+    assert.match(page, /<span class="status-inline status-inline--warn"><span class="icon">.*?<\/span>not known<\/span>/, section);
+    assert.ok(page.includes(`<strong>${NOT_KNOWN_WHY.replace(/'/g, "&#39;")}</strong>`), section);
+    assert.ok(page.includes("the dashboard cannot tell whether this server is running."), section);
+    // None of the sections is drawn: none of what they show was read.
+    assert.equal(/data-form=|current server state|minecraft startup requirement/.test(page), false, section);
+    // Start and Stop are there to be pressed: the dashboard answers with the reason.
+    assert.equal(page.includes('data-action="start-server">'), true, section);
+    assert.equal(page.includes('data-action="stop-server">'), true, section);
+  }
+  assert.match(renderServerTree(), /<span class="tree-meta">unknown<\/span>/);
+  assert.equal(anyServerStopping(), false);
+
+  // The reason is text, whatever is in it.
+  state.serverSnapshot = snapshotOf({ ...NOT_KNOWN, unknown: '<img src=x onerror="alert(1)">' });
+  const odd = renderServerContent();
+  assert.equal(odd.includes("<img"), false);
+  assert.ok(odd.includes("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;"));
+
+  // Pressed, each is answered by the dashboard with the reason, and that is what the page says.
+  state.serverSnapshot = snapshotOf(NOT_KNOWN);
+  state.serverSection = "overview";
+  const previousFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+  });
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push(`${options.method} ${url}`);
+    return { headers: { get: () => "application/json" }, json: async () => ({ error: NOT_KNOWN_WHY }), ok: false, status: 409 };
+  };
+  for (const action of ["stop-server", "start-server"]) {
+    await handleAppClick({ target: { closest: (selector) => (selector === "[data-action]" ? { dataset: { action } } : null) } });
+    assert.deepEqual(state.notice, { message: NOT_KNOWN_WHY, type: "error" }, action);
+  }
+  assert.deepEqual(calls, ["POST /api/servers/demo/stop", "POST /api/servers/demo/start"]);
+  // Nothing is watched for it: there is no stop to wait for, and no log to follow.
+  assert.deepEqual(intervals.filter((interval) => !interval.cleared), []);
+});
+
+test("a server that has exited with processes left says so, holds Start, and offers Stop to end them", async (t) => {
+  const state = await withServerOnPage(t, leftOver(1));
+  const { renderServerContent } = await load(path.join(jsRoot, "views", "server.js"));
+  const { renderServerTree } = await load(path.join(jsRoot, "views", "nav.js"));
+  const buttons = (markup) => (markup.match(/<button class="button[^>]*data-action="(?:start|stop|refresh)-server"[^>]*>/g) || []);
+  const show = (status) => {
+    state.serverSnapshot = snapshotOf(status);
+    state.servers = [{ id: "demo", name: "Demo", status }];
+    return { page: renderServerContent(), tree: renderServerTree() };
+  };
+
+  const one = show(leftOver(1));
+  assert.match(one.page, /<span class="status-inline status-inline--warn"><span class="icon">.*?<\/span>exited, with processes left<\/span>/);
+  assert.deepEqual(buttons(one.page), [
+    '<button class="button button--primary" data-action="start-server" disabled title="stop this server first: processes from its last run are still there">',
+    '<button class="button button--quiet" data-action="stop-server">',
+    '<button class="button button--quiet" data-action="refresh-server">'
+  ]);
+  assert.ok(
+    one.page.includes(
+      '<p class="notice notice--error">the process this server was started as has exited, and 1 process that it started is still running: something its start script started beside the server, or the server itself behind a start script that has gone. it may be using the world, so the server still counts as running. stop ends it, and the server cannot be started again before that.</p>'
+    )
+  );
+  assert.match(one.page, /<strong>exited, with processes left<\/strong>/);
+  assert.match(one.tree, /<span class="tree-meta">left over<\/span>/);
+
+  const several = show(leftOver(3));
+  assert.ok(several.page.includes("and 3 processes that it started are still running:"));
+  assert.ok(several.page.includes("they may be using the world, so the server still counts as running. stop ends them,"));
+  // Where they could not be counted, no number is given.
+  const uncounted = show(leftOver(null));
+  assert.ok(uncounted.page.includes("and processes that it started are still running:"));
+
+  // An ordinary running server has none of it.
+  const online = show(RUNNING);
+  assert.equal(online.page.includes("was started as has exited"), false);
+  assert.equal(online.page.includes("disabled"), false);
+
+  // Someone who may not start or stop it has no buttons to hold.
+  state.serverSnapshot = snapshotOf(leftOver(1), { canControlRuntime: false });
+  assert.deepEqual(buttons(renderServerContent()), ['<button class="button button--quiet" data-action="refresh-server">']);
+});
+
+test("a stop that ends with the server's state no longer known is said as an error, and not as stopped", async (t) => {
+  const { answer, state, tick } = await withStoppingServer(t);
+  answer.status = NOT_KNOWN;
+  await tick();
+  assert.deepEqual(state.notice, { message: "it is no longer known whether Demo is running: see its page", type: "error" });
+  assert.match(appElement.innerHTML, /status-inline--warn"><span class="icon">.*?<\/span>not known/);
+  assert.equal(appElement.innerHTML.includes("Demo stopped"), false);
+});

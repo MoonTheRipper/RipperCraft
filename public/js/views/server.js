@@ -51,6 +51,32 @@ export function renderLockedServerAccess(snapshot) {
   `;
 }
 
+// The page of a server the dashboard cannot tell the state of: why, and what
+// that means. Nothing else of the server is shown, because nothing else of
+// it was read: half of a server's page comes out of the folder that is, as
+// a rule, the reason.
+export function renderStateNotKnown(snapshot) {
+  const { server } = snapshot;
+  return renderSection(
+    "server",
+    "state not known",
+    `
+      <p class="notice notice--error">the dashboard cannot tell whether this server is running. until it can it will not start it, stop it, or change anything in its folder.</p>
+      <div class="meta-list">
+        <div class="meta-row">
+          <span>why</span>
+          <strong>${escapeHtml(server.status.unknown)}</strong>
+        </div>
+        <div class="meta-row">
+          <span>directory</span>
+          <strong><code>${escapeHtml(server.directory)}</code></strong>
+        </div>
+      </div>
+      <p class="muted">put that right on the machine the dashboard runs on, then press refresh. the other servers are not affected.</p>
+    `
+  );
+}
+
 export function renderServerContent() {
   if (!state.serverSnapshot) {
     return `
@@ -70,16 +96,20 @@ export function renderServerContent() {
   // While a server is stopping there is nothing for either button to do: it
   // cannot be started before it has gone, and it has been told to stop once.
   const held = runState.stopping ? ' disabled title="this server is stopping"' : "";
+  // And what is left of its last run has to be stopped before it is started.
+  const startHeld = runState.leftover ? ' disabled title="stop this server first: processes from its last run are still there"' : held;
   const actions = `
     <span class="status-inline status-inline--${runState.tone}">${icon("server")}${runState.label}</span>
     <span class="status-inline ${unlocked ? "status-inline--ok" : "status-inline--idle"}">${icon("unlock")}${unlocked ? "unlocked" : "locked"}</span>
-    ${permissions.canControlRuntime ? `<button class="button button--primary" data-action="start-server"${held}>${labelWithIcon("start", "start")}</button>` : ""}
+    ${permissions.canControlRuntime ? `<button class="button button--primary" data-action="start-server"${startHeld}>${labelWithIcon("start", "start")}</button>` : ""}
     ${permissions.canControlRuntime ? `<button class="button button--quiet" data-action="stop-server"${held}>${labelWithIcon("stop", "stop")}</button>` : ""}
     <button class="button button--quiet" data-action="refresh-server">${labelWithIcon("refresh", "refresh")}</button>
   `;
 
   let body = "";
-  if (permissions.requiresUnlock) {
+  if (runState.unknown) {
+    body = renderStateNotKnown(state.serverSnapshot);
+  } else if (permissions.requiresUnlock) {
     body = renderLockedServerAccess(state.serverSnapshot);
   } else if (state.serverSection === "settings") {
     body = renderSettingsSection(state.serverSnapshot);

@@ -150,23 +150,54 @@ function panelResponses() {
     // A real one would take a server that is slow to stop.
     stoppingStatus: {
       lastStop: null,
+      leftover: null,
       pid: 4242,
       running: true,
       startedAt: "2026-11-16T10:00:00.000Z",
       startedBy: "owner",
       stopping: true,
-      stoppingSince: "2026-11-16T12:00:00.000Z"
+      stoppingSince: "2026-11-16T12:00:00.000Z",
+      unknown: null
+    },
+    // Of one whose first process has exited, with two that it started still
+    // there. A real one would take a start script that leaves something
+    // running, and a server that goes by itself.
+    leftoverStatus: {
+      lastStop: null,
+      leftover: { count: 2 },
+      pid: 4242,
+      running: true,
+      startedAt: "2026-11-16T10:00:00.000Z",
+      startedBy: "owner",
+      stopping: false,
+      stoppingSince: null,
+      unknown: null
+    },
+    // And of one the dashboard cannot tell the state of. A real one would
+    // take a folder that is not as the dashboard left it.
+    unknownStatus: {
+      lastStop: null,
+      leftover: null,
+      pid: null,
+      running: null,
+      startedAt: null,
+      startedBy: null,
+      stopping: false,
+      stoppingSince: null,
+      unknown: "servers/example/.rippermoon is a link. The dashboard keeps this server's record and log there, and reads, writes and removes nothing through it as it is. Put a folder there, or remove what is there."
     },
     // And of one that did not go, and was killed. A real one would take a
     // server that ignores "stop" and SIGTERM for minutes.
     killedStatus: {
       lastStop: { at: "2026-11-16T12:04:10.000Z", how: "SIGKILL" },
+      leftover: null,
       pid: null,
       running: false,
       startedAt: null,
       startedBy: null,
       stopping: false,
-      stoppingSince: null
+      stoppingSince: null,
+      unknown: null
     },
     updatePlan: {
       addons: {
@@ -268,6 +299,13 @@ async function renderEverything(responses, role) {
     state.serverSnapshot = { ...atRest, server: { ...atRest.server, status: panels.killedStatus } };
     state.servers = responses.servers.map((server) => ({ ...server, status: panels.killedStatus }));
     pages.push(renderServerContent());
+    // With processes left over from a run whose first process has exited,
+    // and in a state the dashboard cannot tell.
+    for (const status of [panels.leftoverStatus, panels.unknownStatus]) {
+      state.serverSnapshot = { ...atRest, server: { ...atRest.server, status } };
+      state.servers = responses.servers.map((server) => ({ ...server, status }));
+      pages.push(renderServerContent(), renderSidebar("light"));
+    }
     state.serverSnapshot = atRest;
     state.servers = responses.servers;
 

@@ -208,6 +208,15 @@ test("the pages still draw what the server really sends", async (t) => {
   // One that had to be killed: its page says so, and when.
   assert.ok(page.includes('<p class="notice notice--error">this server did not stop when it was asked to, and was killed. the world may not have been saved: see its log before starting it again.</p>'));
   assert.ok(page.includes(`<strong>${new Date("2026-11-16T12:04:10.000Z").toLocaleString()} — killed. it did not stop when asked</strong>`));
+  // One whose first process has gone, with two it started still there.
+  assert.match(page, /<span class="status-inline status-inline--warn"><span class="icon">.*?<\/span>exited, with processes left<\/span>/);
+  assert.ok(page.includes("the process this server was started as has exited, and 2 processes that it started are still running:"));
+  assert.match(page, /<button class="button button--primary" data-action="start-server" disabled title="stop this server first: processes from its last run are still there">/);
+  assert.match(page, /<span class="tree-meta">left over<\/span>/);
+  // And one whose state is not known: the reason, and none of its sections.
+  assert.match(page, /<span class="status-inline status-inline--warn"><span class="icon">.*?<\/span>not known<\/span>/);
+  assert.ok(page.includes("<strong>servers/example/.rippermoon is a link. The dashboard keeps this server&#39;s record and log there"));
+  assert.match(page, /<span class="tree-meta">unknown<\/span>/);
   // And one that is not, which is every other drawing of it here.
   assert.match(page, /<button class="button button--primary" data-action="start-server">/);
   assert.match(page, /<span class="tree-meta">down<\/span>/);
