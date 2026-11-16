@@ -27,11 +27,13 @@ const {
   nowIso,
   readEnv,
   readJson,
+  readRegularFile,
   runCommand,
   safeFilename,
   sleep,
   tailTextFile,
   withinParent,
+  writeFileAtomic,
   writeJson
 } = require("./utils");
 const {
@@ -945,6 +947,8 @@ function createServerManager(store, options = {}) {
   }
 
   const fromRoot = (target) => path.relative(store.rootDir, target);
+  // The files of servers last found not to be files. See readServerFile().
+  const notFilesReported = new Set();
 
   // Whether a server has the folder the dashboard keeps its record and its
   // log in, .rippermoon in the server's own folder.
@@ -1133,18 +1137,62 @@ function createServerManager(store, options = {}) {
     }
   }
 
-  // Written beside its final name and moved into place, so that whatever is
-  // at that name - a link a mod left there, say - is replaced and never
-  // written through.
-  async function writePidFile(pidFile, info) {
-    const temporaryPath = `${pidFile}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
+  // Reads one of a server's own files whole: its settings, its EULA. Without
+  // waiting, and only a regular file - see readRegularFile() in utils.js.
+  //
+  // null for a file that is not there. What is there and is not a file - a
+  // named pipe, a folder - counts as not there as well: it holds nothing to
+  // read and nothing to lose, and the page these are read for is the one with
+  // the Stop button on it, so it has to load. The dashboard's log says so,
+  // once for as long as it stays that way: one page reads server.properties
+  // five times. Writing the file from the page puts a real one in its place.
+  async function readServerFile(target) {
     try {
-      await fsp.writeFile(temporaryPath, `${JSON.stringify(info, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
-      await fsp.rename(temporaryPath, pidFile);
+      const contents = await readRegularFile(target);
+      notFilesReported.delete(target);
+      return contents;
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        notFilesReported.delete(target);
+        return null;
+      }
+      if (error.code === "ERR_NOT_A_FILE") {
+        if (!notFilesReported.has(target)) {
+          notFilesReported.add(target);
+          logger.warn("Something that is not a file is where a server's file belongs: read as if there were none", {
+            file: fromRoot(target)
+          });
+        }
+        return null;
+      }
+      if (error.code === "ERR_FILE_TOO_LARGE") {
+        throw userFacingError(error.message.replace(target, fromRoot(target)));
+      }
+      throw error;
+    }
+  }
+
+  // Puts one of the dashboard's own files in a server's folder - its record,
+  // its launch script - by writing it beside its name and moving it into
+  // place. Whatever is at that name is replaced: a link is not written
+  // through, and a named pipe, which would hold a plain write until something
+  // read from it, is not waited on.
+  async function replaceFile(target, contents, mode) {
+    const temporaryPath = `${target}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
+    try {
+      await fsp.writeFile(temporaryPath, contents, { encoding: "utf8", flag: "wx" });
+      if (mode !== undefined) {
+        await fsp.chmod(temporaryPath, mode);
+      }
+      await fsp.rename(temporaryPath, target);
     } catch (error) {
       await fsp.rm(temporaryPath, { force: true }).catch(() => {});
       throw error;
     }
+  }
+
+  async function writePidFile(pidFile, info) {
+    await replaceFile(pidFile, `${JSON.stringify(info, null, 2)}\n`);
   }
 
   // Whether a process is there and this account's to signal. Only ever asked
@@ -1514,14 +1562,8 @@ function createServerManager(store, options = {}) {
       throw new Error("Server not found.");
     }
     const paths = resolveRecordPaths(server);
-    try {
-      return await fsp.readFile(paths.propertiesFile, "utf8");
-    } catch (error) {
-      if (error.code === "ENOENT") {
-        return "";
-      }
-      throw error;
-    }
+    const contents = await readServerFile(paths.propertiesFile);
+    return contents === null ? "" : contents;
   }
 
   async function readEulaStatus(serverId) {
@@ -1530,15 +1572,8 @@ function createServerManager(store, options = {}) {
       throw new Error("Server not found.");
     }
     const paths = resolveRecordPaths(server);
-    try {
-      const contents = await fsp.readFile(paths.eulaFile, "utf8");
-      return /^eula\s*=\s*true\b/im.test(contents);
-    } catch (error) {
-      if (error.code === "ENOENT") {
-        return false;
-      }
-      throw error;
-    }
+    const contents = await readServerFile(paths.eulaFile);
+    return contents !== null && /^eula\s*=\s*true\b/im.test(contents);
   }
 
   async function writeEulaStatus(serverId, accepted) {
@@ -1547,7 +1582,9 @@ function createServerManager(store, options = {}) {
       throw new Error("Server not found.");
     }
     const paths = resolveRecordPaths(server);
-    await fsp.writeFile(paths.eulaFile, `eula=${accepted ? "true" : "false"}\n`, "utf8");
+    // Replaced in one step, not opened where it lies: a named pipe at this
+    // name would hold a plain write until something read from it.
+    await writeFileAtomic(paths.eulaFile, `eula=${accepted ? "true" : "false"}\n`);
     return await readEulaStatus(serverId);
   }
 
@@ -1557,7 +1594,8 @@ function createServerManager(store, options = {}) {
       throw new Error("Server not found.");
     }
     const paths = resolveRecordPaths(server);
-    await fsp.writeFile(paths.propertiesFile, contents, "utf8");
+    // As for eula.txt: replaced, and never waited on.
+    await writeFileAtomic(paths.propertiesFile, contents);
   }
 
   async function readSafeAdminProperties(serverId) {
@@ -2695,6 +2733,8 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     const paths = resolveRecordPaths(server);
     await ensureDir(paths.serverDir);
     await ensureDir(paths.runtimeDir);
+    // The launch script goes in there, and is not written through a link.
+    await runtimeDirIsThere(paths);
     await ensureDir(paths.modsDir);
     await ensureDir(paths.backupsDir);
     await ensureDir(path.dirname(paths.logFile));
@@ -2707,8 +2747,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       await fsp.writeFile(paths.propertiesFile, initialPropertiesText(server.name, server.id), "utf8");
     }
 
-    await fsp.writeFile(paths.managedLaunchScript, getManagedLaunchScriptContents(server), "utf8");
-    await fsp.chmod(paths.managedLaunchScript, 0o755);
+    await replaceFile(paths.managedLaunchScript, getManagedLaunchScriptContents(server), 0o755);
 
     let repairedRuntime = false;
     const runtimeArtifact = managedRuntimeArtifactPath(server, paths);
@@ -2731,12 +2770,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
         await setServerMetadata(serverId, {
           managedRuntime: { ...runtime, updatedAt: nowIso() }
         });
-        await fsp.writeFile(
-          paths.managedLaunchScript,
-          buildLaunchScript(server.minMemory, server.maxMemory, runtime.launch),
-          "utf8"
-        );
-        await fsp.chmod(paths.managedLaunchScript, 0o755);
+        await replaceFile(paths.managedLaunchScript, buildLaunchScript(server.minMemory, server.maxMemory, runtime.launch), 0o755);
         return {
           managed: true,
           repairedRuntime: true,
@@ -2890,12 +2924,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       managedRuntime = runtime;
       reportProgress("writing launch script");
       const launchScriptPath = path.join(serverDir, ".rippermoon", "launch-server.sh");
-      await fsp.writeFile(
-        launchScriptPath,
-        buildLaunchScript(details.minMemory, details.maxMemory, runtime.launch),
-        "utf8"
-      );
-      await fsp.chmod(launchScriptPath, 0o755);
+      await replaceFile(launchScriptPath, buildLaunchScript(details.minMemory, details.maxMemory, runtime.launch), 0o755);
     }
 
     if (!minecraftVersion) {
@@ -3345,10 +3374,17 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     const spawnDirectly = shouldSpawnDirectly(command);
     const directCommandPath = spawnDirectly ? path.resolve(paths.serverDir, command) : null;
 
-    if (spawnDirectly && !(await exists(directCommandPath))) {
-      const message = buildStartFailureMessage(server, command, { code: "ENOENT" }, directCommandPath);
-      await appendRuntimeLog(paths, `[${nowIso()}] Start failed: ${message}\n`);
-      throw userFacingError(message);
+    if (spawnDirectly) {
+      // What is run has to be a file. Looked at here, where it can be said
+      // plainly, and not left to the attempt to run it.
+      const found = await fsp.stat(directCommandPath).catch(() => null);
+      if (!found || !found.isFile()) {
+        const message = found
+          ? `Unable to start ${server.name}. The launch command at ${fromRoot(directCommandPath)} is not a file.`
+          : buildStartFailureMessage(server, command, { code: "ENOENT" }, directCommandPath);
+        await appendRuntimeLog(paths, `[${nowIso()}] Start failed: ${message}\n`);
+        throw userFacingError(message);
+      }
     }
 
     const launched = await takeTurn(lifecycleTurns, serverId, () =>
@@ -4069,12 +4105,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       });
       // The argfile path embeds the loader version, so the launch script has to
       // be rewritten alongside the runtime it points at.
-      await fsp.writeFile(
-        paths.managedLaunchScript,
-        buildLaunchScript(server.minMemory, server.maxMemory, runtime.launch),
-        "utf8"
-      );
-      await fsp.chmod(paths.managedLaunchScript, 0o755);
+      await replaceFile(paths.managedLaunchScript, buildLaunchScript(server.minMemory, server.maxMemory, runtime.launch), 0o755);
       await ensureManagedServerArtifacts(serverId, { repairRuntime: false });
 
       return {

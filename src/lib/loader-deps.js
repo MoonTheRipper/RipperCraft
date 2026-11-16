@@ -239,9 +239,16 @@ async function readBytes(handle, position, length) {
 // to read a 2KB manifest is not worth it - and shelling out to `unzip` would add
 // a runtime dependency the rest of the dashboard does not need.
 async function readJarEntries(jarPath, wantedEntries) {
-  const handle = await fsp.open(jarPath, "r");
+  // Without waiting, and only a regular file: the jars read here are in a
+  // server's folder, and a named pipe called server.jar would hold a plain
+  // open for ever. See readRegularFile() in utils.js.
+  const handle = await fsp.open(jarPath, fsp.constants.O_RDONLY | fsp.constants.O_NONBLOCK);
   try {
-    const { size } = await handle.stat();
+    const stats = await handle.stat();
+    if (!stats.isFile()) {
+      throw new Error("not a regular file");
+    }
+    const { size } = stats;
     if (size < 22) {
       return {};
     }

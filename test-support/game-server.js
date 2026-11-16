@@ -228,8 +228,17 @@ async function createServerRoot(t, behaviour = {}) {
         // Gone in the meantime.
       }
     }
+    // Whatever is still waiting on a pipe is let go, and again for as long as
+    // the clearing up takes: a reader that has been let go of one pipe may
+    // go straight on to wait on the next, and the removal below needs one of
+    // the threads they hold.
     releasePipesUnder(root);
-    await fsp.rm(root, { force: true, maxRetries: 10, recursive: true, retryDelay: 50 });
+    const releasing = setInterval(() => releasePipesUnder(root), 50);
+    try {
+      await fsp.rm(root, { force: true, maxRetries: 10, recursive: true, retryDelay: 50 });
+    } finally {
+      clearInterval(releasing);
+    }
   });
   return layout;
 }
