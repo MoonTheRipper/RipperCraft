@@ -11,6 +11,8 @@ const {
   isAlive,
   isThere,
   plantPipe,
+  procStarted,
+  recordFor,
   sleep,
   startFromAnotherProcess,
   unlessItHangs,
@@ -61,7 +63,14 @@ test("a server the dashboard started is stopped through its console, and nothing
   assert.equal(consoleStats.mode & 0o777, 0o600);
   assert.equal(fs.lstatSync(server.consolesDir).isDirectory(), true);
   assert.equal(fs.lstatSync(server.consolesDir).mode & 0o777, 0o700);
-  assert.deepEqual(server.pidInfo(), { console: "fifo", group: true, pid: started.pid, startedAt: started.startedAt, startedBy: "owner" });
+  assert.deepEqual(server.pidInfo(), recordFor(started.pid, started.startedAt, { console: "fifo" }));
+  // Where /proc can say, the record holds what tells this process from any
+  // other that is ever given its pid.
+  if (procStarted(started.pid) !== null) {
+    assert.deepEqual(Object.keys(server.pidInfo()).sort(), ["boot", "console", "group", "pid", "started", "startedAt", "startedBy"]);
+    assert.match(server.pidInfo().boot, /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+    assert.equal(Number.isSafeInteger(server.pidInfo().started), true);
+  }
   assert.equal(fs.lstatSync(server.pidFile).isFile(), true);
   // The dashboard holds neither the console nor the log open: nothing of the
   // server depends on this process staying alive.
@@ -486,7 +495,7 @@ for (const situation of NO_PIPE) {
     assert.equal(started.running, true);
     assert.equal(started.pid, pid);
     // Nothing on record about a console, and no pipe in the folder.
-    assert.deepEqual(server.pidInfo(), { group: true, pid, startedAt: started.startedAt, startedBy: "owner" });
+    assert.deepEqual(server.pidInfo(), recordFor(pid, started.startedAt));
     if (isThere(server.consoleFile)) {
       assert.equal(fs.lstatSync(server.consoleFile).isDirectory(), true);
       assert.equal(fs.readFileSync(path.join(server.consoleFile, "kept.txt"), "utf8"), "kept\n");

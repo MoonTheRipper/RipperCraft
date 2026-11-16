@@ -120,6 +120,68 @@ const DEFAULT_STOP_WAITS = Object.freeze({
   poll: 1_000
 });
 
+// What the kernel calls one run of the machine, from start to shutdown.
+const BOOT_ID = /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+
+// The three things below ask /proc, where there is one. They read at once, in
+// the thread that asks: /proc never waits on a disk, and these must not wait
+// for the handful of threads every other file operation shares. Each answers
+// null where /proc cannot say: on a system that has none, for a process that
+// has gone, and for one this process is not allowed to look at.
+
+// The run of the machine this process is in.
+function readBootId() {
+  try {
+    const id = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    return BOOT_ID.test(id) ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+// A process's group, its session, and when it was started, in the kernel's
+// ticks since the machine was. The line is "pid (name) state ppid pgrp
+// session ...", and a name can hold anything, a ")" included, so the fields
+// are counted from the last one.
+function readProcStat(pid) {
+  let fields;
+  try {
+    const line = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    fields = line.slice(line.lastIndexOf(")") + 2).split(" ");
+  } catch {
+    return null;
+  }
+  const [group, session, started] = [fields[2], fields[3], fields[19]].map(Number);
+  return [group, session, started].every(Number.isSafeInteger) ? { group, session, started } : null;
+}
+
+// The folder a process is running in.
+function readProcCwd(pid) {
+  try {
+    return fs.readlinkSync(`/proc/${pid}/cwd`);
+  } catch {
+    return null;
+  }
+}
+
+// The processes of a group, each with the above. null with no /proc to list.
+function readProcGroup(pgid) {
+  let names;
+  try {
+    names = fs.readdirSync("/proc");
+  } catch {
+    return null;
+  }
+  const members = [];
+  for (const name of names) {
+    const stat = /^\d+$/.test(name) ? readProcStat(Number(name)) : null;
+    if (stat && stat.group === pgid) {
+      members.push({ ...stat, cwd: readProcCwd(Number(name)) });
+    }
+  }
+  return members;
+}
+
 // What pid.json holds, as far as it can be believed. The file is in the
 // server's own folder, where a mod can write anything: a pid that is not a
 // whole number in range is no pid, the dashboard's own is not a game server,
@@ -142,8 +204,13 @@ function parsePidInfo(text) {
     console: parsed.console === CONSOLE_PIPE ? CONSOLE_PIPE : null,
     // Only `true` says the pid is a process group's as well: a record from
     // before servers were started in a group of their own names one process.
+    // Which run of the machine the pid is from, and when in that run the
+    // process was started. A record without them, from before they were
+    // written, is believed without.
+    boot: typeof parsed.boot === "string" && BOOT_ID.test(parsed.boot) ? parsed.boot : null,
     group: parsed.group === true,
     pid,
+    started: Number.isSafeInteger(parsed.started) && parsed.started >= 0 ? parsed.started : null,
     startedAt: typeof parsed.startedAt === "string" ? parsed.startedAt : null,
     startedBy: typeof parsed.startedBy === "string" && parsed.startedBy ? parsed.startedBy : "unknown"
   };
@@ -201,6 +268,8 @@ function createServerManager(store, options = {}) {
   const stopWaits = Object.freeze({ ...DEFAULT_STOP_WAITS, ...(options.stopWaits || {}) });
   // The program that makes a named pipe: Node cannot make one itself.
   const mkfifoCommand = options.mkfifoCommand || "mkfifo";
+  // Which run of the machine this is. A pid means nothing in another one.
+  const bootId = readBootId();
   const serversRoot = path.join(store.rootDir, "servers");
   // The console pipes are kept together in a folder of the dashboard's own,
   // not in each server's folder. A pipe that a running server reads holds up
@@ -1141,6 +1210,60 @@ function createServerManager(store, options = {}) {
     }
   }
 
+  // Whether what a record names is still there, and is this server.
+  //
+  // A pid alone does not say. Copy a running server's folder and the copy's
+  // record names the original's process: the copy showed as running, and
+  // stopping it stopped the original. Restart the machine and the pid is
+  // some other program's. So, where /proc can answer:
+  //
+  //   - the record is from this run of the machine;
+  //   - the process was started when the record says it was;
+  //   - it is running in this server's folder, or under it.
+  //
+  // What fails one of these is not this server, and the record goes. What
+  // /proc cannot answer - there is none, or the process is one this
+  // dashboard may signal and not look at - is believed as before, on the pid.
+  //
+  // A group whose leader has exited has no process under the recorded pid to
+  // ask about. Then its members are asked instead: one of them has to be in
+  // the session the leader made, no older than the leader, and in this
+  // server's folder.
+  async function examineRecorded(info, paths) {
+    if (info.boot && bootId && info.boot !== bootId) {
+      return { gone: true, running: false, why: "it is from before this machine was last started" };
+    }
+    const leaderAlive = isProcessAlive(info.pid);
+    if (!leaderAlive && !(info.group && isGroupAlive(info.pid))) {
+      return { gone: true, running: false, why: "its process has gone" };
+    }
+    const home = await fsp.realpath(paths.serverDir).catch(() => null);
+    const inItsFolder = (cwd) => cwd === null || home === null || cwd === home || cwd.startsWith(`${home}${path.sep}`);
+
+    if (leaderAlive) {
+      const stat = readProcStat(info.pid);
+      if (stat && info.started !== null && stat.started !== info.started) {
+        return { gone: false, running: false, why: `pid ${info.pid} is another process now, started at another time` };
+      }
+      const cwd = readProcCwd(info.pid);
+      if (!inItsFolder(cwd)) {
+        return { gone: false, running: false, why: `pid ${info.pid} is a process running in ${cwd}, not in this server's folder` };
+      }
+      return { running: true };
+    }
+
+    const members = readProcGroup(info.pid);
+    if (!members || !members.length) {
+      return { running: true };
+    }
+    const itsOwn = members.some(
+      (member) => member.session === info.pid && (info.started === null || member.started >= info.started) && inItsFolder(member.cwd)
+    );
+    return itsOwn
+      ? { running: true }
+      : { gone: false, running: false, why: `process group ${info.pid} is not this server's: nothing in it runs in this server's folder` };
+  }
+
   // The server this process started itself, while it runs. The child is the
   // truth about it. pid.json is for the dashboard process that comes after
   // this one, and sits where a mod can rewrite it.
@@ -1162,14 +1285,16 @@ function createServerManager(store, options = {}) {
     if (!server) {
       return { process: null, stale: null };
     }
-    const recorded = await readPidFile(resolveRecordPaths(server));
+    const paths = resolveRecordPaths(server);
+    const recorded = await readPidFile(paths);
     if (!recorded.exists) {
       return { process: null, stale: null };
     }
-    if (recorded.info && isServerAlive(recorded.info)) {
-      return { process: { ...recorded.info, child: null }, stale: null };
+    if (!recorded.info) {
+      return { process: null, stale: recorded.why };
     }
-    return { process: null, stale: recorded.info ? "its process has gone" : recorded.why };
+    const state = await examineRecorded(recorded.info, paths);
+    return state.running ? { process: { ...recorded.info, child: null }, stale: null } : { process: null, stale: state.why };
   }
 
   // Removes the record and the console of a server that is no longer running.
@@ -1183,7 +1308,8 @@ function createServerManager(store, options = {}) {
       return;
     }
     const recorded = await readPidFile(paths);
-    if (recorded.info && isServerAlive(recorded.info)) {
+    const state = recorded.info ? await examineRecorded(recorded.info, paths) : null;
+    if (state && state.running) {
       return;
     }
     await removeConsolePipe(paths.consoleFile);
@@ -1199,6 +1325,14 @@ function createServerManager(store, options = {}) {
       logger.warn("Removed a server's pid file that could not be a record", {
         file: fromRoot(paths.pidFile),
         reason: recorded.why,
+        serverId
+      });
+    } else if (!state.gone) {
+      // A record, of something that is running and is not this server.
+      logger.warn("Removed a server's record of a process that is not that server", {
+        file: fromRoot(paths.pidFile),
+        pid: recorded.info.pid,
+        reason: state.why,
         serverId
       });
     } else if (announce) {
@@ -3047,6 +3181,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       gone: false,
       group: true,
       pid: null,
+      started: null,
       startedAt: nowIso(),
       startedBy: actor.username,
       watch: null
@@ -3095,6 +3230,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
           });
       own.child = child;
       own.pid = child.pid;
+      own.started = (readProcStat(child.pid) || { started: null }).started;
       // Listened for before anything is awaited. Whether the process was made
       // is already known, and the event that says so comes on the next tick.
       outcome = new Promise((resolve) => {
@@ -3149,7 +3285,11 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
         startedAt: own.startedAt,
         startedBy: own.startedBy,
         ...(own.console === CONSOLE_PIPE ? { console: CONSOLE_PIPE } : {}),
-        group: true
+        group: true,
+        // What tells this process from another that is given its pid later:
+        // which run of the machine it is from, and when in it it was started.
+        ...(bootId ? { boot: bootId } : {}),
+        ...(own.started !== null ? { started: own.started } : {})
       });
     } catch (error) {
       // A server the next dashboard process cannot find would be shown as
@@ -3306,6 +3446,12 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       logger.info("Server stopped", { pid, serverId, waitedSeconds: waitedSeconds() });
     };
 
+    // A server this process did not start is known by its record alone, and
+    // minutes pass between one step and the next. What is about to be
+    // signalled is looked at again each time: by then the pid could be some
+    // other program's.
+    const stillThisServer = async () => Boolean(serverProcess.child) || (await examineRecorded(serverProcess, paths)).running;
+
     // A server on record without a console was started before the dashboard
     // kept one for its servers, or by a dashboard process that could not make
     // one and has since gone. A signal is all that reaches it.
@@ -3325,6 +3471,9 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
         return await stopped();
       }
 
+      if (!(await stillThisServer())) {
+        return await stopped();
+      }
       const waited = waitedSeconds();
       signalServer(serverProcess, "SIGTERM");
       logger.warn('Server did not exit after "stop" on its console: sent SIGTERM', {
@@ -3338,7 +3487,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
         return await stopped();
       }
     } else {
-      if (await waitForExit(serverProcess, 0)) {
+      if ((await waitForExit(serverProcess, 0)) || !(await stillThisServer())) {
         // It went while it was being asked.
         return await stopped();
       }
@@ -3356,6 +3505,9 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       }
     }
 
+    if (!(await stillThisServer())) {
+      return await stopped();
+    }
     const waited = waitedSeconds();
     signalServer(serverProcess, "SIGKILL");
     logger.warn("Server did not exit after SIGTERM: sent SIGKILL. The world may not have been saved.", {

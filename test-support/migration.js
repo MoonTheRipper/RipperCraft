@@ -420,9 +420,23 @@ exec '${real("id")}' "$@"
     const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
     children.push(child);
     gameServerPid = child.pid;
+    // The record as the dashboard writes it now. All the script takes from
+    // it is the pid, and the numbers after it must not be taken for one.
     await writeFile(
       path.join(checkout, "servers", "Demo", ".rippermoon", "pid.json"),
-      `${JSON.stringify({ pid: gameServerPid, startedBy: "owner" }, null, 2)}\n`
+      `${JSON.stringify(
+        {
+          pid: gameServerPid,
+          startedAt: "2026-11-16T09:00:00.000Z",
+          startedBy: "owner",
+          console: "fifo",
+          group: true,
+          boot: "0a1b2c3d-0000-4000-8000-000000000000",
+          started: 4194303
+        },
+        null,
+        2
+      )}\n`
     );
     await writeFile(path.join(root, "proc", String(gameServerPid), "cgroup"), `0::/system.slice/${OLD_UNIT}\n`);
     await writeFile(path.join(state, OLD_UNIT, "children"), `${gameServerPid}\n`);

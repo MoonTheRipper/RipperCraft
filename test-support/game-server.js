@@ -122,6 +122,38 @@ function isAlive(pid) {
   }
 }
 
+// When a process was started, as /proc counts it, and which run of the
+// machine this is. null where there is no /proc to ask.
+function procStarted(pid) {
+  try {
+    const line = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    return Number(line.slice(line.lastIndexOf(")") + 2).split(" ")[19]);
+  } catch {
+    return null;
+  }
+}
+
+function bootIdNow() {
+  try {
+    return fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+
+// What the dashboard writes down about a server it has just started, given
+// the pid and the time it reported.
+function recordFor(pid, startedAt, extra = {}) {
+  const record = { group: true, pid, startedAt, startedBy: OWNER.username, ...extra };
+  if (bootIdNow() !== null) {
+    record.boot = bootIdNow();
+  }
+  if (procStarted(pid) !== null) {
+    record.started = procStarted(pid);
+  }
+  return record;
+}
+
 // Whether anything is at a path - a link that leads nowhere included.
 function isThere(target) {
   try {
@@ -340,6 +372,7 @@ module.exports = {
   QUICK_WAITS,
   SERVER_ID,
   STOPPED,
+  bootIdNow,
   createManager,
   createServerRoot,
   describeServerDir,
@@ -347,6 +380,8 @@ module.exports = {
   isAlive,
   isThere,
   plantPipe,
+  procStarted,
+  recordFor,
   sleep,
   startFromAnotherProcess,
   startLegacyServer,
