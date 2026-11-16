@@ -414,7 +414,11 @@ test("a per-server java binary is validated and reaches the launched process", a
   const store = createStore(root);
   const serverManager = createServerManager(store);
 
+  // In this order: stopping a server asks the store about it, and a folder
+  // that was removed first is made again to answer. One was left in the
+  // temporary directory by every run.
   t.after(async () => {
+    await serverManager.stopServer("DemoServer").catch(() => {});
     await fsp.rm(root, { recursive: true, force: true });
   });
 
@@ -464,9 +468,6 @@ test("a per-server java binary is validated and reaches the launched process", a
   await fsp.chmod(probe, 0o755);
 
   await serverManager.startServer("DemoServer", owner);
-  t.after(async () => {
-    await serverManager.stopServer("DemoServer").catch(() => {});
-  });
 
   const expectedCapture = `${fakeJava}|${fakeJava}`;
   let captured = "";
