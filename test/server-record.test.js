@@ -455,7 +455,7 @@ test("a pid file is replaced when a server starts, never written through", async
   await server.whenReady();
   assert.equal(again.running, true);
   assert.equal(fs.lstatSync(server.pidFile).isFile(), true);
-  assert.deepEqual(server.pidInfo(), { console: "fifo", pid: again.pid, startedAt: again.startedAt, startedBy: "owner" });
+  assert.deepEqual(server.pidInfo(), { console: "fifo", group: true, pid: again.pid, startedAt: again.startedAt, startedBy: "owner" });
   assert.equal(fs.readFileSync(elsewhere, "utf8"), "nobody writes here\n");
   assert.deepEqual(fs.readdirSync(server.runtimeDir).sort(), ["pid.json", "runtime.log"]);
   assert.deepEqual(fs.readdirSync(server.consolesDir), [SERVER_ID]);

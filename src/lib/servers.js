@@ -140,6 +140,9 @@ function parsePidInfo(text) {
   }
   return {
     console: parsed.console === CONSOLE_PIPE ? CONSOLE_PIPE : null,
+    // Only `true` says the pid is a process group's as well: a record from
+    // before servers were started in a group of their own names one process.
+    group: parsed.group === true,
     pid,
     startedAt: typeof parsed.startedAt === "string" ? parsed.startedAt : null,
     startedBy: typeof parsed.startedBy === "string" && parsed.startedBy ? parsed.startedBy : "unknown"
@@ -1087,12 +1090,63 @@ function createServerManager(store, options = {}) {
     }
   }
 
+  // Whether a process group has anything in it that this account may signal.
+  // Only ever asked about a pid that parsePidInfo() let through, which is 2 or
+  // more: minus that is a group, never "every process" (-1) or "my own group"
+  // (0).
+  function isGroupAlive(pgid) {
+    try {
+      process.kill(-pgid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Whether a server is still running.
+  //
+  // A server is started as the leader of a process group of its own, and
+  // counts as running while anything is left in that group. The process the
+  // dashboard started need not be the server: a start script that does not
+  // end in `exec` stays as a shell with the server as its child, and when
+  // that shell was all the dashboard watched, a SIGTERM ended the shell, the
+  // server ran on, and the dashboard called it stopped and started a second
+  // one beside it.
+  //
+  // A server on record without a group - one started before this - is the
+  // one process its record names.
+  function isServerAlive(serverProcess) {
+    if (serverProcess.group) {
+      return isGroupAlive(serverProcess.pid);
+    }
+    if (serverProcess.child) {
+      return serverProcess.child.exitCode === null && serverProcess.child.signalCode === null;
+    }
+    return isProcessAlive(serverProcess.pid);
+  }
+
+  // Sends a signal to a server: to its whole group where it has one, so that
+  // a start script and the server behind it get it alike.
+  function signalServer(serverProcess, signal) {
+    try {
+      if (serverProcess.group) {
+        process.kill(-serverProcess.pid, signal);
+      } else if (serverProcess.child) {
+        serverProcess.child.kill(signal);
+      } else {
+        process.kill(serverProcess.pid, signal);
+      }
+    } catch {
+      // Gone already. The wait that follows sees that.
+    }
+  }
+
   // The server this process started itself, while it runs. The child is the
   // truth about it. pid.json is for the dashboard process that comes after
   // this one, and sits where a mod can rewrite it.
   function ownProcess(serverId) {
     const own = runningChildren.get(serverId);
-    return own && own.child.exitCode === null && own.child.signalCode === null ? own : null;
+    return own && isServerAlive(own) ? own : null;
   }
 
   // The process a server is running as: this dashboard's own child, or the one
@@ -1112,7 +1166,7 @@ function createServerManager(store, options = {}) {
     if (!recorded.exists) {
       return { process: null, stale: null };
     }
-    if (recorded.info && isProcessAlive(recorded.info.pid)) {
+    if (recorded.info && isServerAlive(recorded.info)) {
       return { process: { ...recorded.info, child: null }, stale: null };
     }
     return { process: null, stale: recorded.info ? "its process has gone" : recorded.why };
@@ -1129,7 +1183,7 @@ function createServerManager(store, options = {}) {
       return;
     }
     const recorded = await readPidFile(paths);
-    if (recorded.info && isProcessAlive(recorded.info.pid)) {
+    if (recorded.info && isServerAlive(recorded.info)) {
       return;
     }
     await removeConsolePipe(paths.consoleFile);
@@ -2890,22 +2944,55 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     }
   }
 
-  // A server this process started has exited. It is forgotten at once, so
-  // that nothing takes it for running, and cleared up after in its turn.
-  function onChildExit(serverId, own, paths, code, signal) {
+  // A server this process started has gone, all of it. It is forgotten at
+  // once, so that nothing takes it for running, and cleared up after in its
+  // turn. `line` is what its own log is told. Once only, however it is found
+  // out: by its exit, by the watch below, or by the stop that was waiting.
+  function onServerGone(serverId, own, paths, line) {
+    if (own.gone) {
+      return;
+    }
+    own.gone = true;
+    clearInterval(own.watch);
+    own.watch = null;
     if (runningChildren.get(serverId) === own) {
       runningChildren.delete(serverId);
     }
-    logger.info("Server process exited", { code, pid: own.pid, serverId, signal });
     takeTurn(lifecycleTurns, serverId, async () => {
-      await appendRuntimeLog(
-        paths,
-        `\n[${nowIso()}] ${code === null ? `Process was ended by ${signal}` : `Process exited with code ${code}`}\n`
-      );
+      await appendRuntimeLog(paths, `\n[${nowIso()}] ${line}\n`);
       await forgetServer(serverId, paths);
     }).catch((error) => {
       logger.error("Clearing up after a server that exited failed", { error: error.message, serverId, stack: error.stack });
     });
+  }
+
+  // The process this dashboard started for a server has exited.
+  //
+  // As a rule that is the server, and the end of it. But the process may have
+  // been a start script that left the server running as its child. Then
+  // others of its group are still there, the server still counts as running -
+  // it can be stopped, and is not started again - and the group is looked at
+  // until the last of it has gone.
+  function onLeaderExit(serverId, own, paths, code, signal) {
+    const how = code === null ? `Process was ended by ${signal}` : `Process exited with code ${code}`;
+    logger.info("Server process exited", { code, pid: own.pid, serverId, signal });
+    if (!isServerAlive(own)) {
+      onServerGone(serverId, own, paths, how);
+      return;
+    }
+    logger.warn("The process that started a server has exited, and others it started run on: the server counts as running", {
+      pid: own.pid,
+      serverId
+    });
+    appendRuntimeLog(
+      paths,
+      `\n[${nowIso()}] ${how}. Others it started are still running: the server counts as running until they have gone.\n`
+    );
+    own.watch = setInterval(() => {
+      if (!isServerAlive(own)) {
+        onServerGone(serverId, own, paths, "The last of the server's processes has gone");
+      }
+    }, stopWaits.poll);
   }
 
   // The launch itself, in the server's turn. Returns false when there was
@@ -2957,9 +3044,12 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     const own = {
       child: null,
       console: CONSOLE_STDIN,
+      gone: false,
+      group: true,
       pid: null,
       startedAt: nowIso(),
-      startedBy: actor.username
+      startedBy: actor.username,
+      watch: null
     };
     let consoleHandle = null;
     let outcome = null;
@@ -2984,14 +3074,22 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       }
 
       const stdio = [consoleHandle ? consoleHandle.fd : "pipe", logHandle.fd, logHandle.fd];
+      // `detached` makes the process the leader of a session and a process
+      // group of its own, with whatever it starts in that group too: the
+      // whole of a server can then be signalled, and told from everything
+      // else, by one number. It also means that Ctrl-C on a dashboard run
+      // from a terminal no longer reaches the game servers, which outlive it
+      // as they outlive a restart of the service.
       const child = directCommandPath
         ? spawn(directCommandPath, [], {
             cwd: paths.serverDir,
+            detached: true,
             env: childEnv,
             stdio
           })
         : spawn(shellCommand.command, [...shellCommand.args, command], {
             cwd: paths.serverDir,
+            detached: true,
             env: childEnv,
             stdio
           });
@@ -3003,7 +3101,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
         child.once("spawn", () => resolve(null));
         child.once("error", (error) => resolve(error));
       });
-      child.once("exit", (code, signal) => onChildExit(serverId, own, paths, code, signal));
+      child.once("exit", (code, signal) => onLeaderExit(serverId, own, paths, code, signal));
     } catch (error) {
       launchError = error;
     } finally {
@@ -3039,9 +3137,9 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       // exited fails, and must not take the dashboard with it.
       child.stdin.on("error", () => {});
     }
-    if (child.exitCode === null && child.signalCode === null) {
-      // Unless it has exited already: its exit was then heard a moment ago,
-      // and will not be heard again to take this record back out.
+    if (!own.gone) {
+      // Unless all of it has gone already: that was then found out a moment
+      // ago, and will not be found out again to take this record back out.
       runningChildren.set(serverId, own);
     }
 
@@ -3050,13 +3148,14 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
         pid: own.pid,
         startedAt: own.startedAt,
         startedBy: own.startedBy,
-        ...(own.console === CONSOLE_PIPE ? { console: CONSOLE_PIPE } : {})
+        ...(own.console === CONSOLE_PIPE ? { console: CONSOLE_PIPE } : {}),
+        group: true
       });
     } catch (error) {
       // A server the next dashboard process cannot find would be shown as
       // stopped while it runs, and be started a second time on the same
       // world. This one has only just begun, so it is ended instead.
-      child.kill("SIGKILL");
+      signalServer(own, "SIGKILL");
       const message = `Unable to start ${server.name}. Its process could not be recorded in ${path.relative(store.rootDir, paths.pidFile)} (${error.message}), so it was ended again.`;
       await appendRuntimeLog(paths, `[${nowIso()}] Start failed: ${message}\n`);
       throw userFacingError(message);
@@ -3139,51 +3238,43 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     });
   }
 
-  function sendSignal(serverProcess, signal) {
-    try {
-      if (serverProcess.child) {
-        serverProcess.child.kill(signal);
-      } else {
-        process.kill(serverProcess.pid, signal);
+  // Waits for a server to be gone, for at most `waitMs`, and says whether it
+  // is.
+  //
+  // A server this process started says when its own process has exited, and
+  // that is looked at at once. What has no such event - a server this process
+  // did not start, or the rest of a group whose leader has exited - is looked
+  // at again and again. Timers only, no clock: the wait is as long as the
+  // timer says.
+  function waitForExit(serverProcess, waitMs) {
+    return new Promise((resolve) => {
+      if (!isServerAlive(serverProcess)) {
+        resolve(true);
+        return;
       }
-    } catch {
-      // Gone already. The wait that follows sees that.
-    }
-  }
-
-  // Waits for a server's process to be gone, for at most `waitMs`. A server
-  // this process started says so itself, with its exit event. One it did not
-  // start has no event to wait for, so it is looked at again and again.
-  async function waitForExit(serverProcess, waitMs) {
-    const { child, pid } = serverProcess;
-    if (child) {
-      if (child.exitCode !== null || child.signalCode !== null) {
-        return true;
+      const { child } = serverProcess;
+      let again = null;
+      const finish = (gone) => {
+        clearTimeout(deadline);
+        clearInterval(again);
+        if (child) {
+          child.off("exit", look);
+        }
+        resolve(gone);
+      };
+      const look = () => {
+        if (!isServerAlive(serverProcess)) {
+          finish(true);
+        }
+      };
+      const deadline = setTimeout(() => finish(!isServerAlive(serverProcess)), waitMs);
+      if (child) {
+        child.once("exit", look);
       }
-      return await new Promise((resolve) => {
-        const onExit = () => {
-          clearTimeout(timer);
-          resolve(true);
-        };
-        const timer = setTimeout(() => {
-          child.off("exit", onExit);
-          resolve(false);
-        }, waitMs);
-        child.once("exit", onExit);
-      });
-    }
-
-    const deadline = performance.now() + waitMs;
-    for (;;) {
-      if (!isProcessAlive(pid)) {
-        return true;
+      if (!child || serverProcess.group) {
+        again = setInterval(look, stopWaits.poll);
       }
-      const left = deadline - performance.now();
-      if (left <= 0) {
-        return false;
-      }
-      await sleep(Math.min(stopWaits.poll, left));
-    }
+    });
   }
 
   // Stops a server, and takes its time over it.
@@ -3204,8 +3295,13 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     const note = (text) => appendRuntimeLog(paths, `[${nowIso()}] ${text}\n`);
     const by = actor && actor.username ? ` by ${actor.username}` : "";
     const stopped = async () => {
+      if (serverProcess.child) {
+        // This process started it. Its exit has said so already, unless the
+        // last of it to go was not the process that was started.
+        onServerGone(serverId, serverProcess, paths, "The last of the server's processes has gone");
+      }
       // The record of a server this process did not start is cleared here.
-      // One it did start has been cleared by its exit already, a turn ahead.
+      // One it did start is cleared a turn ahead of this.
       await takeTurn(lifecycleTurns, serverId, () => forgetServer(serverId, paths, { announce: true }));
       logger.info("Server stopped", { pid, serverId, waitedSeconds: waitedSeconds() });
     };
@@ -3230,7 +3326,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       }
 
       const waited = waitedSeconds();
-      sendSignal(serverProcess, "SIGTERM");
+      signalServer(serverProcess, "SIGTERM");
       logger.warn('Server did not exit after "stop" on its console: sent SIGTERM', {
         pid,
         server: server.name,
@@ -3246,7 +3342,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
         // It went while it was being asked.
         return await stopped();
       }
-      sendSignal(serverProcess, "SIGTERM");
+      signalServer(serverProcess, "SIGTERM");
       logger.warn('Server has no console the dashboard can reach: sent SIGTERM instead of "stop"', {
         pid,
         reason: asked.reason,
@@ -3261,7 +3357,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     }
 
     const waited = waitedSeconds();
-    sendSignal(serverProcess, "SIGKILL");
+    signalServer(serverProcess, "SIGKILL");
     logger.warn("Server did not exit after SIGTERM: sent SIGKILL. The world may not have been saved.", {
       pid,
       server: server.name,

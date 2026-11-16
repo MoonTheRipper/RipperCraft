@@ -61,7 +61,7 @@ test("a server the dashboard started is stopped through its console, and nothing
   assert.equal(consoleStats.mode & 0o777, 0o600);
   assert.equal(fs.lstatSync(server.consolesDir).isDirectory(), true);
   assert.equal(fs.lstatSync(server.consolesDir).mode & 0o777, 0o700);
-  assert.deepEqual(server.pidInfo(), { console: "fifo", pid: started.pid, startedAt: started.startedAt, startedBy: "owner" });
+  assert.deepEqual(server.pidInfo(), { console: "fifo", group: true, pid: started.pid, startedAt: started.startedAt, startedBy: "owner" });
   assert.equal(fs.lstatSync(server.pidFile).isFile(), true);
   // The dashboard holds neither the console nor the log open: nothing of the
   // server depends on this process staying alive.
@@ -486,7 +486,7 @@ for (const situation of NO_PIPE) {
     assert.equal(started.running, true);
     assert.equal(started.pid, pid);
     // Nothing on record about a console, and no pipe in the folder.
-    assert.deepEqual(server.pidInfo(), { pid, startedAt: started.startedAt, startedBy: "owner" });
+    assert.deepEqual(server.pidInfo(), { group: true, pid, startedAt: started.startedAt, startedBy: "owner" });
     if (isThere(server.consoleFile)) {
       assert.equal(fs.lstatSync(server.consoleFile).isDirectory(), true);
       assert.equal(fs.readFileSync(path.join(server.consoleFile, "kept.txt"), "utf8"), "kept\n");
