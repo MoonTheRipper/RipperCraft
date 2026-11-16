@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const {
+  DEFAULT_STOP_WAITS,
   OWNER,
   QUICK_WAITS,
   SERVER_ID,
@@ -33,7 +34,6 @@ function watchForUncaught(t) {
 // --- patience --------------------------------------------------------------------------------
 
 test("a dashboard that is told nothing else waits three minutes, then one, or four without a console", async (t) => {
-  const { DEFAULT_STOP_WAITS } = require("../src/lib/servers");
   // The numbers themselves. Every other test here shortens them, so nothing
   // else would notice if they went back to the 20 seconds that cost a world.
   assert.deepEqual({ ...DEFAULT_STOP_WAITS }, { console: 180_000, kill: 10_000, poll: 1_000, signalOnly: 240_000, term: 60_000 });

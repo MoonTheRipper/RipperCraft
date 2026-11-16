@@ -11,7 +11,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { execFileSync, spawn } = require("node:child_process");
 const { hashSecret, setHashCostForTests } = require("../src/lib/auth");
-const { createServerManager } = require("../src/lib/servers");
+const { DEFAULT_STOP_WAITS, createServerManager } = require("../src/lib/servers");
 const { createStore } = require("../src/lib/store");
 // Loaded for what it does on the way in: managers made here are given a
 // fetcher that connects to nothing.
@@ -377,6 +377,7 @@ function startLegacyServer(t, server) {
 }
 
 module.exports = {
+  DEFAULT_STOP_WAITS,
   OWNER,
   QUICK_WAITS,
   SERVER_ID,
