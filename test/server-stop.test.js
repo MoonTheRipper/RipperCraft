@@ -32,6 +32,29 @@ function watchForUncaught(t) {
 
 // --- patience --------------------------------------------------------------------------------
 
+test("a dashboard that is told nothing else waits three minutes, then one, or four without a console", async (t) => {
+  const { DEFAULT_STOP_WAITS } = require("../src/lib/servers");
+  // The numbers themselves. Every other test here shortens them, so nothing
+  // else would notice if they went back to the 20 seconds that cost a world.
+  assert.deepEqual({ ...DEFAULT_STOP_WAITS }, { console: 180_000, kill: 10_000, poll: 1_000, signalOnly: 240_000, term: 60_000 });
+  assert.equal(Object.isFrozen(DEFAULT_STOP_WAITS), true);
+
+  // A manager made the way the dashboard makes it, with no waits of its own, uses them.
+  const server = await createServerRoot(t);
+  const asDeployed = await createManager(server.root, { stopWaits: undefined });
+  assert.deepEqual(asDeployed.serverManager.stopWaits, DEFAULT_STOP_WAITS);
+  // A test's waits replace the ones it names and no others.
+  const shortened = await createManager(server.root, { stopWaits: { console: 5 } });
+  assert.deepEqual(shortened.serverManager.stopWaits, { ...DEFAULT_STOP_WAITS, console: 5 });
+  assert.equal(Object.isFrozen(asDeployed.serverManager.stopWaits), true);
+
+  // And the dashboard is told nothing: the program that starts it names no
+  // waits, and the app hands on only what it was given.
+  const source = (file) => fs.readFileSync(path.join(__dirname, "..", "src", file), "utf8");
+  assert.doesNotMatch(source("server.js"), /stopWaits/);
+  assert.deepEqual(source("app.js").match(/stopWaits[^\n]*/g), ["stopWaits shortens", "stopWaits: options.stopWaits"]);
+});
+
 test("a server that is slow to save is waited for, not signalled", async (t) => {
   const server = await createServerRoot(t, { onStop: "wait" });
   // Every other wait is far too short for this server; the one after "stop" is not.

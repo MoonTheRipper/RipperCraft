@@ -181,8 +181,9 @@ function createServerManager(store, options = {}) {
     warn() {}
   };
   // options.stopWaits shortens the waits, for tests that cannot spend four
-  // minutes on a server that will not stop.
-  const stopWaits = { ...DEFAULT_STOP_WAITS, ...(options.stopWaits || {}) };
+  // minutes on a server that will not stop. Nothing else sets it: a dashboard
+  // waits as long as DEFAULT_STOP_WAITS says.
+  const stopWaits = Object.freeze({ ...DEFAULT_STOP_WAITS, ...(options.stopWaits || {}) });
   // The program that makes a named pipe: Node cannot make one itself.
   const mkfifoCommand = options.mkfifoCommand || "mkfifo";
   const serversRoot = path.join(store.rootDir, "servers");
@@ -4023,6 +4024,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     requestStop,
     startServer,
     stopServer,
+    stopWaits,
     syncDiscoveredServers,
     userCanAccessServer,
     userCanCreateWorld,
@@ -4038,5 +4040,6 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
 }
 
 module.exports = {
+  DEFAULT_STOP_WAITS,
   createServerManager
 };
