@@ -408,6 +408,27 @@ test("a checkout that has never been run is given its data/ and servers/ folders
   assert.equal(machine.isActive(NEW_UNIT), true);
 });
 
+test("a data/ or servers/ that is a link to a folder somewhere else is refused", { skip }, async (t) => {
+  // What is in the two folders is found by walking them, and a walk does not go
+  // through a link: the backup would be of nothing, and the game server that
+  // is running would not be seen.
+  for (const folder of ["data", "servers"]) {
+    const machine = await createMachine(t);
+    const elsewhere = path.join(machine.base, `${folder}-on-another-disk`);
+    fs.renameSync(path.join(machine.checkout, folder), elsewhere);
+    fs.symlinkSync(elsewhere, path.join(machine.checkout, folder));
+
+    const result = machine.run();
+
+    assert.equal(result.status, 1, result.output);
+    assert.match(result.output, new RegExp(`PROBLEM: ${folder}/ is a link, to \\S+-on-another-disk\\. `));
+    assert.doesNotMatch(result.output, /which the service will be able to read but not change/);
+    assert.deepEqual(machine.systemctlCalls(), []);
+    assert.equal(machine.backupCount(), 0);
+    assert.equal(machine.head(), machine.oldCommit);
+  }
+});
+
 test("a first install listens where it is told, on this machine only by default", { skip }, async (t) => {
   const machine = await createMachine(t, { oldUnit: false });
   fs.mkdirSync(path.join(machine.state, NEW_UNIT), { recursive: true });

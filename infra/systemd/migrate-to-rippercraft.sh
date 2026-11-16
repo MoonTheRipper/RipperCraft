@@ -642,8 +642,23 @@ check_programs() {
   done <<<"$records"
 }
 
+# data/ and servers/ have to be folders in the checkout, not links to folders
+# kept somewhere else. What is in them is found by walking them, and a walk
+# does not go through a link: a data/ that is one would be backed up as
+# nothing at all, without a word, and a game server under a servers/ that is
+# one would not be seen and so not be watched.
+check_folders() {
+  local folder target
+  for folder in data servers; do
+    as_owner test -L "$CHECKOUT/$folder" || continue
+    target="$(as_owner readlink -f -- "$CHECKOUT/$folder" 2>/dev/null || true)"
+    problem "$folder/ is a link, to ${target:-nowhere}. It has to be a folder in the checkout itself. If it is kept on another disk, mount that there instead of linking to it."
+  done
+}
+
 # A link in servers/ or data/ that leads out of them leads to somewhere the
-# service sees differently: not at all, or read-only.
+# service sees differently: not at all, or read-only. The two folders
+# themselves are check_folders' business.
 check_links() {
   local link target
   while IFS= read -r -d '' link; do
@@ -658,7 +673,7 @@ check_links() {
     else
       note "note: $link points to $target, which the service will be able to read but not change."
     fi
-  done < <(as_owner find "$CHECKOUT/servers" "$CHECKOUT/data" -type l -print0 2>/dev/null || true)
+  done < <(as_owner find "$CHECKOUT/servers" "$CHECKOUT/data" -mindepth 1 -type l -print0 2>/dev/null || true)
 }
 
 # Only ordinary files in data/ are backed up and put back. Anything else there
@@ -1351,6 +1366,7 @@ preflight() {
   fi
 
   check_programs
+  check_folders
   check_links
   check_data_files
   check_groups

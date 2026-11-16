@@ -170,7 +170,7 @@ sudo infra/systemd/migrate-to-rippercraft.sh --check    # look; change nothing
 sudo infra/systemd/migrate-to-rippercraft.sh            # install and start
 ```
 
-The service runs as the account that owns the checkout, so clone it as the account the game servers should run as, not as root. It needs systemd, Node 24, Java and `zip`, and `git` and `curl` for the script. Java and `zip` have to be installed for the whole machine, not in a home directory; Node may be in one (nvm is fine).
+The service runs as the account that owns the checkout, so clone it as the account the game servers should run as, not as root. It needs systemd, Node 24, Java and `zip`, and `git` and `curl` for the script. Java and `zip` have to be installed for the whole machine, not in a home directory; Node may be in one (nvm is fine). `data/` and `servers/` have to be folders in the checkout itself, not links to folders kept somewhere else: if they are on another disk, mount it there.
 
 A service keeps every group its account is in. If the account is in `docker`, `lxd`, `incus` or `libvirt` on a machine where that service is installed, the script refuses: whoever can use such a socket is root, sandbox or no sandbox. Take the account out of the group, or give the dashboard an account of its own.
 
