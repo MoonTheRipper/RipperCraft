@@ -16,8 +16,10 @@ const {
   plantPipe,
   procStarted,
   recordFor,
+  settled,
   sleep,
   startLegacyServer,
+  stoppedBy,
   unlessItHangs,
   waitFor,
   whatArrived
@@ -121,9 +123,17 @@ test("a pid file that does not hold a game server's pid is never signalled", asy
   // above was of what the file held, not of the process it named.
   fs.writeFileSync(server.pidFile, believable);
   const found = await serverManager.getServerStatus(SERVER_ID);
-  assert.deepEqual(found, { pid: bystander.pid, running: true, startedAt: "2026-11-16T09:00:00.000Z", startedBy: "owner", stopping: false, stoppingSince: null });
+  assert.deepEqual(found, {
+    lastStop: null,
+    pid: bystander.pid,
+    running: true,
+    startedAt: "2026-11-16T09:00:00.000Z",
+    startedBy: "owner",
+    stopping: false,
+    stoppingSince: null
+  });
   assert.deepEqual(sent, [[bystander.pid, 0]]);
-  assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("SIGTERM"));
   assert.equal(bystander.signalCode, "SIGTERM");
   assert.equal(sent.some(([pid, signal]) => pid === bystander.pid && signal === "SIGTERM"), true);
   assert.equal(sent.every(([pid]) => pid === bystander.pid), true);
@@ -211,7 +221,7 @@ test("a pid file that cannot be read is left as it is, with the server and its c
 
   // Readable again, it is the same server as before, and stops as one.
   assert.equal((await manager.getServerStatus(SERVER_ID)).pid, pid);
-  assert.deepEqual(await manager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(settled(await manager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
   assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
 });
 
@@ -297,10 +307,11 @@ for (const who of ["the dashboard that started it", "a dashboard started later"]
     fs.unlinkSync(server.runtimeDir);
     fs.renameSync(`${server.runtimeDir}.real`, server.runtimeDir);
     if (own) {
-      assert.deepEqual(await manager.getServerStatus(SERVER_ID), STOPPED);
+      // The stop it could not report on had gone through, by the console.
+      assert.deepEqual(settled(await manager.getServerStatus(SERVER_ID)), stoppedBy("console"));
     } else {
       assert.equal((await manager.getServerStatus(SERVER_ID)).pid, pid);
-      assert.deepEqual(await manager.stopServer(SERVER_ID, OWNER), STOPPED);
+      assert.deepEqual(settled(await manager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
       assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
     }
     otherIsUntouched();
@@ -361,7 +372,7 @@ test("a server the dashboard started is known by its process, whatever becomes o
   }
   // What was left is a record of a process that is running, somewhere else.
   // That is not this server, and the record went with the server.
-  assert.deepEqual(stopped, STOPPED);
+  assert.deepEqual(settled(stopped), stoppedBy("console"));
   assert.equal(isThere(server.pidFile), false);
   assert.deepEqual(
     problems().map((entry) => [entry.level, entry.message, entry.meta.pid]),
@@ -388,7 +399,7 @@ test("two starts at once start one server", async (t) => {
   assert.equal((server.runtimeLog().match(/^fake server ready$/gm) || []).length, 1);
   assert.equal(server.pidInfo().pid, first.pid);
 
-  assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
   assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
   assert.deepEqual(problems(), []);
 });
@@ -479,7 +490,7 @@ test("a copy of a running server's folder is not a second running server, and st
   }
 
   // The original is as it was, and stops when it is the one that is asked.
-  assert.deepEqual(await first.serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(settled(await first.serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
   assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
 });
 
@@ -534,6 +545,7 @@ test("a record whose pid is another process's by now is not believed, and nothin
   // the one that is stopped.
   write(truth);
   assert.deepEqual(await serverManager.getServerStatus(SERVER_ID), {
+    lastStop: null,
     pid,
     running: true,
     startedAt: "2026-11-16T09:00:00.000Z",
@@ -541,7 +553,7 @@ test("a record whose pid is another process's by now is not believed, and nothin
     stopping: false,
     stoppingSince: null
   });
-  assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("SIGTERM"));
   assert.deepEqual(server.received(), ["console: closed", "signal: SIGTERM", "exit: SIGTERM"]);
   assert.equal(inFolder.exitCode, 0);
 });
@@ -616,7 +628,7 @@ test("a pid file is replaced when a server starts, never written through", async
   assert.deepEqual(fs.readdirSync(server.runtimeDir).sort(), ["pid.json", "runtime.log"]);
   assert.deepEqual(fs.readdirSync(server.consolesDir), [SERVER_ID]);
 
-  assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
   assert.deepEqual(fs.readdirSync(server.runtimeDir), ["runtime.log"]);
   assert.deepEqual(fs.readdirSync(server.consolesDir), []);
 
@@ -636,7 +648,7 @@ test("a pid file is replaced when a server starts, never written through", async
   assert.equal(fs.readFileSync(elsewhere, "utf8"), "nobody writes here\n");
   assert.deepEqual(fs.readdirSync(server.runtimeDir).sort(), ["pid.json", "runtime.log"]);
   assert.deepEqual(fs.readdirSync(server.consolesDir), [SERVER_ID]);
-  assert.deepEqual(await later.serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(settled(await later.serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
   assert.deepEqual(later.problems(), []);
 });
 
@@ -730,7 +742,7 @@ test("only the exact marker in a pid file says that a server has a console", asy
     fs.writeFileSync(server.pidFile, JSON.stringify({ console: marker, pid: legacy.pid, startedAt: "2026-11-16T09:00:00.000Z", startedBy: "owner" }));
     const arrived = consoleWithAReader(server);
 
-    assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED, JSON.stringify(marker));
+    assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("SIGTERM"), JSON.stringify(marker));
     // Nothing was written to the pipe: the record does not say it is a console.
     assert.equal(arrived(), "", JSON.stringify(marker));
     assert.equal(server.received().includes("signal: SIGTERM"), true, JSON.stringify(marker));
@@ -749,7 +761,7 @@ test("only the exact marker in a pid file says that a server has a console", asy
   fs.writeFileSync(server.pidFile, JSON.stringify({ console: "fifo", pid: legacy.pid, startedAt: "2026-11-16T09:00:00.000Z", startedBy: "owner" }));
   const arrived = consoleWithAReader(server);
 
-  assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("SIGTERM"));
   assert.equal(arrived(), "stop\n");
   // This server was never listening there, so the wait ran out and a signal followed.
   assert.deepEqual(

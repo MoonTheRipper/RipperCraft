@@ -13,8 +13,10 @@ const {
   plantPipe,
   procStarted,
   recordFor,
+  settled,
   sleep,
   startFromAnotherProcess,
+  stoppedBy,
   unlessItHangs,
   waitFor,
   whatArrived
@@ -80,7 +82,8 @@ test("a server the dashboard started is stopped through its console, and nothing
   }
 
   const stopped = await serverManager.stopServer(SERVER_ID, OWNER);
-  assert.deepEqual(stopped, STOPPED);
+  // The status says how: by its console.
+  assert.deepEqual(settled(stopped), stoppedBy("console"));
   // It was told to stop, and did. No signal was needed.
   assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
   assert.equal(isThere(server.pidFile), false);
@@ -118,7 +121,7 @@ test("a server started through a shell is stopped through its console as well", 
   await server.whenReady();
   assert.equal(fs.lstatSync(server.consoleFile).isFIFO(), true);
 
-  assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
   assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
   assert.equal(isThere(server.consoleFile), false);
   assert.deepEqual(problems(), []);
@@ -138,7 +141,7 @@ test("a start script that stays between the dashboard and the server passes the 
   assert.notEqual(started.pid, pid);
 
   // "stop" gets to the server all the same: it was handed the script's stdin.
-  assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
   assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
   assert.equal(isAlive(pid), false);
   assert.deepEqual(problems(), []);
@@ -155,7 +158,7 @@ test("after a dashboard restart the server is found again, and still stopped thr
   const second = await createManager(server.root);
   assert.deepEqual(await second.serverManager.getServerStatus(SERVER_ID), started);
 
-  assert.deepEqual(await second.serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(settled(await second.serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
   assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
   assert.equal(isThere(server.pidFile), false);
   assert.equal(isThere(server.consoleFile), false);
@@ -186,7 +189,7 @@ test("a server outlives the dashboard process that started it: its output still 
   const found = await later.serverManager.getServerStatus(SERVER_ID);
   assert.deepEqual(found, dashboard.status);
 
-  assert.deepEqual(await later.serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(settled(await later.serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
   assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
   assert.equal(isAlive(pid), false);
   assert.equal(isThere(server.pidFile), false);
@@ -225,7 +228,7 @@ test("a server's console pipe is not in its folder, so nothing that reads the fo
     []
   );
 
-  assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
 });
 
 test("each server has a pipe of its own, under a plain name even when its id is not one", async (t) => {
@@ -265,7 +268,7 @@ test("each server has a pipe of its own, under a plain name even when its id is 
   assert.deepEqual(received(oddDir), ["console: stop", "exit: stop"]);
   assert.deepEqual(server.received(), []);
   assert.deepEqual(fs.readdirSync(server.consolesDir), [SERVER_ID]);
-  assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
   assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
   assert.deepEqual(fs.readdirSync(server.consolesDir), []);
   assert.deepEqual(problems(), []);
@@ -287,7 +290,7 @@ test("a link where the folder of pipes belongs is not followed", async (t) => {
     first.problems().map((entry) => [entry.message, entry.meta.reason]),
     [["A server was started without a console that outlasts the dashboard", "data/consoles is not a folder of its own"]]
   );
-  assert.deepEqual(await first.serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(settled(await first.serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
   assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
   fs.rmSync(path.join(server.serverDir, "received.log"));
   fs.rmSync(path.join(server.serverDir, "fake-server.pid"));
@@ -305,7 +308,7 @@ test("a link where the folder of pipes belongs is not followed", async (t) => {
   fs.renameSync(server.consolesDir, `${server.consolesDir}.real`);
   fs.symlinkSync(elsewhere, server.consolesDir);
 
-  assert.deepEqual(await second.serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(settled(await second.serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("SIGTERM"));
   // Nothing was written through the link, and nothing was removed through it.
   assert.equal(whatArrived(reader), "");
   assert.equal(fs.lstatSync(path.join(elsewhere, SERVER_ID)).isFIFO(), true);
@@ -393,7 +396,7 @@ for (const impostor of IMPOSTORS) {
       const planted = impostor.plant(server, t);
 
       // Opened carelessly, a pipe that nothing reads holds the stop for ever.
-      assert.deepEqual(await unlessItHangs(dashboard.serverManager.stopServer(SERVER_ID, OWNER)), STOPPED);
+      assert.deepEqual(settled(await unlessItHangs(dashboard.serverManager.stopServer(SERVER_ID, OWNER))), stoppedBy("SIGTERM"));
       // The server never saw "stop": it was not sent anywhere.
       assert.deepEqual(server.received(), ["signal: SIGTERM", "exit: SIGTERM"]);
       // Not into what was planted, and not into what that led to.
@@ -432,7 +435,7 @@ test("what is left where the console belongs is cleared away by the next start, 
     assert.equal(fs.lstatSync(server.consoleFile).mode & 0o777, 0o600);
     assert.equal(fs.readFileSync(elsewhere, "utf8"), "nobody writes here\n");
 
-    assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+    assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
     assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
     fs.rmSync(path.join(server.serverDir, "received.log"));
     fs.rmSync(path.join(server.serverDir, "fake-server.pid"));
@@ -454,7 +457,7 @@ test("a file planted where the console was is not written to while the dashboard
   assert.equal(fs.readFileSync(server.consoleFile, "utf8"), "a file of the server's own\n");
 
   server.release();
-  assert.deepEqual(await stopping, STOPPED);
+  assert.deepEqual(settled(await stopping), stoppedBy("SIGTERM"));
 });
 
 // --- when no pipe can be made ------------------------------------------------------------------
@@ -514,7 +517,7 @@ for (const situation of NO_PIPE) {
     assert.match(server.runtimeLog(), /^fake server ready$/m);
 
     // The dashboard that started it still has its console, and uses it.
-    assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+    assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
     assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
     assert.equal(isThere(server.pidFile), false);
     assert.equal(problems().length, 1);
@@ -548,7 +551,7 @@ test("what is found where the pipe was just made is looked at before a server is
     assert.deepEqual(server.received(), [], label);
     assert.equal(fs.readFileSync(elsewhere, "utf8"), "nobody reads or writes here\n", label);
 
-    assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED, label);
+    assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"), label);
     assert.deepEqual(server.received(), ["console: stop", "exit: stop"], label);
     assert.equal(fs.readFileSync(elsewhere, "utf8"), "nobody reads or writes here\n", label);
   }
@@ -570,7 +573,7 @@ test("a server started without a pipe loses its console with the dashboard, keep
 
   const later = await createManager(server.root);
   assert.equal((await later.serverManager.getServerStatus(SERVER_ID)).pid, pid);
-  assert.deepEqual(await later.serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(settled(await later.serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("SIGTERM"));
   assert.deepEqual(server.received(), ["console: closed", "signal: SIGTERM", "exit: SIGTERM"]);
   assert.deepEqual(
     later.problems().map((entry) => entry.message),

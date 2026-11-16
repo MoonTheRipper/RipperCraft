@@ -286,6 +286,11 @@ function createServerManager(store, options = {}) {
   // that is restarted in the middle of one has already asked the server to
   // stop, and the next press of Stop begins a new, equally patient one.
   const stopsInProgress = new Map();
+  // How this process's last stop of each server ended: what it took - "stop"
+  // on the console, SIGTERM or SIGKILL - and when, with the process it was a
+  // stop of. Kept until the server is next started, and no longer than this
+  // process: the server's own log has the lines that last.
+  const lastStops = new Map();
   // Launching a server, and clearing up after one that has gone, take turns
   // for each server. Without that a status check that found a dead pid could
   // remove the pid file a start had just written, and the dashboard would lose
@@ -1416,7 +1421,16 @@ function createServerManager(store, options = {}) {
 
   // `stopping` is only ever true of a server that is running: the moment its
   // process has gone it is stopped, whether or not the stop has noticed yet.
+  //
+  // `lastStop` is only ever there for a server that is not running, and that
+  // this process has stopped and not started again since: { at, how }, where
+  // `how` is the last thing the stop took - "console", "SIGTERM" or
+  // "SIGKILL". A server that went by itself, or that another dashboard
+  // process stopped, has none. It is how the page knows to say that a server
+  // was killed, and that its world may not have been saved, where it used to
+  // say "stopped" in green.
   function describeStatus(serverId, serverProcess) {
+    const last = lastStops.get(serverId);
     if (!serverProcess) {
       return {
         running: false,
@@ -1424,8 +1438,17 @@ function createServerManager(store, options = {}) {
         startedAt: null,
         startedBy: null,
         stopping: false,
-        stoppingSince: null
+        stoppingSince: null,
+        lastStop: last ? last.shown : null
       };
+    }
+    if (last && (last.pid !== serverProcess.pid || last.startedAt !== serverProcess.startedAt)) {
+      // Running, and not as the process that stop was of: it has been
+      // started since, by another dashboard process, or the start would have
+      // cleared this. Only another process is forgotten here. The one that
+      // was stopped can still be handed in by a look that began just before
+      // it went, and must not take with it what its stop has just set down.
+      lastStops.delete(serverId);
     }
     const stop = stopsInProgress.get(serverId);
     const stopping = Boolean(stop && stop.pid === serverProcess.pid);
@@ -1435,7 +1458,8 @@ function createServerManager(store, options = {}) {
       startedAt: serverProcess.startedAt,
       startedBy: serverProcess.startedBy || "unknown",
       stopping,
-      stoppingSince: stopping ? stop.since : null
+      stoppingSince: stopping ? stop.since : null,
+      lastStop: null
     };
   }
 
@@ -3302,6 +3326,8 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       // exited fails, and must not take the dashboard with it.
       child.stdin.on("error", () => {});
     }
+    // A new run. How the last one was stopped is not about this one.
+    lastStops.delete(serverId);
     if (!own.gone) {
       // Unless all of it has gone already: that was then found out a moment
       // ago, and will not be found out again to take this record back out.
@@ -3470,7 +3496,16 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     const waitedSeconds = () => Math.round((performance.now() - began) / 1000);
     const note = (text) => appendRuntimeLog(paths, `[${nowIso()}] ${text}\n`);
     const by = actor && actor.username ? ` by ${actor.username}` : "";
+    // The last thing the server was sent, for the status to say afterwards.
+    let took = null;
     const stopped = async () => {
+      if (took) {
+        lastStops.set(serverId, {
+          pid,
+          shown: Object.freeze({ at: nowIso(), how: took }),
+          startedAt: serverProcess.startedAt
+        });
+      }
       if (serverProcess.child) {
         // This process started it. Its exit has said so already, unless the
         // last of it to go was not the process that was started.
@@ -3479,7 +3514,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       // The record of a server this process did not start is cleared here.
       // One it did start is cleared a turn ahead of this.
       await takeTurn(lifecycleTurns, serverId, () => forgetServer(serverId, paths, { announce: true }));
-      logger.info("Server stopped", { pid, serverId, waitedSeconds: waitedSeconds() });
+      logger.info("Server stopped", { how: took, pid, serverId, waitedSeconds: waitedSeconds() });
     };
 
     // A server this process did not start is known by its record alone, and
@@ -3502,6 +3537,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     }
 
     if (asked.sent) {
+      took = "console";
       logger.info('Stopping a server: sent "stop" to its console', { pid, server: server.name, serverId });
       if (await waitForExit(serverProcess, stopWaits.console)) {
         return await stopped();
@@ -3512,6 +3548,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       }
       const waited = waitedSeconds();
       signalServer(serverProcess, "SIGTERM");
+      took = "SIGTERM";
       logger.warn('Server did not exit after "stop" on its console: sent SIGTERM', {
         pid,
         server: server.name,
@@ -3528,6 +3565,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
         return await stopped();
       }
       signalServer(serverProcess, "SIGTERM");
+      took = "SIGTERM";
       logger.warn('Server has no console the dashboard can reach: sent SIGTERM instead of "stop"', {
         pid,
         reason: asked.reason,
@@ -3546,6 +3584,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     }
     const waited = waitedSeconds();
     signalServer(serverProcess, "SIGKILL");
+    took = "SIGKILL";
     logger.warn("Server did not exit after SIGTERM: sent SIGKILL. The world may not have been saved.", {
       pid,
       server: server.name,
@@ -4316,6 +4355,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
 
     const paths = resolveRecordPaths(server);
     await store.deleteServerRecord(serverId);
+    lastStops.delete(serverId);
     await fsp.rm(paths.serverDir, { force: true, recursive: true });
     // Its console pipe is not in that folder. One is only still there if the
     // server went while no dashboard was watching.

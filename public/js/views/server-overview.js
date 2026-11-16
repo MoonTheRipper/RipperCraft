@@ -1,5 +1,5 @@
 import { renderMetaRows, renderSection } from "../components.js";
-import { describeRunState, formatDate } from "../format.js";
+import { describeLastStop, describeRunState, formatDate } from "../format.js";
 import { escapeHtml, icon, labelWithIcon, rawHtml } from "../html.js";
 import { state } from "../state.js";
 
@@ -18,12 +18,17 @@ export function renderOverviewSection(snapshot) {
   `;
 
   const runState = describeRunState(server.status);
+  const lastStop = describeLastStop(server.status);
   const infoBody = `
     ${runState.stopping
       ? `<p class="muted">this server was told to stop and is saving its world. it is given minutes to finish before anything stronger is tried, and this page shows it as stopped as soon as it has.</p>`
       : ""}
+    ${lastStop?.killed
+      ? `<p class="notice notice--error">this server did not stop when it was asked to, and was killed. the world may not have been saved: see its log before starting it again.</p>`
+      : ""}
     ${renderMetaRows([
       ["status", runState.stopping ? `${runState.label} since ${formatDate(server.status.stoppingSince)}` : runState.label],
+      ...(lastStop ? [["last stop", lastStop.summary]] : []),
       ["eula", server.eulaAccepted ? "accepted" : "pending"],
       ["loader", server.loader],
       ["minecraft", server.minecraftVersion || "unknown"],

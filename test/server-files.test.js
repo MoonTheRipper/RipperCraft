@@ -12,7 +12,9 @@ const {
   createServerRoot,
   isAlive,
   plantPipe,
+  settled,
   sleep,
+  stoppedBy,
   unlessItHangs,
   waitFor,
   whatArrived
@@ -137,7 +139,7 @@ test("pipes where a server's files belong do not hold up its page, and a stop is
   await waitFor(() => server.received().includes("exit: stop"), "the server to be told to stop");
   await waitFor(() => !isAlive(pid), "the server to have gone");
   await waitFor(async () => (await serverManager.getServerStatus(SERVER_ID)).running === false, "the stop to be over");
-  assert.deepEqual(await serverManager.getServerStatus(SERVER_ID), STOPPED);
+  assert.deepEqual(settled(await serverManager.getServerStatus(SERVER_ID)), stoppedBy("console"));
   // Nothing was read out of any of them, and nothing replaced.
   for (const name of planted) {
     assert.equal(fs.lstatSync(path.join(server.serverDir, name)).isFIFO(), true, name);
@@ -189,7 +191,7 @@ test("accepting the EULA and saving the settings put a file where a pipe was, wi
   const started = await serverManager.startServer(SERVER_ID, OWNER);
   assert.equal(started.running, true);
   await server.whenReady();
-  assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(settled(await serverManager.stopServer(SERVER_ID, OWNER)), stoppedBy("console"));
 });
 
 test("settings that are a link to a file are read and written through it, as before", async (t) => {

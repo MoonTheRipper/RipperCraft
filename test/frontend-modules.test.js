@@ -988,9 +988,20 @@ function snapshotOf(status, permissions = {}) {
   };
 }
 
-const RUNNING = { pid: 4242, running: true, startedAt: "2026-11-16T10:00:00.000Z", startedBy: "owner", stopping: false, stoppingSince: null };
+const RUNNING = {
+  lastStop: null,
+  pid: 4242,
+  running: true,
+  startedAt: "2026-11-16T10:00:00.000Z",
+  startedBy: "owner",
+  stopping: false,
+  stoppingSince: null
+};
 const STOPPING = { ...RUNNING, stopping: true, stoppingSince: "2026-11-16T12:00:00.000Z" };
-const STOPPED = { pid: null, running: false, startedAt: null, startedBy: null, stopping: false, stoppingSince: null };
+const STOPPED = { lastStop: null, pid: null, running: false, startedAt: null, startedBy: null, stopping: false, stoppingSince: null };
+// Stopped by the dashboard, and what the stop took.
+const STOP_ENDED_AT = "2026-11-16T12:04:10.000Z";
+const stoppedBy = (how) => ({ ...STOPPED, lastStop: { at: STOP_ENDED_AT, how } });
 
 // Puts one server on the page for a test and takes it off again afterwards,
 // along with any timer the page started for it.
@@ -1243,5 +1254,168 @@ test("a server that stops while another one is on the page is noticed as well", 
   assert.deepEqual(state.notice, { message: "Other stopped", type: "success" });
   assert.equal(appElement.innerHTML.includes('<span class="tree-meta">stopping</span>'), false);
   assert.deepEqual(intervals.map((interval) => interval.cleared), [true]);
+});
+
+// A page with one server on it that is stopping, a dashboard that answers
+// with whatever `answer.status` is at the time, and the timer that asks.
+async function withStoppingServer(t) {
+  const state = await withServerOnPage(t, STOPPING);
+  const intervals = captureIntervals(t);
+  const { render } = await load(path.join(jsRoot, "render.js"));
+  const previousFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+  });
+  const answer = { status: STOPPING };
+  globalThis.fetch = async (url) => {
+    const body = url === "/api/servers" ? { providers: {}, servers: [{ id: "demo", name: "Demo", status: answer.status }] } : snapshotOf(answer.status);
+    return { headers: { get: () => "application/json" }, json: async () => body, ok: true, status: 200 };
+  };
+  render();
+  assert.equal(intervals.length, 1);
+  return { answer, state, tick: () => intervals[0].run() };
+}
+
+test("how a stop ended is told apart: by the console, by SIGTERM, or by killing the server", async () => {
+  const { describeLastStop } = await load(path.join(jsRoot, "format.js"));
+  const when = new Date(STOP_ENDED_AT).toLocaleString();
+
+  assert.deepEqual(describeLastStop(stoppedBy("console")), { killed: false, summary: `${when} — by "stop" on its console` });
+  assert.deepEqual(describeLastStop(stoppedBy("SIGTERM")), { killed: false, summary: `${when} — by SIGTERM` });
+  assert.deepEqual(describeLastStop(stoppedBy("SIGKILL")), { killed: true, summary: `${when} — killed. it did not stop when asked` });
+
+  // A server the dashboard has not stopped has nothing to say about it.
+  for (const status of [STOPPED, RUNNING, STOPPING, undefined, null, {}, "stopped"]) {
+    assert.equal(describeLastStop(status), null);
+  }
+  // Nor has one that is running, whatever an answer says.
+  assert.equal(describeLastStop({ ...RUNNING, lastStop: { at: STOP_ENDED_AT, how: "SIGKILL" } }), null);
+  // Only the three words the dashboard uses mean anything, and nothing that was sent is passed on.
+  for (const how of ["sigkill", "KILL", '<b onclick="alert(1)">', 9, null, undefined, ["SIGKILL"]]) {
+    assert.equal(describeLastStop({ ...STOPPED, lastStop: { at: STOP_ENDED_AT, how } }), null, JSON.stringify(how));
+  }
+  for (const lastStop of ["SIGKILL", 1, true, []]) {
+    assert.equal(describeLastStop({ ...STOPPED, lastStop }), null, JSON.stringify(lastStop));
+  }
+  // When it ended is drawn as a time or as "unknown".
+  assert.equal(describeLastStop({ ...STOPPED, lastStop: { at: '<b onclick="alert(1)">', how: "SIGKILL" } }).summary, "unknown — killed. it did not stop when asked");
+});
+
+test("a server that had to be killed is not called stopped: the page says what that may have cost", async (t) => {
+  const { answer, state, tick } = await withStoppingServer(t);
+  const when = new Date(STOP_ENDED_AT).toLocaleString();
+
+  answer.status = stoppedBy("SIGKILL");
+  await tick();
+  assert.deepEqual(state.notice, {
+    message: "Demo did not stop when asked, and was killed: the world may not have been saved, see its log",
+    type: "error"
+  });
+  // Drawn as an error, and read out as one.
+  assert.match(appElement.innerHTML, /<div class="notice notice--error" aria-hidden="true">Demo did not stop when asked, and was killed: the world may not have been saved, see its log<\/div>/);
+  // The notice goes with the next thing that is done. The server's page keeps saying it.
+  assert.match(appElement.innerHTML, /status-inline--idle"><span class="icon">.*?<\/span>offline/);
+  assert.ok(appElement.innerHTML.includes('<p class="notice notice--error">this server did not stop when it was asked to, and was killed. the world may not have been saved: see its log before starting it again.</p>'));
+  assert.ok(appElement.innerHTML.includes(`<span>last stop</span>\n              <strong>${when} — killed. it did not stop when asked</strong>`));
+  // It can be started again: nothing is held.
+  assert.equal(appElement.innerHTML.includes('data-action="start-server" disabled'), false);
+});
+
+for (const [how, summary] of [
+  ["console", "by &quot;stop&quot; on its console"],
+  ["SIGTERM", "by SIGTERM"]
+]) {
+  test(`a server that stopped by ${how} is called stopped, and its page says how`, async (t) => {
+    const { answer, state, tick } = await withStoppingServer(t);
+    answer.status = stoppedBy(how);
+    await tick();
+    assert.deepEqual(state.notice, { message: "Demo stopped", type: "success" });
+    assert.ok(appElement.innerHTML.includes(`<span>last stop</span>\n              <strong>${new Date(STOP_ENDED_AT).toLocaleString()} — ${summary}</strong>`));
+    assert.equal(appElement.innerHTML.includes("was killed"), false);
+    assert.equal(appElement.innerHTML.includes('<p class="notice notice--error">'), false);
+  });
+}
+
+test("a server the dashboard did not stop has no last stop on its page", async (t) => {
+  const { answer, state, tick } = await withStoppingServer(t);
+  // It went, and nothing says how: the dashboard was restarted in the middle of the stop.
+  answer.status = STOPPED;
+  await tick();
+  assert.deepEqual(state.notice, { message: "Demo stopped", type: "success" });
+  assert.equal(appElement.innerHTML.includes("last stop"), false);
+  assert.equal(appElement.innerHTML.includes("was killed"), false);
+});
+
+test("a stop that ends with the server still running is said as an error, and one that was started again is not", async (t) => {
+  const { answer, state, tick } = await withStoppingServer(t);
+
+  // The same process, and no stop under way any more.
+  answer.status = RUNNING;
+  await tick();
+  assert.deepEqual(state.notice, {
+    message: "Demo is still running: the stop did not finish. see its log, then stop it again",
+    type: "error"
+  });
+  assert.match(appElement.innerHTML, /status-inline--ok"><span class="icon">.*?<\/span>online/);
+  // Stop can be pressed again.
+  assert.equal(appElement.innerHTML.includes('data-action="stop-server" disabled'), false);
+});
+
+test("a server that stopped and was started again between two looks is a running server, and nothing is said", async (t) => {
+  const { answer, state, tick } = await withStoppingServer(t);
+  answer.status = { ...RUNNING, pid: 5151, startedAt: "2026-11-16T12:05:00.000Z" };
+  await tick();
+  assert.equal(state.notice, null);
+  assert.match(appElement.innerHTML, /status-inline--ok"><span class="icon">.*?<\/span>online/);
+});
+
+test("several stops that end together are each said for what they were, the bad news first", async (t) => {
+  const state = await withServerOnPage(t, STOPPING);
+  const intervals = captureIntervals(t);
+  const { render } = await load(path.join(jsRoot, "render.js"));
+  const previousFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+  });
+  const names = { demo: "Demo", four: "Four", three: "Three", two: "Two" };
+  let statuses = { demo: STOPPING, four: { ...STOPPING, pid: 44 }, three: { ...STOPPING, pid: 33 }, two: { ...STOPPING, pid: 22 } };
+  const list = () => Object.keys(names).map((id) => ({ id, name: names[id], status: statuses[id] }));
+  globalThis.fetch = async (url) => {
+    const body = url === "/api/servers" ? { providers: {}, servers: list() } : snapshotOf(statuses.demo);
+    return { headers: { get: () => "application/json" }, json: async () => body, ok: true, status: 200 };
+  };
+  state.servers = list();
+  render();
+
+  statuses = { demo: stoppedBy("SIGKILL"), four: stoppedBy("console"), three: { ...RUNNING, pid: 33 }, two: stoppedBy("SIGKILL") };
+  await intervals[0].run();
+  assert.deepEqual(state.notice, {
+    message:
+      "Demo, Two did not stop when asked, and were killed: the world may not have been saved, see their logs. " +
+      "Three is still running: the stop did not finish. see its log, then stop it again. " +
+      "Four stopped",
+    type: "error"
+  });
+});
+
+test("stop on a server that keeps running without stopping is not called 'not running'", async (t) => {
+  const state = await withServerOnPage(t, RUNNING);
+  captureIntervals(t);
+  const { handleAppClick } = await load(path.join(jsRoot, "actions", "click.js"));
+  const previousFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+  });
+  // The stop could not begin: the answer is a server that is running, and not stopping.
+  globalThis.fetch = async (url) => {
+    const body = url === "/api/servers/demo/stop" ? { status: RUNNING } : url === "/api/servers" ? { providers: {}, servers: [{ id: "demo", name: "Demo", status: RUNNING }] } : snapshotOf(RUNNING);
+    return { headers: { get: () => "application/json" }, json: async () => body, ok: true, status: 200 };
+  };
+  await handleAppClick({ target: { closest: (selector) => (selector === "[data-action]" ? { dataset: { action: "stop-server" } } : null) } });
+  assert.deepEqual(state.notice, {
+    message: "the server is still running: the stop did not go through. see its log and the dashboard's, then try again",
+    type: "error"
+  });
+  assert.match(appElement.innerHTML, /status-inline--ok"><span class="icon">.*?<\/span>online/);
 });
 

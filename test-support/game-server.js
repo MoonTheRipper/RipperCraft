@@ -297,8 +297,38 @@ async function startFromAnotherProcess(t, root, options = {}) {
   };
 }
 
-// What a server that is not running is reported as.
-const STOPPED = Object.freeze({ pid: null, running: false, startedAt: null, startedBy: null, stopping: false, stoppingSince: null });
+// What a server that is not running is reported as, when the dashboard that
+// is asked has not stopped it since it last started it: one that never ran,
+// one that went by itself, one that another dashboard process stopped.
+const STOPPED = Object.freeze({
+  lastStop: null,
+  pid: null,
+  running: false,
+  startedAt: null,
+  startedBy: null,
+  stopping: false,
+  stoppingSince: null
+});
+
+// And one the dashboard has stopped. `how` is the last thing the stop took:
+// "console", "SIGTERM" or "SIGKILL". For comparing with a status that has
+// been through settled().
+function stoppedBy(how) {
+  return { ...STOPPED, lastStop: { at: "a moment ago", how } };
+}
+
+// A status with the time its last stop ended looked at and taken out, so
+// that the rest of it can be compared whole.
+function settled(status) {
+  if (!status || !status.lastStop) {
+    return status;
+  }
+  const { at } = status.lastStop;
+  assert.match(at, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+  const ago = Date.now() - Date.parse(at);
+  assert.ok(ago >= 0 && ago < 60_000, `the stop ended ${ago} ms ago`);
+  return { ...status, lastStop: { ...status.lastStop, at: "a moment ago" } };
+}
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -392,9 +422,11 @@ module.exports = {
   plantPipe,
   procStarted,
   recordFor,
+  settled,
   sleep,
   startFromAnotherProcess,
   startLegacyServer,
+  stoppedBy,
   unlessItHangs,
   waitFor,
   whatArrived

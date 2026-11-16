@@ -148,7 +148,26 @@ function panelResponses() {
     notice: { message: "something happened", type: "error" },
     // The status of a server that has been told to stop and has not gone yet.
     // A real one would take a server that is slow to stop.
-    stoppingStatus: { pid: 4242, running: true, startedAt: "2026-11-16T10:00:00.000Z", startedBy: "owner", stopping: true, stoppingSince: "2026-11-16T12:00:00.000Z" },
+    stoppingStatus: {
+      lastStop: null,
+      pid: 4242,
+      running: true,
+      startedAt: "2026-11-16T10:00:00.000Z",
+      startedBy: "owner",
+      stopping: true,
+      stoppingSince: "2026-11-16T12:00:00.000Z"
+    },
+    // And of one that did not go, and was killed. A real one would take a
+    // server that ignores "stop" and SIGTERM for minutes.
+    killedStatus: {
+      lastStop: { at: "2026-11-16T12:04:10.000Z", how: "SIGKILL" },
+      pid: null,
+      running: false,
+      startedAt: null,
+      startedBy: null,
+      stopping: false,
+      stoppingSince: null
+    },
     updatePlan: {
       addons: {
         blockedReasons: [],
@@ -245,6 +264,10 @@ async function renderEverything(responses, role) {
     state.servers = responses.servers.map((server) => ({ ...server, status: panels.stoppingStatus }));
     state.serverSection = "overview";
     pages.push(renderServerContent(), renderSidebar("light"));
+    // And after a stop that ended with the server being killed.
+    state.serverSnapshot = { ...atRest, server: { ...atRest.server, status: panels.killedStatus } };
+    state.servers = responses.servers.map((server) => ({ ...server, status: panels.killedStatus }));
+    pages.push(renderServerContent());
     state.serverSnapshot = atRest;
     state.servers = responses.servers;
 

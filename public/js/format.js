@@ -35,6 +35,33 @@ export function describeRunState(status) {
   return { label: "offline", short: "down", stopping: false, tone: "idle" };
 }
 
+// How the dashboard's last stop of a server ended, for a server that is not
+// running: what it took, and when. null when the dashboard has not stopped
+// it since it was last started.
+//
+// "stop" on the console is how a server is meant to go. SIGTERM comes after
+// minutes of nothing, and Minecraft saves on it. SIGKILL comes last, and a
+// server that is killed saves nothing: the page said "stopped", in green, of
+// one that had been, and its owner found out from the world. `killed` is for
+// that case, and everything that shows a stop asks it.
+export function describeLastStop(status) {
+  const stop = status && !status.running && status.lastStop;
+  if (!stop || typeof stop !== "object") {
+    return null;
+  }
+  const when = formatDate(stop.at);
+  if (stop.how === "SIGKILL") {
+    return { killed: true, summary: `${when} — killed. it did not stop when asked` };
+  }
+  if (stop.how === "SIGTERM") {
+    return { killed: false, summary: `${when} — by SIGTERM` };
+  }
+  if (stop.how === "console") {
+    return { killed: false, summary: `${when} — by "stop" on its console` };
+  }
+  return null;
+}
+
 export function getServerPermissions(snapshot = state.serverSnapshot) {
   return (
     snapshot?.server?.permissions || {

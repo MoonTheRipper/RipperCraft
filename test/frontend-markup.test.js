@@ -205,6 +205,9 @@ test("the pages still draw what the server really sends", async (t) => {
   assert.match(page, /<span class="tree-meta">stopping<\/span>/);
   assert.match(page, /<button class="button button--primary" data-action="start-server" disabled title="this server is stopping">/);
   assert.match(page, /<button class="button button--quiet" data-action="stop-server" disabled title="this server is stopping">/);
+  // One that had to be killed: its page says so, and when.
+  assert.ok(page.includes('<p class="notice notice--error">this server did not stop when it was asked to, and was killed. the world may not have been saved: see its log before starting it again.</p>'));
+  assert.ok(page.includes(`<strong>${new Date("2026-11-16T12:04:10.000Z").toLocaleString()} — killed. it did not stop when asked</strong>`));
   // And one that is not, which is every other drawing of it here.
   assert.match(page, /<button class="button button--primary" data-action="start-server">/);
   assert.match(page, /<span class="tree-meta">down<\/span>/);
