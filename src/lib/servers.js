@@ -146,6 +146,18 @@ function parsePidInfo(text) {
   };
 }
 
+// The name of a server's console pipe in data/consoles: the server's id where
+// that is a plain file name, and otherwise a name made from it that is one.
+// An id is the name a folder in servers/ was found under, so it can hold
+// anything a folder name can.
+function consoleFileName(serverId) {
+  const id = String(serverId);
+  if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/.test(id) && !/^id-[0-9a-f]{40}$/.test(id)) {
+    return id;
+  }
+  return `id-${crypto.createHash("sha256").update(id).digest("hex").slice(0, 40)}`;
+}
+
 // What is in the way when a file in a server's folder cannot be opened the way
 // the dashboard opens them, in words for a log line.
 const OPEN_FAILURES = Object.freeze({
@@ -187,6 +199,11 @@ function createServerManager(store, options = {}) {
   // The program that makes a named pipe: Node cannot make one itself.
   const mkfifoCommand = options.mkfifoCommand || "mkfifo";
   const serversRoot = path.join(store.rootDir, "servers");
+  // The console pipes are kept together in a folder of the dashboard's own,
+  // not in each server's folder. A pipe that a running server reads holds up
+  // whatever opens it to read as well: `grep -R` or a backup of a server's
+  // folder stopped dead on one, and a copy of the folder took the pipe along.
+  const consolesDir = path.join(store.rootDir, "data", "consoles");
   // The servers this process started and has not seen exit: for each, the
   // child, its pid, who started it and when, and how its console is reached.
   const runningChildren = new Map();
@@ -279,7 +296,7 @@ function createServerManager(store, options = {}) {
       modsDir: path.join(serverDir, PAPER_LIKE_LOADERS.has(record.loader) ? "plugins" : (record.modsDir || "mods")),
       disabledModsDir: path.join(serverDir, ".rippermoon", "disabled-mods"),
       addonManifestFile: path.join(serverDir, ".rippermoon", "addons.json"),
-      consoleFile: path.join(serverDir, ".rippermoon", "console"),
+      consoleFile: path.join(consolesDir, consoleFileName(record.id)),
       eulaFile: path.join(serverDir, "eula.txt"),
       pidFile: path.join(serverDir, ".rippermoon", "pid.json"),
       opsFile: path.join(serverDir, "ops.json"),
@@ -919,12 +936,36 @@ function createServerManager(store, options = {}) {
     }
   }
 
+  // Whether data/consoles is there as a folder of its own. A link in its
+  // place is not one: the pipes would be made, written to and removed
+  // wherever it led.
+  async function consolesDirIsUsable() {
+    try {
+      return (await fsp.lstat(consolesDir)).isDirectory();
+    } catch {
+      return false;
+    }
+  }
+
+  // Makes data/consoles, for the account alone: whoever can write to a
+  // server's console pipe can type commands into that server.
+  async function prepareConsolesDir() {
+    await fsp.mkdir(consolesDir, { mode: 0o700, recursive: true });
+    const stats = await fsp.lstat(consolesDir);
+    if (!stats.isDirectory()) {
+      throw new Error(`${path.relative(store.rootDir, consolesDir)} is not a folder of its own`);
+    }
+    if ((stats.mode & 0o777) !== 0o700) {
+      await fsp.chmod(consolesDir, 0o700);
+    }
+  }
+
   // Removes a server's console pipe once nothing runs behind it. Only a pipe:
   // anything else found at that path is not the dashboard's, and is left for
   // the next start to deal with.
   async function removeConsolePipe(consoleFile) {
     try {
-      if ((await fsp.lstat(consoleFile)).isFIFO()) {
+      if ((await consolesDirIsUsable()) && (await fsp.lstat(consoleFile)).isFIFO()) {
         await fsp.unlink(consoleFile);
       }
     } catch {
@@ -2664,11 +2705,16 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
   // A server used to read its console from a pipe whose other end was this
   // process. When the dashboard was restarted that end closed, the server was
   // left with no console at all, and the only way to stop it was a signal. A
-  // named pipe is in the server's folder instead, and any later dashboard
-  // process can open it to write "stop".
+  // named pipe has a name instead, data/consoles/<the server's id>, and any
+  // later dashboard process can open it to write "stop".
   //
   // Returns the open pipe, or null and why there is none.
   async function createConsole(paths) {
+    try {
+      await prepareConsolesDir();
+    } catch (error) {
+      return { handle: null, reason: error.message };
+    }
     // Whatever is at the path goes first: the pipe of an earlier run, or
     // something a mod left there. unlink removes a link and not what it points
     // to. It fails on a folder, and then there is no console.
@@ -2702,7 +2748,7 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
       // the server, which is handed this as its stdin, holds both ends. It
       // then never reads an end of file, however many writers come and go.
       // Not through a link, and looked at before it is believed: the pipe was
-      // made a moment ago, but in a folder a mod can write to.
+      // made a moment ago, but in a folder a mod can write to as well.
       handle = await fsp.open(paths.consoleFile, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
       if (!(await handle.stat()).isFIFO()) {
         throw new Error("what was opened there is not a named pipe");
@@ -2719,14 +2765,17 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
 
   // Writes a line to a server's console pipe.
   //
-  // The path is in the server's folder, and a mod running in any server can
-  // put something else there: a file, a link to one, a folder, a pipe of its
-  // own. So it is opened without following a link, and looked at before
+  // The path is in data/, where a mod running in any server can write too,
+  // and can put something else there: a file, a link to one, a folder, a pipe
+  // of its own. So it is opened without following a link, and looked at before
   // anything is written: only a named pipe is written to. It is opened
   // without waiting, too. A pipe that nothing reads would hold a plain open
   // for ever; opened this way it fails at once, which is how the dashboard
   // learns that the console is no longer attached to anything.
   async function writeToConsole(consoleFile, text) {
+    if (!(await consolesDirIsUsable())) {
+      return { reason: `${path.relative(store.rootDir, consolesDir)} is not a folder of its own`, sent: false };
+    }
     let handle;
     try {
       handle = await fsp.open(consoleFile, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW);
@@ -3893,6 +3942,9 @@ exec "$JAVA_BIN" -Xms\${MIN_MEMORY} -Xmx\${MAX_MEMORY} \${JVM_ARGS} "@${launch.a
     const paths = resolveRecordPaths(server);
     await store.deleteServerRecord(serverId);
     await fsp.rm(paths.serverDir, { force: true, recursive: true });
+    // Its console pipe is not in that folder. One is only still there if the
+    // server went while no dashboard was watching.
+    await removeConsolePipe(paths.consoleFile);
     return {
       deleted: true,
       directory: server.directory,

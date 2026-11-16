@@ -13,7 +13,7 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
-const { spawn, spawnSync } = require("node:child_process");
+const { execFileSync, spawn, spawnSync } = require("node:child_process");
 
 const REPO_ROOT = path.join(__dirname, "..");
 const SCRIPT = path.join(REPO_ROOT, "infra", "systemd", "migrate-to-rippercraft.sh");
@@ -391,6 +391,11 @@ exec '${real("id")}' "$@"
       await writeFile(path.join(checkout, "data", name), contents, 0o600);
     }
     await fsp.mkdir(path.join(checkout, "servers"), { recursive: true });
+    // What a dashboard with a running server leaves in data/ besides its
+    // files: the server's console, a named pipe. The script looks through
+    // data/ and backs up part of it, and must not stop at a pipe.
+    await fsp.mkdir(path.join(checkout, "data", "consoles"), { mode: 0o700, recursive: true });
+    execFileSync("mkfifo", ["-m", "600", path.join(checkout, "data", "consoles", "Demo")]);
   }
 
   let gameServerPid = 0;

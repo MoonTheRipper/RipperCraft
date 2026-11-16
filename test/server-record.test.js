@@ -237,10 +237,12 @@ test("a pid file is replaced when a server starts, never written through", async
   assert.equal(server.pidInfo().pid, started.pid);
   assert.equal(fs.readFileSync(elsewhere, "utf8"), "nobody writes here\n");
   // Nothing but the record, the console and the log is left in the folder.
-  assert.deepEqual(fs.readdirSync(server.runtimeDir).sort(), ["console", "pid.json", "runtime.log"]);
+  assert.deepEqual(fs.readdirSync(server.runtimeDir).sort(), ["pid.json", "runtime.log"]);
+  assert.deepEqual(fs.readdirSync(server.consolesDir), [SERVER_ID]);
 
   assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
   assert.deepEqual(fs.readdirSync(server.runtimeDir), ["runtime.log"]);
+  assert.deepEqual(fs.readdirSync(server.consolesDir), []);
 
   // That link was found and cleared before the server was started. This one
   // turns up later, once the start is under way: a stand-in for mkfifo makes
@@ -256,7 +258,8 @@ test("a pid file is replaced when a server starts, never written through", async
   assert.equal(fs.lstatSync(server.pidFile).isFile(), true);
   assert.deepEqual(server.pidInfo(), { console: "fifo", pid: again.pid, startedAt: again.startedAt, startedBy: "owner" });
   assert.equal(fs.readFileSync(elsewhere, "utf8"), "nobody writes here\n");
-  assert.deepEqual(fs.readdirSync(server.runtimeDir).sort(), ["console", "pid.json", "runtime.log"]);
+  assert.deepEqual(fs.readdirSync(server.runtimeDir).sort(), ["pid.json", "runtime.log"]);
+  assert.deepEqual(fs.readdirSync(server.consolesDir), [SERVER_ID]);
   assert.deepEqual(await later.serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
   assert.deepEqual(later.problems(), []);
 });
@@ -335,6 +338,7 @@ test("only the exact marker in a pid file says that a server has a console", asy
   // A pipe where a console would be, with something reading it, so that
   // whatever the dashboard writes there can be seen.
   const consoleWithAReader = (server) => {
+    fs.mkdirSync(server.consolesDir, { recursive: true });
     plantPipe(server.consoleFile);
     const reader = fs.openSync(server.consoleFile, fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
     t.after(() => fs.closeSync(reader));

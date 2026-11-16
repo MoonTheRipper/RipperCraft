@@ -52,18 +52,22 @@ test("a server the dashboard started is stopped through its console, and nothing
   assert.equal(started.pid, server.fakePid());
   assert.equal(started.startedBy, "owner");
 
-  // Its console is a named pipe in its own folder, for the account alone, and
-  // the pid file says that it has one.
+  // Its console is a named pipe under the server's id, in a folder of the
+  // dashboard's own, both for the account alone - and the pid file says that
+  // it has one.
+  assert.equal(server.consoleFile, path.join(server.root, "data", "consoles", SERVER_ID));
   const consoleStats = fs.lstatSync(server.consoleFile);
   assert.equal(consoleStats.isFIFO(), true);
   assert.equal(consoleStats.mode & 0o777, 0o600);
+  assert.equal(fs.lstatSync(server.consolesDir).isDirectory(), true);
+  assert.equal(fs.lstatSync(server.consolesDir).mode & 0o777, 0o700);
   assert.deepEqual(server.pidInfo(), { console: "fifo", pid: started.pid, startedAt: started.startedAt, startedBy: "owner" });
   assert.equal(fs.lstatSync(server.pidFile).isFile(), true);
   // The dashboard holds neither the console nor the log open: nothing of the
   // server depends on this process staying alive.
-  const stillOpen = openFilesUnder(server.runtimeDir);
+  const stillOpen = openFilesUnder(server.root);
   if (stillOpen) {
-    assert.deepEqual(stillOpen, []);
+    assert.deepEqual(stillOpen.filter((target) => !target.startsWith(path.join(server.root, "data", "logs"))), []);
   }
 
   const stopped = await serverManager.stopServer(SERVER_ID, OWNER);
@@ -88,9 +92,9 @@ test("a server the dashboard started is stopped through its console, and nothing
     return log.search(line);
   });
   assert.deepEqual(order, [...order].sort((a, b) => a - b));
-  const afterwards = openFilesUnder(server.runtimeDir);
+  const afterwards = openFilesUnder(server.root);
   if (afterwards) {
-    assert.deepEqual(afterwards, []);
+    assert.deepEqual(afterwards.filter((target) => !target.startsWith(path.join(server.root, "data", "logs"))), []);
   }
 });
 
@@ -181,6 +185,126 @@ test("a server outlives the dashboard process that started it: its output still 
   assert.deepEqual(later.problems(), []);
   // Nobody was there to be handed its exit code. The log says that it went.
   assert.match(server.runtimeLog(), new RegExp(`^\\[[^\\]]+\\] Process ${pid} is no longer running$`, "m"));
+});
+
+// --- where the pipes are kept ----------------------------------------------------------------------
+
+test("a server's console pipe is not in its folder, so nothing that reads the folder waits on it", async (t) => {
+  const { spawnSync } = require("node:child_process");
+  const server = await createServerRoot(t);
+  const { serverManager } = await createManager(server.root);
+  await serverManager.startServer(SERVER_ID, OWNER);
+  await server.whenReady();
+
+  // No pipe anywhere under the server's folder while it runs.
+  const pipes = fs
+    .readdirSync(server.serverDir, { recursive: true, withFileTypes: true })
+    .filter((entry) => entry.isFIFO())
+    .map((entry) => path.join(entry.parentPath, entry.name));
+  assert.deepEqual(pipes, []);
+
+  // A search through the folder comes back. On a pipe that a running server
+  // reads it waited for ever: the server never closes its end.
+  const search = spawnSync("grep", ["-R", "-l", "text that is nowhere in there", server.serverDir], { timeout: 10_000 });
+  assert.equal(search.signal, null, "the search did not come back");
+  assert.equal(search.status, 1);
+  // And a copy of the folder takes no pipe with it.
+  const copy = path.join(server.root, "a-copy");
+  assert.equal(spawnSync("cp", ["-a", server.serverDir, copy], { timeout: 10_000 }).status, 0);
+  assert.deepEqual(
+    fs.readdirSync(copy, { recursive: true, withFileTypes: true }).filter((entry) => entry.isFIFO()),
+    []
+  );
+
+  assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+});
+
+test("each server has a pipe of its own, under a plain name even when its id is not one", async (t) => {
+  const server = await createServerRoot(t);
+  // A folder found in servers/ is a server, and its name is the server's id.
+  const oddId = "Zweiter Server (März)";
+  const oddDir = path.join(server.root, "servers", oddId);
+  fs.mkdirSync(path.join(oddDir, "logs"), { recursive: true });
+  fs.writeFileSync(path.join(oddDir, "eula.txt"), "eula=true\n");
+  fs.copyFileSync(path.join(server.serverDir, "fake-server.js"), path.join(oddDir, "fake-server.js"));
+  const { problems, serverManager } = await createManager(server.root);
+  await serverManager.syncDiscoveredServers();
+  await serverManager.setServerMetadata(oddId, { passphrase: "lane-secret", startCommand: "./fake-server.js" });
+  const received = (directory) => {
+    try {
+      return fs.readFileSync(path.join(directory, "received.log"), "utf8").split("\n").filter(Boolean);
+    } catch {
+      return [];
+    }
+  };
+
+  assert.equal((await serverManager.startServer(SERVER_ID, OWNER)).running, true);
+  assert.equal((await serverManager.startServer(oddId, OWNER)).running, true);
+  await server.whenReady();
+  await waitFor(() => fs.existsSync(path.join(oddDir, "fake-server.pid")), "the second server to be ready");
+
+  const names = fs.readdirSync(server.consolesDir).sort();
+  assert.equal(names.length, 2);
+  assert.equal(names[0], SERVER_ID);
+  assert.match(names[1], /^id-[0-9a-f]{40}$/);
+  for (const name of names) {
+    assert.equal(fs.lstatSync(path.join(server.consolesDir, name)).isFIFO(), true);
+  }
+
+  // "stop" for one of them reaches that one alone.
+  assert.equal((await serverManager.stopServer(oddId, OWNER)).running, false);
+  assert.deepEqual(received(oddDir), ["console: stop", "exit: stop"]);
+  assert.deepEqual(server.received(), []);
+  assert.deepEqual(fs.readdirSync(server.consolesDir), [SERVER_ID]);
+  assert.deepEqual(await serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
+  assert.deepEqual(fs.readdirSync(server.consolesDir), []);
+  assert.deepEqual(problems(), []);
+});
+
+test("a link where the folder of pipes belongs is not followed", async (t) => {
+  const server = await createServerRoot(t);
+  const elsewhere = path.join(server.root, "somewhere-else");
+  fs.mkdirSync(elsewhere);
+
+  // Before a server is started: no pipe is made through it.
+  fs.mkdirSync(path.dirname(server.consolesDir), { recursive: true });
+  fs.symlinkSync(elsewhere, server.consolesDir);
+  const first = await createManager(server.root);
+  assert.equal((await first.serverManager.startServer(SERVER_ID, OWNER)).running, true);
+  await server.whenReady();
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
+  assert.deepEqual(
+    first.problems().map((entry) => [entry.message, entry.meta.reason]),
+    [["A server was started without a console that outlasts the dashboard", "data/consoles is not a folder of its own"]]
+  );
+  assert.deepEqual(await first.serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  assert.deepEqual(server.received(), ["console: stop", "exit: stop"]);
+  fs.rmSync(path.join(server.serverDir, "received.log"));
+  fs.rmSync(path.join(server.serverDir, "fake-server.pid"));
+
+  // While a server runs: the folder is swapped for a link to one that holds
+  // another pipe of the same name, with something reading it.
+  fs.unlinkSync(server.consolesDir);
+  const second = await createManager(server.root);
+  assert.equal((await second.serverManager.startServer(SERVER_ID, OWNER)).running, true);
+  await server.whenReady();
+  assert.equal(fs.lstatSync(server.consoleFile).isFIFO(), true);
+  plantPipe(path.join(elsewhere, SERVER_ID));
+  const reader = fs.openSync(path.join(elsewhere, SERVER_ID), fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
+  t.after(() => fs.closeSync(reader));
+  fs.renameSync(server.consolesDir, `${server.consolesDir}.real`);
+  fs.symlinkSync(elsewhere, server.consolesDir);
+
+  assert.deepEqual(await second.serverManager.stopServer(SERVER_ID, OWNER), STOPPED);
+  // Nothing was written through the link, and nothing was removed through it.
+  assert.equal(whatArrived(reader), "");
+  assert.equal(fs.lstatSync(path.join(elsewhere, SERVER_ID)).isFIFO(), true);
+  assert.deepEqual(server.received(), ["signal: SIGTERM", "exit: SIGTERM"]);
+  assert.deepEqual(
+    second.problems().map((entry) => [entry.message, entry.meta.reason]),
+    [['Server has no console the dashboard can reach: sent SIGTERM instead of "stop"', "data/consoles is not a folder of its own"]]
+  );
 });
 
 // --- when something else is where the console was -------------------------------------------------
@@ -284,7 +408,7 @@ test("what is left where the console belongs is cleared away by the next start, 
   const { problems, serverManager } = await createManager(server.root);
   const elsewhere = path.join(server.root, "elsewhere.txt");
   fs.writeFileSync(elsewhere, "nobody writes here\n");
-  fs.mkdirSync(server.runtimeDir, { recursive: true });
+  fs.mkdirSync(server.consolesDir, { recursive: true });
 
   for (const plant of [
     () => fs.symlinkSync(elsewhere, server.consoleFile),

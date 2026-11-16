@@ -147,7 +147,9 @@ function describeServerDir(root, serverId = SERVER_ID) {
     }
   };
   const layout = {
-    consoleFile: path.join(runtimeDir, "console"),
+    // The console pipes are together in data/, each under its server's id.
+    consoleFile: path.join(root, "data", "consoles", serverId),
+    consolesDir: path.join(root, "data", "consoles"),
     // The pid the stand-in wrote down for itself, or null before it has.
     fakePid: () => Number(read(path.join(serverDir, "fake-server.pid"))) || null,
     pidFile: path.join(runtimeDir, "pid.json"),

@@ -168,6 +168,42 @@ test("a pid file that cannot be read, or names something else, is not a game ser
   assert.equal(machine.head(), machine.newCommit);
 });
 
+test("a console pipe in data/ is not in the way, is not backed up, and is still there afterwards", { skip }, async (t) => {
+  const machine = await createMachine(t);
+  // Every machine here has one: a dashboard with a running server keeps that
+  // server's console in data/consoles. Here one of them has a reader too, as a
+  // running server is: whatever opens such a pipe to read it never comes back.
+  const consoles = path.join(machine.checkout, "data", "consoles");
+  const pipe = path.join(consoles, "Demo");
+  assert.equal(fs.lstatSync(pipe).isFIFO(), true);
+  const reader = fs.openSync(pipe, fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
+  t.after(() => fs.closeSync(reader));
+  const untouched = () => {
+    assert.equal(fs.lstatSync(consoles).isDirectory(), true);
+    assert.equal(fs.lstatSync(consoles).mode & 0o777, 0o700);
+    assert.equal(fs.lstatSync(pipe).isFIFO(), true);
+    assert.equal(fs.lstatSync(pipe).mode & 0o777, 0o600);
+    // Nothing was written into it either.
+    assert.throws(() => fs.readSync(reader, Buffer.alloc(16)), { code: "EAGAIN" });
+  };
+
+  const check = machine.run(["--check"]);
+  assert.equal(check.status, 0, check.output);
+  untouched();
+
+  const result = machine.run();
+  assert.equal(result.status, 0, result.output);
+  untouched();
+  // The backup holds the three files and nothing of the pipes.
+  assert.deepEqual(fs.readdirSync(path.join(machine.backup(), "data")).sort(), ["app.json", "servers.json", "users.json"]);
+
+  const again = machine.run();
+  assert.equal(again.status, 0, again.output);
+  const back = machine.run(["--rollback"]);
+  assert.equal(back.status, 0, back.output);
+  untouched();
+});
+
 test("a game server started after the first look is watched all the same", { skip }, async (t) => {
   const machine = await createMachine(t);
   const before = originalData(machine);
