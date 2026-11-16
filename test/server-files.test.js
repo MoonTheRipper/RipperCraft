@@ -35,6 +35,31 @@ async function timed(answer) {
   return { ms: Date.now() - from, value };
 }
 
+// A socket to try the reader on, at a path short enough to be one whatever
+// TMPDIR is. null, with a note, where none can be made.
+async function listenOnAShortPath(t) {
+  let folder;
+  try {
+    folder = fs.mkdtempSync(path.join("/tmp", "rc-"));
+  } catch (error) {
+    t.diagnostic(`no socket was tried: a short folder for one could not be made (${error.code || error.message})`);
+    return null;
+  }
+  t.after(() => fs.rmSync(folder, { force: true, recursive: true }));
+  const target = path.join(folder, "socket.txt");
+  const listening = net.createServer();
+  const failure = await new Promise((resolve) => {
+    listening.once("error", resolve);
+    listening.listen(target, () => resolve(null));
+  });
+  if (failure) {
+    t.diagnostic(`no socket was tried: one could not be made at ${target} (${failure.code || failure.message})`);
+    return null;
+  }
+  t.after(() => new Promise((resolve) => listening.close(resolve)));
+  return target;
+}
+
 test("a whole file is read only when it is a file, and nothing else is waited on", async (t) => {
   const server = await createServerRoot(t);
   const at = (name) => path.join(server.root, name);
@@ -48,9 +73,10 @@ test("a whole file is read only when it is a file, and nothing else is waited on
   const writer = fs.openSync(at("written-pipe.txt"), fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
   t.after(() => fs.closeSync(writer));
   fs.writeSync(writer, "something in the pipe\n");
-  const listening = net.createServer();
-  await new Promise((resolve) => listening.listen(at("socket.txt"), resolve));
-  t.after(() => new Promise((resolve) => listening.close(resolve)));
+  // A socket's path has to fit in about a hundred bytes, and the temporary
+  // folder's own may be most of that already: it is made in a short folder
+  // of its own, and where there is no such folder that one case is left out.
+  const socket = await listenOnAShortPath(t);
 
   assert.equal(await readRegularFile(at("a.txt")), "eula=true\n");
   // Through a link, as readFile reads: it is what the link leads to that counts.
@@ -59,10 +85,10 @@ test("a whole file is read only when it is a file, and nothing else is waited on
   await assert.rejects(readRegularFile(at("no-such.txt")), { code: "ENOENT" });
   await assert.rejects(readRegularFile(at("dangling.txt")), { code: "ENOENT" });
 
-  for (const name of ["folder.txt", "pipe.txt", "written-pipe.txt", "socket.txt", "endless.txt"]) {
-    const outcome = await unlessItHangs(readRegularFile(at(name)).then(() => "read", (error) => error));
-    assert.equal(outcome.code, "ERR_NOT_A_FILE", name);
-    assert.equal(outcome.message, `${at(name)} is not a regular file, and was not read.`, name);
+  for (const target of [at("folder.txt"), at("pipe.txt"), at("written-pipe.txt"), at("endless.txt"), ...(socket ? [socket] : [])]) {
+    const outcome = await unlessItHangs(readRegularFile(target).then(() => "read", (error) => error));
+    assert.equal(outcome.code, "ERR_NOT_A_FILE", target);
+    assert.equal(outcome.message, `${target} is not a regular file, and was not read.`, target);
   }
   // What was in the pipe is still in it.
   assert.equal(whatArrived(writer), "something in the pipe\n");
