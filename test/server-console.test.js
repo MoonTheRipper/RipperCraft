@@ -274,6 +274,21 @@ test("each server has a pipe of its own, under a plain name even when its id is 
   assert.deepEqual(problems(), []);
 });
 
+test("deleting a server takes a console pipe that was left behind for it", async (t) => {
+  const server = await createServerRoot(t);
+  const { serverManager } = await createManager(server.root);
+  // Left behind: the server went while no dashboard was watching, and its
+  // record has gone since. Nothing that asks after the server clears it away.
+  fs.mkdirSync(server.consolesDir, { recursive: true });
+  plantPipe(server.consoleFile);
+  assert.deepEqual(await serverManager.getServerStatus(SERVER_ID), STOPPED);
+  assert.equal(fs.lstatSync(server.consoleFile).isFIFO(), true);
+
+  assert.deepEqual(await serverManager.deleteServer(SERVER_ID), { deleted: true, directory: `servers/${SERVER_ID}`, id: SERVER_ID });
+  assert.equal(isThere(server.serverDir), false);
+  assert.deepEqual(fs.readdirSync(server.consolesDir), []);
+});
+
 test("a link where the folder of pipes belongs is not followed", async (t) => {
   const server = await createServerRoot(t);
   const elsewhere = path.join(server.root, "somewhere-else");
