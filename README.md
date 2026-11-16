@@ -9,7 +9,7 @@ Current feature set:
 - First-run owner bootstrap in the browser, gated by a one-time setup code
 - Owner and admin accounts with per-server access lists
 - Per-server passphrase unlocks before start, settings edits, world activation, and mod installs
-- Start and stop controls for managed servers
+- Start and stop controls for managed servers, with a stop that asks the server on its console and waits for the world to be saved
 - `server.properties` editing and server metadata editing
 - World archive capture, zip import, activation, and export
 - Debug log viewing from `logs/latest.log` and the manager runtime log
@@ -90,6 +90,30 @@ An admin is someone the owner trusts with one or a few servers: to start and sto
 
 One thing it cannot hold: an add-on is code, and a server that loads it runs it as the same system user as the dashboard. Run as a service, the dashboard and its game servers are shut in a sandbox that keeps such code away from your home directory and the rest of the machine, but not away from the dashboard itself: see [What the sandbox does not do](#what-the-sandbox-does-not-do). Give admin accounts to people you would trust with the dashboard and every server in it.
 
+### Starting and stopping
+
+**Stop** tells the server to stop on its console, the same as typing `stop` there. The server tells its players, saves the world and exits. That takes seconds as a rule, and minutes on a machine that is short of memory, so the dashboard does not wait for it with the page:
+
+- The request is answered at once. The server is shown as **stopping…** until its process has gone, in the page header, in the overview and in the server tree, and the page asks every two seconds until it has. Start and Stop are held meanwhile.
+- Pressing Stop again, from the same page or another one, starts nothing new: it is the same stop. Starting a server that is still stopping is refused, and so is everything else that needs a stopped server.
+- The dashboard is patient, and says when its patience runs out:
+
+  | The server | First | If it has not exited | Last of all |
+  | --- | --- | --- | --- |
+  | has a console the dashboard can reach | `stop` on the console | after 3 minutes, `SIGTERM` | 1 minute after that, `SIGKILL` |
+  | has none | `SIGTERM` | | after 4 minutes, `SIGKILL` |
+
+  Minecraft saves the world on `SIGTERM` as it does on `stop`. `SIGKILL` saves nothing: whatever the server had not written is lost. Every signal is written at `WARN` to the dashboard's log and added to the server's own `runtime.log`, with how long the server had been given.
+- A stop belongs to the dashboard process that began it. If the dashboard is restarted in the middle of one, the server has been told to stop already and carries on; pressing Stop again starts a new stop, as patient as the first.
+
+**The console** is a named pipe in the server's folder, `.rippermoon/console`, that only the account can read and write. It is made when the server starts and removed when the server has gone. The server holds it open for as long as it runs, so it does not depend on the dashboard: restart the dashboard, and the server is still stopped by `stop`, not by a signal. Making the pipe needs `mkfifo`, which every Linux and macOS has, and a file system that can hold one. Where it cannot be made the server is started with a pipe from the dashboard itself, as it used to be, and both logs say so; such a server has a console only until the dashboard is next restarted, and is stopped by signal after that.
+
+**`runtime.log`**, in `.rippermoon/` beside it, is written by the server itself: its output goes straight into the file, not through the dashboard. It goes on being written while the dashboard is restarting or away. The dashboard adds lines of its own: who started the server, each step of a stop, and how the process ended.
+
+**A server that was started by an earlier version** of the dashboard has no such pipe: its console was a pipe to the dashboard process that started it. It is stopped by signal until it has been stopped and started once with this version. See [Updating](#updating) for what to do with servers that are running when you update.
+
+The dashboard reads `.rippermoon/pid.json` to find a server it started before a restart, and that file is in the server's folder, where a mod can write. A pid in it counts only if it is a whole number above 1 that is not the dashboard's own, and nothing is signalled on the word of anything else. The console and the pid file are never opened through a link, the runtime log is never written through one, and the console is only written to if it is a named pipe. A log is only read if it is a regular file: a pipe left where `logs/latest.log` or `runtime.log` belongs reads as empty, and no longer holds the dashboard up.
+
 ### Server settings
 
 - The **loader** is one of `vanilla`, `fabric`, `forge`, `neoforge`, `quilt`, `paper`, `purpur`, `folia`, `spigot`, `bukkit` or `custom`.
@@ -148,7 +172,7 @@ Every response carries a `Content-Security-Policy` that lets the page load scrip
 ## Notes
 
 - New vanilla servers are created with `eula=false`. Review Mojang's EULA before switching them to `true`.
-- Graceful stopping works best for servers started through `RipperCraft` itself.
+- A server is stopped through its console, and given time to save: see [Starting and stopping](#starting-and-stopping). The dashboard can only stop servers it started itself.
 - CurseForge automation is disabled until a key is configured. Save one in Owner → Integrations (verified against CurseForge before it is stored, kept in `data/app.json`, never sent back to the browser), or set `CURSEFORGE_API_KEY`. The environment variable always wins, and the Owner page says so when it is in effect. `CURSEFORGE_GAME_ID` is optional and defaults to `432` (Minecraft).
 - `data/app.json`, `data/users.json`, and `data/servers.json` hold the cookie secret, password hashes, and server passphrase hashes. They are forced to mode `600` on startup, and are replaced in one step when they change (written to a temporary file beside them, then renamed), so a crash or two saves at once cannot leave one half-written.
 - Once someone has signed in on this version their password hash is in the new format, which earlier versions cannot read. Keep a copy of `data/users.json` from before the upgrade if you might need to go back. `infra/systemd/migrate-to-rippercraft.sh` makes one, and puts it back if it has to undo the upgrade.
@@ -222,6 +246,8 @@ sudo infra/systemd/migrate-to-rippercraft.sh    # only does something if the uni
 sudo systemctl restart rippercraft              # game servers keep running
 ```
 
+The first time you update to a version that gives servers a [console of their own](#starting-and-stopping), stop every running game server from the dashboard before you do, and start them again afterwards. A server started by the older version has its console in the dashboard process that the restart ends. Stopped before the restart, it is still stopped by `stop`; left running through it, it can only be stopped by signal. Servers started since are not affected, and later updates need nothing of the kind.
+
 ### What the sandbox does
 
 The dashboard and every game server it starts run as the account that owns the checkout, in a group of their own, `rippercraft`, with this and no more:
@@ -233,7 +259,7 @@ The dashboard and every game server it starts run as the account that owns the c
 - **None of what your account has lying about outside its home directory**: the terminals you are logged in on and your `screen` sessions, which anything running as you could otherwise read and type into; the crash dumps of your programs, which hold their memory; the system's logs; the machine's shared memory; and the kernel's key store.
 - **No way to gain privileges.** `sudo` and every other setuid program stop working inside it. No mounting, no kernel modules, no tracing other processes, no setting the clock, and network and local sockets only.
 
-Restarting or stopping the service signals the dashboard alone. Game servers keep running, and the dashboard finds them again when it is back.
+Restarting or stopping the service signals the dashboard alone. Game servers keep running, with their consoles and still writing their logs, and the dashboard finds them again when it is back. A stop that was under way is not carried over: the server has been told, and Stop can be pressed again.
 
 Two things follow for you. Do not run programs out of `data/` or `servers/` yourself: those are the two folders a mod can write to. That is why `npm test` only runs the files in `test/`. And settings of your own belong in a drop-in (`sudo systemctl edit rippercraft`), not in the installed unit, which the script rewrites.
 
