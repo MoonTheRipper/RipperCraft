@@ -1,7 +1,6 @@
 const crypto = require("node:crypto");
 const path = require("node:path");
 const fsp = require("node:fs/promises");
-const os = require("node:os");
 const { HttpError, describeBytes } = require("./http");
 const { newUploadTempPath, removeStaleTempFiles } = require("./upload");
 const { createMutex, ensureDir, nowIso, readEnv, runCommand, safeFilename, withinParent } = require("./utils");
@@ -18,7 +17,11 @@ const FREE_SPACE_RESERVE_BYTES = 1024 * 1024 * 1024;
 // Where an archive is unpacked before it becomes the world: a folder beside
 // the world folder, so that putting it in place is a rename and never a copy.
 const STAGING_PREFIX = ".rippercraft-restore-";
-const STAGING_NAME = /^\.rippercraft-restore-[0-9a-f]{16}$/;
+// Where a world is zipped for download: beside the world folder too, on the
+// disk the world is on. It used to be the system's temporary folder, which is
+// often memory.
+const EXPORT_PREFIX = ".rippercraft-export-";
+const STAGING_NAME = /^\.rippercraft-(?:restore|export)-[0-9a-f]{16}$/;
 const STALE_STAGING_AGE_MS = 24 * 60 * 60 * 1000;
 
 // The limit in bytes, from RIPPERCRAFT_MAX_WORLD_MB.
@@ -362,7 +365,7 @@ function createWorldManager(serverManager, options = {}) {
     }
   }
 
-  // Removes unpacking folders a crash or a kill left behind.
+  // Removes unpacking and export folders a crash or a kill left behind.
   async function removeStaleStaging(directory, now = Date.now()) {
     let names;
     try {
@@ -517,7 +520,13 @@ function createWorldManager(serverManager, options = {}) {
       throw worldError("This server has no world to export yet. Start it once to generate one.");
     }
     await assertWorldFolderIsOurs(paths);
-    const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "rippermoon-export-"));
+    // A folder of its own beside the world folder, like the one a restore
+    // unpacks into. One left behind by a dashboard that was stopped half-way
+    // is cleared by the next export or restore once it is a day old.
+    const stagingParent = path.dirname(paths.worldDir);
+    await removeStaleStaging(stagingParent);
+    const tmpDir = path.join(stagingParent, `${EXPORT_PREFIX}${crypto.randomBytes(8).toString("hex")}`);
+    await fsp.mkdir(tmpDir, { mode: 0o700 });
     const outputPath = path.join(tmpDir, `${safeFilename(server.id)}-active-world.zip`);
     try {
       await zipWorld(paths, outputPath);

@@ -154,11 +154,15 @@ sudo cp infra/hosting/generated/frpc.toml /etc/frp/frpc.toml
 
 Install frp client and copy `infra/hosting/systemd/home/frpc.service`.
 
-Run the dashboard locally:
+Run the dashboard. To try it:
 
 ```bash
 npm start
 ```
+
+To keep it running, install it as a service: see "Running it as a service" in the
+[README](../../README.md#running-it-as-a-service). It listens on `127.0.0.1:4300`
+by default, which is where the tunnel expects it.
 
 Then start the tunnel:
 

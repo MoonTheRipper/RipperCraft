@@ -2,7 +2,7 @@
 
 `RipperCraft` is a browser-based Minecraft server control panel that wraps the local `servers/` directory in this workspace.
 
-> Formerly `RipperMoonStash`. The `RIPPERMOONSTASH_*` environment variables and `rippermoonstash-` browser storage keys are still read, so an existing deployment keeps working across the rename. The systemd unit and hosting domain are deliberately untouched — rename those yourself when you are ready.
+> Formerly `RipperMoonStash`. The `RIPPERMOONSTASH_*` environment variables and `rippermoonstash-` browser storage keys are still read, so an existing deployment keeps working across the rename. A dashboard still running as `rippermoonstash.service` is moved to the sandboxed `rippercraft.service` by one script: see [Running it as a service](#running-it-as-a-service). The hosting domain is yours to rename when you are ready.
 
 Current feature set:
 
@@ -88,7 +88,7 @@ Other request bodies are limited to 1 MB.
 
 An admin is someone the owner trusts with one or a few servers: to start and stop them, change the everyday settings, manage worlds and install add-ons. An admin is not trusted with the machine, with the other servers, or with the owner's account, and the dashboard is built to hold that line. The parts of it an operator will notice are below.
 
-One thing it does not hold yet: an add-on is code, and a server that loads it runs it as the same system user as the dashboard. Give admin accounts to people you would let install a mod on your machine.
+One thing it cannot hold: an add-on is code, and a server that loads it runs it as the same system user as the dashboard. Run as a service, the dashboard and its game servers are shut in a sandbox that keeps such code away from your home directory and the rest of the machine, but not away from the dashboard itself: see [What the sandbox does not do](#what-the-sandbox-does-not-do). Give admin accounts to people you would trust with the dashboard and every server in it.
 
 ### Server settings
 
@@ -105,6 +105,7 @@ A world archive is a zip, and a zip can hold more than files.
 - **Restoring** reads the archive itself rather than handing it to `unzip`, and creates only folders and regular files. An archive that holds a symbolic link, a path that leads out of the world folder (`../`), or an entry that turns out larger than its header says is refused, and says why. So is an encrypted archive and one compressed with anything but the standard `store` and `deflate` methods (Deflate64, which Windows uses for files over 2 GB, is the one you might meet): zip it again with another tool.
 - A world may unpack to at most `RIPPERCRAFT_MAX_WORLD_MB` (32 GB by default), and never to more than the disk has free less 1 GB. Raise the limit if your worlds are larger than that. Folders count: each is charged 4 KB against the limit, an archive may hold at most 200,000 files and folders together, and a path in it may be at most 64 names long (63 folders and the file). No world Minecraft writes comes near either.
 - The archive is unpacked into a folder beside the world folder (`.rippercraft-restore-…`, removed afterwards) and moved into place when all of it has been checked. Nothing is unpacked in `/tmp` any more. If the dashboard is killed part-way, the leftover folder is cleared by the next restore once it is a day old.
+- A world is zipped for **download** beside the world folder as well (`.rippercraft-export-…`, removed once it has been sent), no longer in `/tmp`, which is often memory.
 - The live world is archived before a restore or a new world replaces it. If that backup cannot be made, the restore stops and the world stays; it used to carry on. Why it could not be made is in the dashboard's log.
 - Backups, restores, exports, new worlds and archive uploads for one server are done **one at a time**, in the order they were asked for, and restores one at a time across all servers. A second request waits for the first instead of running through it; the same restore clicked twice used to be able to lose the world.
 - **Backing up and exporting** store a symbolic link found inside a world as a link, not as the files it points to. Such a backup cannot be restored from the dashboard, so keep worlds free of links.
@@ -136,7 +137,7 @@ The dashboard makes these requests directly. It does not use an HTTP proxy from 
 
 A game server, and anything else the dashboard runs, is started with a short list of environment variables rather than everything the dashboard itself was started with: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `JAVA_HOME`, `RIPPERCRAFT_JAVA_BIN`, `RIPPERMOONSTASH_JAVA_BIN`, `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS` and `_JAVA_OPTIONS`. `CURSEFORGE_API_KEY` and the rest of the service's settings are no longer passed to mods.
 
-That is not the same as mods being unable to get them. A game server runs as the same system user as the dashboard, and on Linux a process may read the environment of any other process of its own user from `/proc`. A mod that goes looking can still find the key there, until game servers run under a user of their own.
+That is not the same as mods being unable to get them. A game server runs as the same system user as the dashboard, and on Linux a process may read the environment of any other process of its own user from `/proc`. A mod that goes looking can still find the key there, until game servers run under a user of their own. The sandbox the service runs in does not change that: it is around the dashboard and the game servers together.
 
 If a start script of your own reads some other variable that you set for the service, set it in the script, or have the script read it from a file.
 
@@ -150,7 +151,7 @@ Every response carries a `Content-Security-Policy` that lets the page load scrip
 - Graceful stopping works best for servers started through `RipperCraft` itself.
 - CurseForge automation is disabled until a key is configured. Save one in Owner → Integrations (verified against CurseForge before it is stored, kept in `data/app.json`, never sent back to the browser), or set `CURSEFORGE_API_KEY`. The environment variable always wins, and the Owner page says so when it is in effect. `CURSEFORGE_GAME_ID` is optional and defaults to `432` (Minecraft).
 - `data/app.json`, `data/users.json`, and `data/servers.json` hold the cookie secret, password hashes, and server passphrase hashes. They are forced to mode `600` on startup, and are replaced in one step when they change (written to a temporary file beside them, then renamed), so a crash or two saves at once cannot leave one half-written.
-- Once someone has signed in on this version their password hash is in the new format, which earlier versions cannot read. Keep a copy of `data/users.json` from before the upgrade if you might need to go back.
+- Once someone has signed in on this version their password hash is in the new format, which earlier versions cannot read. Keep a copy of `data/users.json` from before the upgrade if you might need to go back. `infra/systemd/migrate-to-rippercraft.sh` makes one, and puts it back if it has to undo the upgrade.
 - Forge and NeoForge are installed by running their official installer, which needs a working Java. They produce argfiles rather than a `server.jar`, and the generated launch script handles both shapes. NeoForge has no builds before Minecraft 1.20.2.
 - Pick a per-server **java version** in Settings when one server needs a different JDK from the rest, for example Forge 1.20.1 on Java 17 alongside newer servers on Java 21+. `RIPPERMOONSTASH_JAVA_BIN` and `JAVA_HOME` apply to the whole service, so they cannot express that on their own. Installed JDKs are detected automatically from the usual locations (`/usr/lib/jvm`, `/usr/java`, `/opt/java`, SDKMAN, macOS `JavaVirtualMachines`), deduplicated across version symlinks, and offered as a dropdown; the list is cached for five minutes.
 - The loader dropdown is a label, not an installer. If it disagrees with the runtime actually on disk, Settings shows a mismatch warning: a server labelled `forge` but running a vanilla jar starts normally and loads no mods.
@@ -161,14 +162,121 @@ Every response carries a `Content-Security-Policy` that lets the page load scrip
 
 ## Running it as a service
 
-`infra/systemd/rippercraft.service` is written for one particular machine: a checkout at
-`/home/ripper-moon/minecraft-server`, run by the user `ripper-moon` with Node from nvm.
-Change `User`, `Group`, `WorkingDirectory` and the Node paths to match yours before
-installing it. The same goes for the units under `infra/hosting/systemd/`.
+`infra/systemd/rippercraft.service` runs the dashboard under systemd, in a sandbox. It is a template: nothing in it names a machine, an account or a path. `infra/systemd/migrate-to-rippercraft.sh` fills it in for the machine it is run on, tries the result out, and installs it.
+
+```bash
+cd /path/to/the/checkout
+sudo infra/systemd/migrate-to-rippercraft.sh --check    # look; change nothing
+sudo infra/systemd/migrate-to-rippercraft.sh            # install and start
+```
+
+The service runs as the account that owns the checkout, so clone it as the account the game servers should run as, not as root. It needs systemd, Node 24, Java and `zip`, and `git` and `curl` for the script. Java and `zip` have to be installed for the whole machine, not in a home directory; Node may be in one (nvm is fine). `data/` and `servers/` have to be folders in the checkout itself, not links to folders kept somewhere else: if they are on another disk, mount it there.
+
+A service keeps every group its account is in. If the account is in `docker`, `lxd`, `incus` or `libvirt` on a machine where that service is installed, the script refuses: whoever can use such a socket is root, sandbox or no sandbox. Take the account out of the group, or give the dashboard an account of its own.
+
+On a machine that has not run the dashboard as a service before, that is all there is to it. It listens on `127.0.0.1:4300`; `--host 0.0.0.0` and `--port` change that. Secrets such as `CURSEFORGE_API_KEY` go in `/etc/rippercraft.env`, owned by root with mode `600`, one `NAME=value` to a line.
+
+Before it changes anything, the script fills the unit in, has systemd check it, and then starts the sandbox for a moment under another name and looks at it from the inside: the code can be read and not written, `data/` and `servers/` can be written, the home directory is empty, `/tmp` is its own, the machine's terminals, logs and crash dumps are out of reach, and node, java and zip run. If any of that is not so on your machine it stops and says which. `--check` does the same and then lists what it would do.
+
+### Moving from `rippermoonstash.service`
+
+The checkout is still on the old commit, and the script in it is the old one. Fetch, and run the script out of the commit you are moving to:
+
+```bash
+cd /path/to/the/checkout
+git fetch
+git show origin/main:infra/systemd/migrate-to-rippercraft.sh > ~/migrate-to-rippercraft.sh
+sudo bash ~/migrate-to-rippercraft.sh --check
+sudo bash ~/migrate-to-rippercraft.sh
+```
+
+It carries the address, the port and the node binary over from the old unit, copies `/etc/rippermoonstash.env` to `/etc/rippercraft.env`, copies `data/*.json` to `/var/backups/rippercraft/<time>/` (root only), fast-forwards the checkout to `origin/main`, and hands over. It needs no network: the fetch is the only step that does.
+
+Game servers that are running keep running. They were started by the dashboard and belong to its unit, and stopping a unit normally stops everything in it; so the old unit is first told to signal only the dashboard, and after the handover the script checks that every game server is still the process it was. The dashboard is away for up to a minute.
+
+If the new dashboard does not start, does not answer, answers with the old code, or a game server is gone, the script undoes all of it - the unit, the checkout, the `data/*.json` files - starts the old unit again, checks that it answers, and says what happened. It ends with status 2 then, or 3 if it could not put everything back, in which case it says in capitals what is not as it was and how to look.
+
+Afterwards:
+
+- Restart each game server from the dashboard, one at a time. A server that was running during the move keeps running *outside* the sandbox until it has been restarted.
+- Everybody has been signed out. Passwords keep working whatever their length; ask every admin whose password is shorter than 12 characters to change it.
+- Running the script again only checks, and says that there is nothing to do.
+
+### Going back
+
+```bash
+sudo infra/systemd/migrate-to-rippercraft.sh --rollback
+```
+
+undoes the last run of the script that changed something. It stops `rippercraft.service` (game servers keep running), puts the checkout back on the commit it was on, puts back the `data/*.json` files from the backup, removes the new unit, and starts and enables what was running before. The files as they were just before going back, and `/etc/rippercraft.env` if the migration made it, are kept beside the backup.
+
+Going back loses what has been changed in the dashboard since the migration: accounts, passwords, server settings. The older code cannot read a password once the newer code has stored it again, so the files from before are the only ones it can use. Worlds and server folders are not touched. It is meant for the days after a migration: once the checkout has been moved on with `git pull`, the script declines, and going back is the steps below.
+
+The script prints the same steps as commands to run by hand when a migration ends. They are: stop `rippercraft`; `git reset --keep` the checkout to the commit from before; put the files from `/var/backups/rippercraft/<time>/data/` back in `data/`, yours and mode `600`; remove `/etc/systemd/system/rippercraft.service` and `sudo systemctl daemon-reload`; `sudo systemctl enable --now rippermoonstash`. When you put the files back by hand, move each into place rather than copying over what is there: `data/` is the service's to write to, and a copy would follow a link left in it. Leave the drop-in in `/etc/systemd/system/rippermoonstash.service.d/` where it is for as long as that unit is installed: it is what keeps game servers running when the unit is stopped.
+
+### Updating
+
+```bash
+git pull --ff-only
+sudo infra/systemd/migrate-to-rippercraft.sh    # only does something if the unit has changed
+sudo systemctl restart rippercraft              # game servers keep running
+```
+
+### What the sandbox does
+
+The dashboard and every game server it starts run as the account that owns the checkout, in a group of their own, `rippercraft`, with this and no more:
+
+- **The checkout, read-only** - the code, `.git`, the unit file - with `data/` and `servers/` in it writable. Nothing the service runs can change what it will run next time, or what you run from the checkout yourself.
+- **An empty home directory of its own**, kept in memory and limited to 256 MB, and an empty `/tmp` and `/var/tmp`. Not yours: no `~/.ssh`, no `~/.config`, no tokens, no shell history, and nobody else's home either.
+- **The rest of the file system read-only**, and no disks or other devices.
+- **Its own processes only.** It cannot see the other programs your account is running, or look into them: their files, their environment, their memory. That is what the group is for. Linux allows one process to look inside another only when both the user and the group match, and a way into any of your other programs would be a way back to your home directory.
+- **None of what your account has lying about outside its home directory**: the terminals you are logged in on and your `screen` sessions, which anything running as you could otherwise read and type into; the crash dumps of your programs, which hold their memory; the system's logs; the machine's shared memory; and the kernel's key store.
+- **No way to gain privileges.** `sudo` and every other setuid program stop working inside it. No mounting, no kernel modules, no tracing other processes, no setting the clock, and network and local sockets only.
+
+Restarting or stopping the service signals the dashboard alone. Game servers keep running, and the dashboard finds them again when it is back.
+
+Two things follow for you. Do not run programs out of `data/` or `servers/` yourself: those are the two folders a mod can write to. That is why `npm test` only runs the files in `test/`. And settings of your own belong in a drop-in (`sudo systemctl edit rippercraft`), not in the installed unit, which the script rewrites.
+
+On systemd older than 257 the service's `/tmp` is of a kind that is emptied whenever the dashboard stops, from under the game servers that are still running. They carry on, but a mod that unpacks something into `/tmp` later may fail until its server is restarted.
+
+### What the sandbox does not do
+
+The dashboard and the game servers are one account in one sandbox, and a mod is code that runs with everything the dashboard has.
+
+- **The dashboard is not protected from a mod.** Anyone who can add a mod to a server can read and change everything in `data/` - the accounts, the password hashes, the cookie secret, every server's passphrase - and every other server's files. That is control of the dashboard. Access lists and passphrases hold for people, not for code a server runs.
+- **A mod can read `CURSEFORGE_API_KEY`**, and whatever else the service was started with, from the dashboard's entry in `/proc`.
+- **The network is open to it** as to any program: it can reach whatever listens on this machine or your LAN, and listen on any port above 1023.
+- **It can read what any local account can read** outside the home directories, and talk to system services that answer any local account.
+- **It can send signals** to the other programs of the same account - end them, not look into them.
+- **A game server that was already running** when the dashboard moved into the sandbox is outside it until it is restarted.
+
+What a mod can no longer do is get out: at your home directory and your keys, at the code the dashboard runs, at the rest of the system's files. Keeping one server's mods away from the dashboard and from the other servers would take a sandbox or an account for each server; that is not built.
+
+### Memory
+
+The dashboard itself uses a few tens of megabytes. Its heap is limited to 1 GB (`--max-old-space-size=1024` in the unit). Left alone, Node takes its limit from the size of the machine, which on one that runs game servers is gigabytes. With the limit a leak ends the dashboard at 1 GB, systemd starts it again five seconds later, and the game servers carry on. The limit is on the JavaScript heap; it does not cover memory the dashboard holds outside it.
+
+The unit as a whole has no limit. A game server is part of the unit, so a limit on the unit is a limit on all the game servers and the dashboard together, and when it is reached the kernel ends the largest process in the unit: a game server, not the dashboard. Whether you want that depends on your machine. If you would rather lose the largest server than have a runaway push the whole machine into swap, add a limit sized for it:
+
+```bash
+sudo systemctl edit rippercraft
+```
+
+```ini
+[Service]
+MemoryMax=12G
+MemorySwapMax=1G
+```
+
+Make it larger than what your servers may use together: each server's `-Xmx`, and about a quarter again for the JVM itself. Set too small, it ends a server for being as large as you told it it could be.
+
+### Reaching it from outside
 
 To reach the dashboard from outside your home network, see `infra/free-hosting/` (Cloudflare
 Tunnel and playit.gg, no server to rent) or `infra/hosting/` (a small VPS in front). Your own
-values go in the files those guides tell you to create; git ignores them.
+values go in the files those guides tell you to create; git ignores them. The other units under
+`infra/hosting/systemd/` are written for one particular machine: change the user and the paths
+in them before you install them.
 
 ## Licence
 
