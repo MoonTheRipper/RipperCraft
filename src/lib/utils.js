@@ -209,23 +209,36 @@ function displayNameFromSlug(value) {
     .replace(/\b\w/g, (match) => match.toUpperCase());
 }
 
+// The end of a text file: its last `maxBytes`, or "" when there is no file.
+//
+// What is read this way is a log in a server's folder, and what a mod leaves
+// at that path need not be a file. A named pipe, opened the ordinary way,
+// holds the open until something writes to it, and with it one of the four
+// threads that every file operation in the dashboard shares. Four such reads,
+// and nothing is read or written any more, the steps of stopping a server
+// among them. So the path is opened without waiting, and looked at before it
+// is read: anything but a regular file reads as empty.
 async function tailTextFile(filePath, maxBytes = 160_000) {
+  let handle;
   try {
-    const stats = await fs.stat(filePath);
-    const start = Math.max(0, stats.size - maxBytes);
-    const handle = await fs.open(filePath, "r");
-    try {
-      const buffer = Buffer.alloc(stats.size - start);
-      await handle.read(buffer, 0, buffer.length, start);
-      return buffer.toString("utf8");
-    } finally {
-      await handle.close();
-    }
+    handle = await fs.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
   } catch (error) {
     if (error.code === "ENOENT") {
       return "";
     }
     throw error;
+  }
+  try {
+    const stats = await handle.stat();
+    if (!stats.isFile()) {
+      return "";
+    }
+    const start = Math.max(0, stats.size - maxBytes);
+    const buffer = Buffer.alloc(stats.size - start);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
+    return buffer.toString("utf8", 0, bytesRead);
+  } finally {
+    await handle.close();
   }
 }
 
