@@ -1,4 +1,5 @@
 import { renderBrandMark } from "../components.js";
+import { describeRunState } from "../format.js";
 import { escapeHtml, labelWithIcon } from "../html.js";
 import { OWNER_SECTIONS, SERVER_SECTIONS, state } from "../state.js";
 
@@ -20,7 +21,7 @@ export function renderServerTree() {
                       data-server-id="${escapeHtml(server.id)}"
                     >
                       ${labelWithIcon("server", server.name)}
-                      <span class="tree-meta">${server.status.running ? "up" : "down"}</span>
+                      <span class="tree-meta">${describeRunState(server.status).short}</span>
                     </button>
                     ${expanded
                       ? `

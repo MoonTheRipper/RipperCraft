@@ -9,6 +9,7 @@ import { applyModalBehaviour, handleAppKeydown } from "./js/modal.js";
 import { setNotice } from "./js/notice.js";
 import { applyProgressBars } from "./js/progress.js";
 import { registerPostRender } from "./js/render.js";
+import { syncStopPolling } from "./js/stopping-live.js";
 
 // render() used to call these two directly at the end of a full render. They
 // are registered here instead so render.js never has to import logs-live.js,
@@ -19,6 +20,10 @@ registerPostRender(applyModalBehaviour);
 registerPostRender(applyLogScroll);
 registerPostRender(syncLogPolling);
 registerPostRender(applyProgressBars);
+// Watches a server that is stopping until it has stopped. Like the log poller
+// it is started and stopped by what is on the page, so a page that is opened
+// or reloaded in the middle of a stop picks it up by itself.
+registerPostRender(syncStopPolling);
 
 const app = getApp();
 

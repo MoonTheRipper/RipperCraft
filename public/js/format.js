@@ -19,6 +19,22 @@ export function formatBytes(bytes) {
   return `${Math.round(value * 10) / 10} ${units[unit]}`;
 }
 
+// What a server is doing, for every place that shows it: the chip in the page
+// header, the row in the overview, the word in the server tree.
+//
+// A server that has been told to stop is still running until its process has
+// gone: it is saving the world, and that can take minutes. It is shown as
+// neither up nor down, and it can be neither started nor stopped again.
+export function describeRunState(status) {
+  if (status?.running && status.stopping) {
+    return { label: "stopping…", short: "stopping", stopping: true, tone: "warn" };
+  }
+  if (status?.running) {
+    return { label: "online", short: "up", stopping: false, tone: "ok" };
+  }
+  return { label: "offline", short: "down", stopping: false, tone: "idle" };
+}
+
 export function getServerPermissions(snapshot = state.serverSnapshot) {
   return (
     snapshot?.server?.permissions || {

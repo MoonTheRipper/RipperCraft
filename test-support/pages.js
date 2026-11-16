@@ -146,6 +146,9 @@ function panelResponses() {
       updatable: 1
     },
     notice: { message: "something happened", type: "error" },
+    // The status of a server that has been told to stop and has not gone yet.
+    // A real one would take a server that is slow to stop.
+    stoppingStatus: { pid: 4242, running: true, startedAt: "2026-11-16T10:00:00.000Z", startedBy: "owner", stopping: true, stoppingSince: "2026-11-16T12:00:00.000Z" },
     updatePlan: {
       addons: {
         blockedReasons: [],
@@ -235,6 +238,15 @@ async function renderEverything(responses, role) {
     state.serverSection = "mods";
     pages.push(renderServerContent());
     state.modResults = panels.modResults;
+
+    // The same server while it is stopping: its page, and its place in the tree.
+    const atRest = state.serverSnapshot;
+    state.serverSnapshot = { ...atRest, server: { ...atRest.server, status: panels.stoppingStatus } };
+    state.servers = responses.servers.map((server) => ({ ...server, status: panels.stoppingStatus }));
+    state.serverSection = "overview";
+    pages.push(renderServerContent(), renderSidebar("light"));
+    state.serverSnapshot = atRest;
+    state.servers = responses.servers;
 
     if (role === "owner") {
       // The same server as one the dashboard installed the runtime for: with

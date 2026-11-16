@@ -199,6 +199,15 @@ test("the pages still draw what the server really sends", async (t) => {
   assert.match(page, /placeholder="0\.16\.10"/);
   assert.match(page, /cannot provision a quilt runtime/);
   assert.match(page, /only compatibility-matching add-ons are listed here for fabric on 1\.21\.1\./);
+  // A server that is stopping: said in all three places, with both buttons held.
+  assert.match(page, /<span class="status-inline status-inline--warn"><span class="icon">.*?<\/span>stopping…<\/span>/);
+  assert.ok(page.includes(`<strong>stopping… since ${new Date("2026-11-16T12:00:00.000Z").toLocaleString()}</strong>`));
+  assert.match(page, /<span class="tree-meta">stopping<\/span>/);
+  assert.match(page, /<button class="button button--primary" data-action="start-server" disabled title="this server is stopping">/);
+  assert.match(page, /<button class="button button--quiet" data-action="stop-server" disabled title="this server is stopping">/);
+  // And one that is not, which is every other drawing of it here.
+  assert.match(page, /<button class="button button--primary" data-action="start-server">/);
+  assert.match(page, /<span class="tree-meta">down<\/span>/);
   // The frame around the section, with the notice above it.
   assert.match(page, /<main class="shell">/);
   assert.match(page, /<section class="content">\s*<div class="notice notice--error" aria-hidden="true">something happened<\/div>/);

@@ -1,5 +1,5 @@
 import { renderPageHeader, renderSection } from "../components.js";
-import { getServerPermissions } from "../format.js";
+import { describeRunState, getServerPermissions } from "../format.js";
 import { escapeHtml, icon, labelWithIcon } from "../html.js";
 import { state } from "../state.js";
 import { renderLogsSection } from "./server-logs.js";
@@ -66,11 +66,15 @@ export function renderServerContent() {
   const { server, unlocked } = state.serverSnapshot;
   const permissions = getServerPermissions(state.serverSnapshot);
   const pathLabel = `servers / ${server.id} / ${state.serverSection}`;
+  const runState = describeRunState(server.status);
+  // While a server is stopping there is nothing for either button to do: it
+  // cannot be started before it has gone, and it has been told to stop once.
+  const held = runState.stopping ? ' disabled title="this server is stopping"' : "";
   const actions = `
-    <span class="status-inline ${server.status.running ? "status-inline--ok" : "status-inline--idle"}">${icon("server")}${server.status.running ? "online" : "offline"}</span>
+    <span class="status-inline status-inline--${runState.tone}">${icon("server")}${runState.label}</span>
     <span class="status-inline ${unlocked ? "status-inline--ok" : "status-inline--idle"}">${icon("unlock")}${unlocked ? "unlocked" : "locked"}</span>
-    ${permissions.canControlRuntime ? `<button class="button button--primary" data-action="start-server">${labelWithIcon("start", "start")}</button>` : ""}
-    ${permissions.canControlRuntime ? `<button class="button button--quiet" data-action="stop-server">${labelWithIcon("stop", "stop")}</button>` : ""}
+    ${permissions.canControlRuntime ? `<button class="button button--primary" data-action="start-server"${held}>${labelWithIcon("start", "start")}</button>` : ""}
+    ${permissions.canControlRuntime ? `<button class="button button--quiet" data-action="stop-server"${held}>${labelWithIcon("stop", "stop")}</button>` : ""}
     <button class="button button--quiet" data-action="refresh-server">${labelWithIcon("refresh", "refresh")}</button>
   `;
 

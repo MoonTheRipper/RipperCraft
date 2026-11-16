@@ -963,3 +963,285 @@ test("an upload over the server's limit is stopped in the page, with the sizes s
   state.bootstrap = null;
   assert.doesNotThrow(() => assertUploadFits(formWith({ size: 5000 * megabyte }), "file"));
 });
+
+// --- a server that is stopping ------------------------------------------------------------------
+
+// The least a snapshot has to hold for a server's page to be drawn.
+function snapshotOf(status, permissions = {}) {
+  return {
+    mods: [],
+    runtime: { modsDir: "servers/demo/mods", worldDir: "servers/demo/world" },
+    server: {
+      description: "",
+      directory: "servers/demo",
+      eulaAccepted: true,
+      id: "demo",
+      loader: "fabric",
+      minecraftVersion: "1.21.1",
+      name: "Demo",
+      passphraseConfigured: true,
+      permissions: { canControlRuntime: true, requiresUnlock: false, unlocked: true, ...permissions },
+      status
+    },
+    unlocked: true,
+    worlds: []
+  };
+}
+
+const RUNNING = { pid: 4242, running: true, startedAt: "2026-11-16T10:00:00.000Z", startedBy: "owner", stopping: false, stoppingSince: null };
+const STOPPING = { ...RUNNING, stopping: true, stoppingSince: "2026-11-16T12:00:00.000Z" };
+const STOPPED = { pid: null, running: false, startedAt: null, startedBy: null, stopping: false, stoppingSince: null };
+
+// Puts one server on the page for a test and takes it off again afterwards,
+// along with any timer the page started for it.
+async function withServerOnPage(t, status) {
+  // The entry module registers what runs after every render, the watcher for
+  // a stopping server among it.
+  await load(path.join(publicRoot, "app.js"));
+  await new Promise((resolve) => setImmediate(resolve));
+  const { state } = await load(path.join(jsRoot, "state.js"));
+  const { syncStopPolling } = await load(path.join(jsRoot, "stopping-live.js"));
+  const saved = { ...state };
+  t.after(() => {
+    Object.assign(state, saved);
+    syncStopPolling();
+  });
+  Object.assign(state, {
+    bootstrap: { loggedIn: true, user: { role: "owner", username: "owner" } },
+    notice: null,
+    selectedServerId: "demo",
+    serverSection: "overview",
+    serverSnapshot: snapshotOf({ ...status }),
+    servers: [{ id: "demo", name: "Demo", status: { ...status } }],
+    view: "server"
+  });
+  return state;
+}
+
+// The timers a test's code asks for, kept instead of started.
+function captureIntervals(t) {
+  const real = { clearInterval: globalThis.clearInterval, setInterval: globalThis.setInterval };
+  const intervals = [];
+  globalThis.setInterval = (run, every) => {
+    const interval = { cleared: false, every, run };
+    intervals.push(interval);
+    return interval;
+  };
+  globalThis.clearInterval = (interval) => {
+    if (interval) {
+      interval.cleared = true;
+    }
+  };
+  t.after(() => Object.assign(globalThis, real));
+  return intervals;
+}
+
+test("a server is shown as online, offline or stopping", async () => {
+  const { describeRunState } = await load(path.join(jsRoot, "format.js"));
+  const offline = { label: "offline", short: "down", stopping: false, tone: "idle" };
+
+  assert.deepEqual(describeRunState(RUNNING), { label: "online", short: "up", stopping: false, tone: "ok" });
+  assert.deepEqual(describeRunState(STOPPING), { label: "stopping…", short: "stopping", stopping: true, tone: "warn" });
+  assert.deepEqual(describeRunState(STOPPED), offline);
+  // A process that has gone is not stopping, whatever else an answer says.
+  assert.deepEqual(describeRunState({ ...STOPPED, stopping: true }), offline);
+  // An answer from before the dashboard said anything about stopping.
+  assert.deepEqual(describeRunState({ pid: 1, running: true }), { label: "online", short: "up", stopping: false, tone: "ok" });
+  for (const nothing of [undefined, null, {}, "running", 1]) {
+    assert.deepEqual(describeRunState(nothing), offline);
+  }
+  // The colour it is drawn in exists.
+  const css = fs.readFileSync(path.join(publicRoot, "styles.css"), "utf8");
+  for (const tone of ["ok", "warn", "idle"]) {
+    assert.match(css, new RegExp(`\\.status-inline--${tone}\\s*\\{`));
+  }
+  assert.match(css, /--c-warn-weak:\s*color-mix\(in srgb, var\(--c-warn\) 12%, transparent\);/);
+});
+
+test("while a server is stopping its page says so in three places, and start and stop are held", async (t) => {
+  const state = await withServerOnPage(t, STOPPING);
+  const { renderServerContent } = await load(path.join(jsRoot, "views", "server.js"));
+  const { renderServerTree } = await load(path.join(jsRoot, "views", "nav.js"));
+  const buttons = (markup) => (markup.match(/<button class="button[^>]*data-action="(?:start|stop|refresh)-server"[^>]*>/g) || []);
+  const show = (status) => {
+    state.serverSnapshot = snapshotOf(status);
+    state.servers = [{ id: "demo", name: "Demo", status }];
+    return { page: renderServerContent(), tree: renderServerTree() };
+  };
+
+  const stopping = show(STOPPING);
+  assert.match(stopping.page, /<span class="status-inline status-inline--warn"><span class="icon">.*?<\/span>stopping…<\/span>/);
+  assert.deepEqual(buttons(stopping.page), [
+    '<button class="button button--primary" data-action="start-server" disabled title="this server is stopping">',
+    '<button class="button button--quiet" data-action="stop-server" disabled title="this server is stopping">',
+    '<button class="button button--quiet" data-action="refresh-server">'
+  ]);
+  assert.ok(stopping.page.includes(`<strong>stopping… since ${new Date(STOPPING.stoppingSince).toLocaleString()}</strong>`));
+  assert.match(stopping.page, /this server was told to stop and is saving its world\./);
+  assert.match(stopping.tree, /<span class="tree-meta">stopping<\/span>/);
+
+  const online = show(RUNNING);
+  assert.match(online.page, /<span class="status-inline status-inline--ok"><span class="icon">.*?<\/span>online<\/span>/);
+  assert.deepEqual(buttons(online.page), [
+    '<button class="button button--primary" data-action="start-server">',
+    '<button class="button button--quiet" data-action="stop-server">',
+    '<button class="button button--quiet" data-action="refresh-server">'
+  ]);
+  assert.match(online.page, /<strong>online<\/strong>/);
+  assert.equal(online.page.includes("told to stop"), false);
+  assert.match(online.tree, /<span class="tree-meta">up<\/span>/);
+
+  const offline = show(STOPPED);
+  assert.match(offline.page, /<span class="status-inline status-inline--idle"><span class="icon">.*?<\/span>offline<\/span>/);
+  assert.equal(offline.page.includes("disabled"), false);
+  assert.match(offline.page, /<strong>offline<\/strong>/);
+  assert.match(offline.tree, /<span class="tree-meta">down<\/span>/);
+
+  // When it began is drawn as a time or as "unknown", never as what was sent.
+  const odd = show({ ...STOPPING, stoppingSince: '<b onclick="alert(1)">' });
+  assert.ok(odd.page.includes("<strong>stopping… since unknown</strong>"));
+  assert.equal(odd.page.includes("<b onclick"), false);
+
+  // Someone who may not start or stop it has no buttons to hold.
+  state.serverSnapshot = snapshotOf(STOPPING, { canControlRuntime: false });
+  assert.deepEqual(buttons(renderServerContent()), ['<button class="button button--quiet" data-action="refresh-server">']);
+});
+
+test("stop is answered at once, and the page then watches the server until it has stopped", async (t) => {
+  const state = await withServerOnPage(t, RUNNING);
+  const intervals = captureIntervals(t);
+  const { handleAppClick } = await load(path.join(jsRoot, "actions", "click.js"));
+  const { STOP_POLL_INTERVAL_MS, anyServerStopping } = await load(path.join(jsRoot, "stopping-live.js"));
+  assert.equal(STOP_POLL_INTERVAL_MS, 2000);
+
+  // The dashboard, as far as this page can tell.
+  let status = RUNNING;
+  const calls = [];
+  const previousFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+  });
+  globalThis.fetch = async (url, options) => {
+    calls.push(`${options.method} ${url}`);
+    let body = null;
+    if (url === "/api/servers/demo/stop") {
+      status = status.running ? STOPPING : STOPPED;
+      body = { status };
+    } else if (url === "/api/servers") {
+      body = { providers: {}, servers: [{ id: "demo", name: "Demo", status }] };
+    } else if (url === "/api/servers/demo") {
+      body = snapshotOf(status);
+    }
+    return { headers: { get: () => "application/json" }, json: async () => body, ok: true, status: 200 };
+  };
+  const press = (action) =>
+    handleAppClick({ target: { closest: (selector) => (selector === "[data-action]" ? { dataset: { action } } : null) } });
+  const held = () => (appElement.innerHTML.match(/data-action="(?:start|stop)-server" disabled/g) || []).length;
+
+  await press("stop-server");
+  // One request to stop it, then the page is brought up to date.
+  assert.deepEqual(calls.splice(0), ["POST /api/servers/demo/stop", "GET /api/servers", "GET /api/servers/demo"]);
+  assert.deepEqual(state.notice, { message: "stopping — the server saves the world first", type: "success" });
+  assert.match(appElement.innerHTML, /status-inline--warn"><span class="icon">.*?<\/span>stopping…/);
+  assert.equal(held(), 2);
+  assert.equal(anyServerStopping(), true);
+  // And from then on it is asked about every two seconds, by one timer.
+  assert.deepEqual(intervals.map((interval) => [interval.every, interval.cleared]), [[2000, false]]);
+
+  // Still stopping: the list is asked for and nothing is drawn again.
+  appElement.innerHTML = "as it was";
+  await intervals[0].run();
+  assert.deepEqual(calls.splice(0), ["GET /api/servers"]);
+  assert.equal(appElement.innerHTML, "as it was");
+  assert.equal(intervals.length, 1);
+
+  // A tab in the background does not ask at all.
+  globalThis.document.hidden = true;
+  await intervals[0].run();
+  globalThis.document.hidden = false;
+  assert.deepEqual(calls, []);
+
+  // It has gone: the whole page is fetched again and drawn as usual.
+  status = STOPPED;
+  await intervals[0].run();
+  assert.deepEqual(calls.splice(0), ["GET /api/servers", "GET /api/servers/demo"]);
+  assert.deepEqual(state.notice, { message: "Demo stopped", type: "success" });
+  assert.match(appElement.innerHTML, /status-inline--idle"><span class="icon">.*?<\/span>offline/);
+  assert.equal(held(), 0);
+  assert.equal(anyServerStopping(), false);
+  assert.deepEqual(intervals.map((interval) => interval.cleared), [true]);
+
+  // Stop on a server that is not running says so, and watches nothing.
+  await press("stop-server");
+  assert.deepEqual(state.notice, { message: "the server is not running", type: "success" });
+  assert.equal(intervals.length, 1);
+});
+
+test("a page opened in the middle of a stop watches it too, and gives up when the dashboard stops answering", async (t) => {
+  const state = await withServerOnPage(t, STOPPING);
+  const intervals = captureIntervals(t);
+  const { render } = await load(path.join(jsRoot, "render.js"));
+  const { anyServerStopping } = await load(path.join(jsRoot, "stopping-live.js"));
+  const previousFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+  });
+  let asked = 0;
+  globalThis.fetch = async () => {
+    asked += 1;
+    return { headers: { get: () => "application/json" }, json: async () => ({ error: "Sign in first." }), ok: false, status: 401 };
+  };
+
+  // Nothing was pressed here: the status that was loaded is all it takes.
+  render();
+  assert.deepEqual(intervals.map((interval) => [interval.every, interval.cleared]), [[2000, false]]);
+  // Drawing again does not start a second timer.
+  render();
+  assert.equal(intervals.length, 1);
+
+  // Two failures are let pass.
+  await intervals[0].run();
+  await intervals[0].run();
+  assert.equal(asked, 2);
+  assert.equal(state.notice, null);
+  assert.equal(anyServerStopping(), true);
+
+  // The third ends it: said once, the buttons are given back, the timer goes.
+  await intervals[0].run();
+  assert.deepEqual(state.notice, { message: "lost touch with a server that was stopping: Sign in first.", type: "error" });
+  assert.equal(anyServerStopping(), false);
+  assert.equal(appElement.innerHTML.includes('data-action="stop-server" disabled'), false);
+  assert.match(appElement.innerHTML, /status-inline--ok"><span class="icon">.*?<\/span>online/);
+  assert.deepEqual(intervals.map((interval) => interval.cleared), [true]);
+});
+
+test("a server that stops while another one is on the page is noticed as well", async (t) => {
+  const state = await withServerOnPage(t, RUNNING);
+  const intervals = captureIntervals(t);
+  const { render } = await load(path.join(jsRoot, "render.js"));
+  const previousFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+  });
+  const calls = [];
+  let other = STOPPING;
+  globalThis.fetch = async (url) => {
+    calls.push(url);
+    const body = { providers: {}, servers: [{ id: "demo", name: "Demo", status: RUNNING }, { id: "other", name: "Other", status: other }] };
+    return { headers: { get: () => "application/json" }, json: async () => body, ok: true, status: 200 };
+  };
+  state.servers = [...state.servers, { id: "other", name: "Other", status: STOPPING }];
+
+  render();
+  assert.equal(intervals.length, 1);
+  assert.match(appElement.innerHTML, /<span class="tree-meta">stopping<\/span>/);
+
+  other = STOPPED;
+  await intervals[0].run();
+  // Only the list: the page that is open is not the server that stopped.
+  assert.deepEqual(calls, ["/api/servers"]);
+  assert.deepEqual(state.notice, { message: "Other stopped", type: "success" });
+  assert.equal(appElement.innerHTML.includes('<span class="tree-meta">stopping</span>'), false);
+  assert.deepEqual(intervals.map((interval) => interval.cleared), [true]);
+});
+
