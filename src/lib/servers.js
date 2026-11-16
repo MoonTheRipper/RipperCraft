@@ -275,8 +275,9 @@ function createServerManager(store, options = {}) {
   const serversRoot = path.join(store.rootDir, "servers");
   // The console pipes are kept together in a folder of the dashboard's own,
   // not in each server's folder. A pipe that a running server reads holds up
-  // whatever opens it to read as well: `grep -R` or a backup of a server's
-  // folder stopped dead on one, and a copy of the folder took the pipe along.
+  // whatever opens it to read as well: in a server's folder, `grep -R` or a
+  // backup of the folder would stop dead on it, and a copy of the folder
+  // would take the pipe along.
   const consolesDir = path.join(store.rootDir, "data", "consoles");
   // The servers this process started and has not seen exit: for each, the
   // child, its pid, who started it and when, and how its console is reached.
@@ -960,10 +961,10 @@ function createServerManager(store, options = {}) {
   //
   // The files in it are opened without following a link, but that guards the
   // last step of the path only. With the folder itself swapped for a link to
-  // another server's, a stop wrote its lines into that server's log and
-  // cleared that server's record away. So the folder has to be a folder, in
-  // the place it is looked for; anything else there is refused out loud, and
-  // nothing is read, written or removed through it.
+  // another server's, a stop would write its lines into that server's log
+  // and clear that server's record away. So the folder has to be a folder,
+  // in the place it is looked for; anything else there is refused out loud,
+  // and nothing is read, written or removed through it.
   async function runtimeDirIsThere(paths) {
     let stats;
     try {
@@ -1096,9 +1097,10 @@ function createServerManager(store, options = {}) {
   //                                 lets through
   //
   // Anything else that goes wrong - no permission, a disk error, no file
-  // handles left - says nothing about the record, and is thrown. The record
-  // of a running server was once cleared away on the strength of an EACCES;
-  // what cannot be read is now left exactly as it is.
+  // handles left - says nothing about the record, and is thrown. Taken for
+  // "no record", an EACCES would have the record and the console of a
+  // running server cleared away; what cannot be read is left exactly as it
+  // is.
   async function readPidFile(paths) {
     if (!(await runtimeDirIsThere(paths))) {
       return { exists: false };
@@ -1427,8 +1429,8 @@ function createServerManager(store, options = {}) {
   // `how` is the last thing the stop took - "console", "SIGTERM" or
   // "SIGKILL". A server that went by itself, or that another dashboard
   // process stopped, has none. It is how the page knows to say that a server
-  // was killed, and that its world may not have been saved, where it used to
-  // say "stopped" in green.
+  // was killed, and that its world may not have been saved, and not just
+  // that it has stopped.
   function describeStatus(serverId, serverProcess) {
     const last = lastStops.get(serverId);
     if (!serverProcess) {

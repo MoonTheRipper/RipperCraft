@@ -168,8 +168,7 @@ export async function handleAppClick(event) {
         setNotice("success", "stopping — the server saves the world first");
       } else if (payload?.status?.running) {
         // Running, and not stopping: the stop could not begin, or was over
-        // before this answer and had not ended it. "Not running" was said of
-        // this once.
+        // before this answer and had not ended it. That is not "not running".
         setNotice("error", "the server is still running: the stop did not go through. see its log and the dashboard's, then try again");
       } else {
         setNotice("success", "the server is not running");

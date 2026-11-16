@@ -41,9 +41,9 @@ export function describeRunState(status) {
 //
 // "stop" on the console is how a server is meant to go. SIGTERM comes after
 // minutes of nothing, and Minecraft saves on it. SIGKILL comes last, and a
-// server that is killed saves nothing: the page said "stopped", in green, of
-// one that had been, and its owner found out from the world. `killed` is for
-// that case, and everything that shows a stop asks it.
+// server that is killed saves nothing: a green "stopped" for that one would
+// leave its owner to find out from the world. `killed` is for that case, and
+// everything that shows a stop asks it.
 export function describeLastStop(status) {
   const stop = status && !status.running && status.lastStop;
   if (!stop || typeof stop !== "object") {
